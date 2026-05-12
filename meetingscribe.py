@@ -113,7 +113,7 @@ DEFAULT_CONFIG = {
             "model": "base",        # tiny / base / small / medium / large-v3
             "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
             "workers": 2,           # 并行实例数；内存占用 = workers × 模型大小
-            "cpu_threads": 2,       # 每个实例的内部线程数；总 CPU 占用 ≈ workers × cpu_threads
+            "cpu_threads": 0,       # 每个实例的内部线程数；0 = 自动（CPU 核数 / 2）
         },
         "openai": {
             "api_key": "",
@@ -401,8 +401,9 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
 
     model_size  = pcfg.get("model", "base")
     chunk_secs  = int(pcfg.get("chunk_secs", 300))
-    max_workers = max(1, int(pcfg.get("workers", 2)))
-    cpu_threads = max(1, int(pcfg.get("cpu_threads", 2)))
+    max_workers     = max(1, int(pcfg.get("workers", 2)))
+    _cpu_threads_cfg = int(pcfg.get("cpu_threads", 0))
+    cpu_threads      = _cpu_threads_cfg if _cpu_threads_cfg > 0 else max(1, (os.cpu_count() or 4) // 2)
 
     # 读取 WAV 元数据
     with wave.open(str(audio_path), "rb") as wf:
