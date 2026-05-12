@@ -403,7 +403,7 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     chunk_secs  = int(pcfg.get("chunk_secs", 300))
     max_workers     = max(1, int(pcfg.get("workers", 2)))
     _cpu_threads_cfg = int(pcfg.get("cpu_threads", 0))
-    cpu_threads      = _cpu_threads_cfg if _cpu_threads_cfg > 0 else max(1, (os.cpu_count() or 4) // 2)
+    cpu_threads      = _cpu_threads_cfg if _cpu_threads_cfg > 0 else max(1, (os.cpu_count() or 2) // 2)
 
     # 读取 WAV 元数据
     with wave.open(str(audio_path), "rb") as wf:
