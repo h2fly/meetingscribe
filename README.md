@@ -1,5 +1,195 @@
 # MeetingScribe
 
+macOS meeting recorder: record audio → auto transcribe → AI polish → meeting notes / interview summary
+
+---
+
+## Requirements
+
+| Item | Detail |
+|------|--------|
+| macOS 12+ | Uses CoreAudio API, macOS only |
+| Python 3.9+ | Verify with `python3 --version` |
+| Node.js 18+ | Required for Claude Code CLI |
+| Homebrew | Required to install BlackHole |
+
+---
+
+## Installation
+
+### Step 1: Install Homebrew (skip if already installed)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+### Step 2: Install BlackHole virtual audio driver
+
+BlackHole is a free virtual audio device that captures system audio (e.g. audio from meeting apps).
+
+```bash
+brew install --cask blackhole-2ch
+```
+
+### Step 3: Configure macOS audio routing
+
+This step routes system audio to both your speakers and BlackHole simultaneously.
+
+1. Open **Audio MIDI Setup** — search in Spotlight, or run:
+   ```bash
+   open "/System/Applications/Utilities/Audio MIDI Setup.app"
+   ```
+
+2. Click **"+"** at the bottom left → **"Create Multi-Output Device"**
+
+3. Check both:
+   - ✅ Your speakers (e.g. `MacBook Air Speakers` / external headphones)
+   - ✅ `BlackHole 2ch`
+
+4. Check the **"Drift Correction"** checkbox on the `BlackHole 2ch` row
+
+5. Right-click the new Multi-Output Device → **"Use This Device For Sound Output"**
+
+6. Note the device name (default is `Multi-Output Device`; you can rename it)
+
+> After this setup, system audio will flow into BlackHole and MeetingScribe can capture it.
+
+### Step 4: Install Claude Code CLI
+
+Claude Code CLI is used for AI polishing and generating meeting notes.
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude login        # Follow the prompts to authorize
+claude --version    # Confirm installation
+```
+
+### Step 5: Install Python dependencies
+
+```bash
+cd meetingscribe
+pip3 install -r requirements.txt
+```
+
+### Step 6: Update config.jsonc
+
+Open `config.jsonc` and update the following fields to match your device names:
+
+```jsonc
+"output_record":  "Multi-Output Device",   // Name of the Multi-Output Device from Step 3
+"output_restore": "MacBook Air Speakers",  // Your speaker name (restored after recording)
+"device_mic":     "MacBook Air Microphone" // Your microphone name
+```
+
+**How to find device names:**
+
+```bash
+python3 meetingscribe.py devices
+```
+
+Speaker names can be found in **System Settings → Sound → Output**.
+
+---
+
+## Quick Start
+
+### GUI (recommended)
+
+```bash
+python3 meetingscribe.py ui
+```
+
+1. Click **▶ Start Recording** to begin
+2. Click **◼ Stop Recording** when done
+3. Click **Generate Meeting Notes** or **Generate Interview Summary**
+4. When complete, click **Open Result** to view the Markdown output
+
+### Command Line
+
+```bash
+# Record and auto-generate meeting notes (Ctrl+C to stop)
+python3 meetingscribe.py record
+
+# Interview mode
+python3 meetingscribe.py record --mode interview
+
+# Process an existing recording
+python3 meetingscribe.py transcribe /path/to/audio.wav
+python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
+```
+
+---
+
+## Output Files
+
+Recordings are saved to `~/Documents/meetingscribe/recordings/`. All output files are placed alongside the recording:
+
+| Extension | Content |
+|-----------|---------|
+| `.wav` | Recording (system audio + microphone, dual stream) |
+| `.raw.txt` | Raw Whisper transcript (with timestamps) |
+| `.proofread.txt` | AI-polished transcript |
+| `.md` | Meeting notes / interview summary (Markdown) |
+
+> Re-running automatically detects completed steps and skips them — no need to re-transcribe.
+
+---
+
+## Configuration
+
+Edit `config.jsonc` in the project directory (supports `//` comments). Common options:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `mode` | `meeting` | `meeting` or `interview` |
+| `transcribe_provider` | `whisper` | `whisper` (local) / `openai` / `gemini` |
+| `polish_provider` | `claude` | `claude` / `openai` / `gemini` |
+| `meeting_notes_provider` | `claude` | `claude` / `openai` / `gemini` |
+| `stt.whisper.model` | `base` | Whisper model size (see table below) |
+
+**Whisper model comparison:**
+
+| Model | Size | Speed | Accuracy |
+|-------|------|-------|----------|
+| `tiny` | ~75 MB | Fastest | Fair |
+| `base` | ~150 MB | Fast | Good (**default**) |
+| `small` | ~480 MB | Medium | Better |
+| `medium` | ~1.5 GB | Slow | Very good |
+| `large-v3` | ~3 GB | Slowest | Best |
+
+---
+
+## Troubleshooting
+
+**Q: No system audio captured (can't hear meeting app audio)**
+- Check Audio MIDI Setup — confirm BlackHole 2ch is checked in the Multi-Output Device
+- Check System Settings → Sound → Output — confirm Multi-Output Device is selected
+- Check that `output_record` in `config.jsonc` exactly matches the device name (spaces matter)
+
+**Q: `claude` command not found**
+```bash
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+Confirm Node.js is installed: `node --version` (requires 18+)
+
+**Q: First Whisper run is slow**
+First run downloads the model (~150 MB for `base`). It is cached locally and not re-downloaded. If your network is slow, switch to `tiny` in `config.jsonc`: `"model": "tiny"`.
+
+**Q: How to confirm device names**
+```bash
+python3 meetingscribe.py devices
+```
+The listed names are exactly what you should put in `config.jsonc`. Names are case-sensitive.
+
+**Q: macOS requests microphone permission**
+Click **Allow** when prompted. If you previously denied it, re-enable it in **System Settings → Privacy & Security → Microphone**.
+
+---
+---
+
+# MeetingScribe
+
 macOS 会议录音助手：一键录音 → 自动转写 → AI 校对 → 会议纪要 / 面试总结
 
 ---
@@ -76,9 +266,9 @@ pip3 install -r requirements.txt
 打开项目目录下的 `config.jsonc`，根据你自己的设备名称修改以下三项：
 
 ```jsonc
-"output_record":  "多输出设备",          // 第三步创建的多输出设备名称
-"output_restore": "MacBook Air 扬声器",  // 录音结束后恢复的扬声器名称
-"device_mic":     "MacBook Air Microphone", // 麦克风名称
+"output_record":  "多输出设备",             // 第三步创建的多输出设备名称
+"output_restore": "MacBook Air Speakers",  // 录音结束后恢复的扬声器名称
+"device_mic":     "MacBook Air Microphone" // 麦克风名称
 ```
 
 **如何查看设备名称：**
@@ -87,7 +277,6 @@ pip3 install -r requirements.txt
 python3 meetingscribe.py devices
 ```
 
-运行后会列出所有可用输入设备，找到麦克风对应的名称填入 `device_mic`。  
 扬声器名称可在系统「声音」设置 → 输出 中查看。
 
 ---
@@ -165,34 +354,27 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 ## 常见问题
 
 **Q：录不到会议软件的声音**
-
 - 检查「音频 MIDI 设置」→ 多输出设备是否勾选了 BlackHole 2ch
 - 检查系统「声音」→「输出」是否选择了多输出设备
 - 检查 `config.jsonc` 中 `output_record` 的名称是否与多输出设备完全一致（包括空格）
 
 **Q：`claude` 命令找不到**
-
 ```bash
 npm install -g @anthropic-ai/claude-code
 claude login
 ```
-
 确认 Node.js 已安装：`node --version`（需要 18+）
 
 **Q：首次运行 Whisper 很慢**
-
-首次运行会自动下载模型（base 约 150 MB），下载完成后本地缓存，后续无需重新下载。  
+首次运行会自动下载模型（base 约 150 MB），下载完成后本地缓存，后续无需重新下载。
 如果网络较慢，可以先改用更小的模型：在 `config.jsonc` 中将 `"model": "base"` 改为 `"model": "tiny"`。
 
 **Q：如何确认设备名称是否正确**
-
 ```bash
 python3 meetingscribe.py devices
 ```
-
 列出的名称即为可填入 `config.jsonc` 的值。注意名称区分大小写。
 
 **Q：macOS 要求麦克风权限**
-
-首次运行时系统会弹出权限请求，点击「允许」即可。  
+首次运行时系统会弹出权限请求，点击「允许」即可。
 如已拒绝，可在「系统设置」→「隐私与安全性」→「麦克风」中重新开启 Terminal / Python 的权限。
