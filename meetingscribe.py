@@ -112,7 +112,8 @@ DEFAULT_CONFIG = {
         "whisper": {
             "model": "base",        # tiny / base / small / medium / large-v3
             "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
-            "workers": 4,           # 并行转写线程数
+            "workers": 2,           # 并行实例数；内存占用 = workers × 模型大小
+            "cpu_threads": 2,       # 每个实例的内部线程数；总 CPU 占用 ≈ workers × cpu_threads
         },
         "openai": {
             "api_key": "",
@@ -400,7 +401,8 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
 
     model_size  = pcfg.get("model", "base")
     chunk_secs  = int(pcfg.get("chunk_secs", 300))
-    max_workers = max(1, int(pcfg.get("workers", 4)))
+    max_workers = max(1, int(pcfg.get("workers", 2)))
+    cpu_threads = max(1, int(pcfg.get("cpu_threads", 2)))
 
     # 读取 WAV 元数据
     with wave.open(str(audio_path), "rb") as wf:
@@ -413,7 +415,8 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     # ── 短录音：直接串行转写 ──────────────────────────────────────────────────
     if chunk_secs <= 0 or total_secs <= chunk_secs:
         print(f"[转写] 加载 Whisper {model_size}（首次运行会下载模型）...")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8",
+                             cpu_threads=cpu_threads)
         segments, info = model.transcribe(
             str(audio_path), language="zh", beam_size=5, vad_filter=True
         )
@@ -455,7 +458,8 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
         # 各线程独立加载模型实例，CTranslate2 推理期间释放 GIL，实现真正并行
         def _run_chunk(args):
             chunk_path_str, offset, idx = args
-            m = WhisperModel(model_size, device="cpu", compute_type="int8")
+            m = WhisperModel(model_size, device="cpu", compute_type="int8",
+                             cpu_threads=cpu_threads)
             segs, _ = m.transcribe(
                 chunk_path_str, language="zh", beam_size=5, vad_filter=True
             )
