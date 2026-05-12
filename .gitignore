@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# 打包文件
+*.zip
+*.tar.gz
+
+# 录音及输出文件（存放在 ~/Documents/meetingscribe/，不在本目录）
+*.wav
+*.raw.txt
+*.proofread.txt

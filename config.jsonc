@@ -1,0 +1,72 @@
+{
+  // ── 录音设备 ────────────────────────────────────────────────────────────────
+  // 录音采样率（Hz），建议与设备原生采样率一致
+  "sample_rate": 48000,
+  // 录音声道数（仅 AudioRecorder 使用，DualStreamRecorder 固定双路）
+  "channels": 3,
+  // 录音开始时切换到的输出设备（通常为 Multi-Output Device，让系统音频同时走 BlackHole）
+  // 运行 `python3 meetingscribe.py devices` 查看可用设备名称
+  "output_record": "多输出设备",
+  // 录音结束后恢复的输出设备（填写你自己的扬声器名称，如 "MacBook Pro Speakers"）
+  "output_restore": "MacBook Air Speakers",
+  // 系统音频捕获设备（BlackHole 虚拟声卡，名称固定）
+  "device_system_audio": "BlackHole 2ch",
+  // 麦克风设备（填写你自己的麦克风名称，如 "MacBook Pro Microphone"）
+  "device_mic": "MacBook Air Microphone",
+
+  // ── 运行模式 ─────────────────────────────────────────────────────────────────
+  // meeting（会议纪要）| interview（面试总结）
+  "mode": "meeting",
+
+  // ── LLM 调用参数 ──────────────────────────────────────────────────────────────
+  // 单次 LLM 调用超时（秒），长会议建议设为 1200 以上
+  "llm_timeout": 1200,
+  // 校对分块大小（字符数），超出则拆分为多块并行处理
+  "polish_chunk_size": 3000,
+  // 校对并发数（同时调用 LLM 的块数），0 = 不限
+  "polish_max_workers": 8,
+
+  // ── 各环节 Provider ───────────────────────────────────────────────────────────
+  // 语音转文字：whisper（本地）| openai | gemini
+  "transcribe_provider": "whisper",
+  // 转写校对：claude | openai | gemini
+  "polish_provider": "claude",
+  // 会议纪要 / 面试总结：claude | openai | gemini
+  "meeting_notes_provider": "claude",
+
+  // ── 语音转文字（STT）Provider 配置 ────────────────────────────────────────────
+  "stt": {
+    "whisper": {
+      // tiny / base / small / medium / large-v3，越大越准但越慢
+      "model": "base"
+    },
+    "openai": {
+      "api_key": "",
+      "model": "whisper-1",
+      "base_url": "https://api.openai.com/v1"
+    },
+    "gemini": {
+      "api_key": "",
+      "model": "gemini-2.0-flash"
+    }
+  },
+
+  // ── 文本处理（LLM）Provider 配置 ──────────────────────────────────────────────
+  "llm": {
+    "claude": {
+      // claude-cli 使用本地安装的 Claude Code CLI（`claude -p`）
+      "type": "claude-cli"
+    },
+    "openai": {
+      "type": "openai",
+      "api_key": "",
+      "model": "gpt-4o",
+      "base_url": "https://api.openai.com/v1"
+    },
+    "gemini": {
+      "type": "gemini",
+      "api_key": "",
+      "model": "gemini-1.5-pro"
+    }
+  }
+}
