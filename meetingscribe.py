@@ -68,6 +68,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -171,7 +172,7 @@ def load_config() -> dict:
             on_disk = json.loads(_strip_jsonc_comments(f.read()))
         cfg = _deep_merge(DEFAULT_CONFIG, on_disk)
     else:
-        cfg = DEFAULT_CONFIG.copy()
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
     return cfg
 
 
@@ -338,12 +339,18 @@ class DualStreamRecorder:
 
     def stop(self):
         self.recording = False
-        for s in (self._sys_stream, self._mic_stream):
+        for attr in ("_sys_stream", "_mic_stream"):
+            s = getattr(self, attr)
             if s:
+                setattr(self, attr, None)
                 try:
                     s.stop()
-                finally:
+                except Exception:
+                    pass
+                try:
                     s.close()
+                except Exception:
+                    pass
 
     def save(self, path: Path) -> bool:
         if not self._sys_frames and not self._mic_frames:
@@ -562,7 +569,7 @@ def _transcribe_gemini(audio_path: Path, pcfg: dict) -> str:
         else:
             print(f"[错误] Gemini STT 网络错误: {e.reason}")
         sys.exit(1)
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, IndexError) as e:
         print(f"[错误] Gemini STT 返回格式异常: {e}")
         sys.exit(1)
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -698,7 +705,7 @@ def _llm_openai(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
         else:
             print(f"[错误] OpenAI 网络错误（{label}）: {e.reason}")
         sys.exit(1)
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, IndexError) as e:
         print(f"[错误] OpenAI 返回格式异常（{label}）: {e}")
         sys.exit(1)
     return data["choices"][0]["message"]["content"].strip()
@@ -730,7 +737,7 @@ def _llm_gemini(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
         else:
             print(f"[错误] Gemini 网络错误（{label}）: {e.reason}")
         sys.exit(1)
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, IndexError) as e:
         print(f"[错误] Gemini 返回格式异常（{label}）: {e}")
         sys.exit(1)
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -1145,7 +1152,11 @@ def cmd_ui(args, cfg):  # noqa: C901
             mic_device=cfg.get("device_mic", "MacBook Air Microphone"),
             sample_rate=cfg["sample_rate"],
         )
-        recorder.start()
+        try:
+            recorder.start()
+        except Exception as e:
+            add_log(f"[ERR] 录音设备启动失败: {e}")
+            return
         recordings_dir = CONFIG_DIR / "recordings"
         recordings_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
