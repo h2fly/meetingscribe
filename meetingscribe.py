@@ -560,6 +560,7 @@ def _transcribe_gemini(audio_path: Path, pcfg: dict) -> str:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             data = _json.loads(resp.read())
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except urllib.error.HTTPError as e:
         print(f"[错误] Gemini STT HTTP {e.code}: {e.read().decode()}")
         sys.exit(1)
@@ -572,7 +573,6 @@ def _transcribe_gemini(audio_path: Path, pcfg: dict) -> str:
     except (ValueError, KeyError, IndexError) as e:
         print(f"[错误] Gemini STT 返回格式异常: {e}")
         sys.exit(1)
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -696,6 +696,7 @@ def _llm_openai(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = _json.loads(resp.read())
+        return data["choices"][0]["message"]["content"].strip()
     except urllib.error.HTTPError as e:
         print(f"[错误] OpenAI HTTP {e.code}（{label}）: {e.read().decode()}")
         sys.exit(1)
@@ -708,7 +709,6 @@ def _llm_openai(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     except (ValueError, KeyError, IndexError) as e:
         print(f"[错误] OpenAI 返回格式异常（{label}）: {e}")
         sys.exit(1)
-    return data["choices"][0]["message"]["content"].strip()
 
 
 def _llm_gemini(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
@@ -728,6 +728,7 @@ def _llm_gemini(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = _json.loads(resp.read())
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except urllib.error.HTTPError as e:
         print(f"[错误] Gemini HTTP {e.code}（{label}）: {e.read().decode()}")
         sys.exit(1)
@@ -740,7 +741,6 @@ def _llm_gemini(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     except (ValueError, KeyError, IndexError) as e:
         print(f"[错误] Gemini 返回格式异常（{label}）: {e}")
         sys.exit(1)
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "meeting") -> str:
