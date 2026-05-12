@@ -1,6 +1,6 @@
 # MeetingScribe
 
-macOS meeting recorder: record audio → auto transcribe → AI polish → meeting notes / interview summary
+macOS meeting scribe — captures both speaker and microphone audio, auto-transcribes, and produces AI-generated meeting notes or interview summaries.
 
 ---
 
@@ -190,7 +190,7 @@ Click **Allow** when prompted. If you previously denied it, re-enable it in **Sy
 
 # MeetingScribe
 
-macOS 会议录音助手：一键录音 → 自动转写 → AI 校对 → 会议纪要 / 面试总结
+macOS 会议记录助手 — 同时录制扬声器与麦克风声音，自动转写，最终由 AI 生成会议纪要或面试总结。
 
 ---
 
