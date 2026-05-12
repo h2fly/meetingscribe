@@ -376,7 +376,7 @@ class DualStreamRecorder:
 
 # ── 转写 ──────────────────────────────────────────────────────────────────────
 
-def transcribe(audio_path: Path, provider: str, cfg: dict) -> str:
+def transcribe(audio_path: Path, provider: str, cfg: dict, on_progress=None) -> str:
     stt_cfgs = {**DEFAULT_CONFIG["stt"], **cfg.get("stt", {})}
     pcfg = stt_cfgs.get(provider)
     if pcfg is None:
@@ -385,7 +385,7 @@ def transcribe(audio_path: Path, provider: str, cfg: dict) -> str:
 
     print(f"[转写] 使用 {provider} 转写 {audio_path.name} ...")
     if provider == "whisper":
-        return _transcribe_whisper(audio_path, pcfg)
+        return _transcribe_whisper(audio_path, pcfg, on_progress=on_progress)
     elif provider == "openai":
         return _transcribe_openai(audio_path, pcfg)
     elif provider == "gemini":
@@ -395,7 +395,7 @@ def transcribe(audio_path: Path, provider: str, cfg: dict) -> str:
         sys.exit(1)
 
 
-def _transcribe_whisper(audio_path: Path, pcfg: dict) -> str:
+def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     import concurrent.futures, tempfile
 
     model_size  = pcfg.get("model", "base")
@@ -466,12 +466,16 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict) -> str:
             return idx, lines
 
         results = [None] * n_chunks
+        done_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
             futures = {executor.submit(_run_chunk, args): args[2] for args in chunk_args}
             for future in concurrent.futures.as_completed(futures):
                 idx, lines = future.result()
                 results[idx] = lines
+                done_count += 1
                 print(f"[转写] 第 {idx + 1}/{n_chunks} 块完成")
+                if on_progress:
+                    on_progress(5 + int(done_count / n_chunks * 35))
 
     all_lines: list[str] = []
     for chunk_lines in results:
@@ -1244,7 +1248,9 @@ def cmd_ui(args, cfg):  # noqa: C901
                 print(f"[转写] 检测到 {raw_txt.name}，跳过 Whisper")
                 transcript_raw = raw_txt.read_text(encoding="utf-8")
             else:
-                transcript_raw = transcribe(audio_path, tp, cfg)
+                def _transcribe_progress(pct):
+                    log_q.put(("progress", pct))
+                transcript_raw = transcribe(audio_path, tp, cfg, on_progress=_transcribe_progress)
                 raw_txt.write_text(transcript_raw, encoding="utf-8")
 
             log_q.put(("progress", 40))
