@@ -325,15 +325,21 @@ class DualStreamRecorder:
             device=self.mic_device, samplerate=self.sample_rate,
             channels=1, dtype="float32", callback=self._mic_cb, blocksize=block,
         )
-        self._sys_stream.start()
-        self._mic_stream.start()
+        try:
+            self._sys_stream.start()
+            self._mic_stream.start()
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self):
         self.recording = False
         for s in (self._sys_stream, self._mic_stream):
             if s:
-                s.stop()
-                s.close()
+                try:
+                    s.stop()
+                finally:
+                    s.close()
 
     def save(self, path: Path) -> bool:
         if not self._sys_frames and not self._mic_frames:
@@ -432,6 +438,12 @@ def _transcribe_openai(audio_path: Path, pcfg: dict) -> str:
     except urllib.error.HTTPError as e:
         print(f"[错误] OpenAI STT HTTP {e.code}: {e.read().decode()}")
         sys.exit(1)
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, OSError)) and "timed out" in str(e.reason).lower():
+            print("[错误] OpenAI STT 请求超时，录音文件可能过大")
+        else:
+            print(f"[错误] OpenAI STT 网络错误: {e.reason}")
+        sys.exit(1)
 
 
 def _transcribe_gemini(audio_path: Path, pcfg: dict) -> str:
@@ -461,6 +473,15 @@ def _transcribe_gemini(audio_path: Path, pcfg: dict) -> str:
             data = _json.loads(resp.read())
     except urllib.error.HTTPError as e:
         print(f"[错误] Gemini STT HTTP {e.code}: {e.read().decode()}")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, OSError)) and "timed out" in str(e.reason).lower():
+            print("[错误] Gemini STT 请求超时，录音文件可能过大")
+        else:
+            print(f"[错误] Gemini STT 网络错误: {e.reason}")
+        sys.exit(1)
+    except (ValueError, KeyError) as e:
+        print(f"[错误] Gemini STT 返回格式异常: {e}")
         sys.exit(1)
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -589,8 +610,14 @@ def _llm_openai(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     except urllib.error.HTTPError as e:
         print(f"[错误] OpenAI HTTP {e.code}（{label}）: {e.read().decode()}")
         sys.exit(1)
-    except TimeoutError:
-        print(f"[错误] OpenAI 超时（{label}，{timeout}s）；可通过 config --set llm_timeout=900 调大")
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, OSError)) and "timed out" in str(e.reason).lower():
+            print(f"[错误] OpenAI 超时（{label}，{timeout}s）；可通过 config --set llm_timeout=900 调大")
+        else:
+            print(f"[错误] OpenAI 网络错误（{label}）: {e.reason}")
+        sys.exit(1)
+    except (ValueError, KeyError) as e:
+        print(f"[错误] OpenAI 返回格式异常（{label}）: {e}")
         sys.exit(1)
     return data["choices"][0]["message"]["content"].strip()
 
@@ -615,8 +642,14 @@ def _llm_gemini(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     except urllib.error.HTTPError as e:
         print(f"[错误] Gemini HTTP {e.code}（{label}）: {e.read().decode()}")
         sys.exit(1)
-    except TimeoutError:
-        print(f"[错误] Gemini 超时（{label}）")
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, OSError)) and "timed out" in str(e.reason).lower():
+            print(f"[错误] Gemini 超时（{label}，{timeout}s）；可通过 config --set llm_timeout=900 调大")
+        else:
+            print(f"[错误] Gemini 网络错误（{label}）: {e.reason}")
+        sys.exit(1)
+    except (ValueError, KeyError) as e:
+        print(f"[错误] Gemini 返回格式异常（{label}）: {e}")
         sys.exit(1)
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -638,6 +671,8 @@ def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "me
         chunks.append("\n".join(current))
 
     total = len(chunks)
+    if total == 0:
+        return ""
     max_workers = cfg.get("polish_max_workers", DEFAULT_CONFIG["polish_max_workers"]) or total
     print(f"[校对] 并行调用 {provider}（{mode} 模式，共 {total} 块，并发 {min(max_workers, total)}）...")
 
@@ -672,7 +707,8 @@ def save_minutes(minutes: str, audio_path: Path) -> Path:
 # ── 子命令 ────────────────────────────────────────────────────────────────────
 
 def cmd_devices(args, cfg):
-    current = cfg.get("device", "")
+    sys_dev = cfg.get("device_system_audio", "")
+    mic_dev = cfg.get("device_mic", "")
     print("\n可用音频输入设备：\n")
     for dev in sd.query_devices():
         if dev["max_input_channels"] < 1:
@@ -683,15 +719,17 @@ def cmd_devices(args, cfg):
             hint = "  ◀ 推荐（聚合设备）"
         elif "blackhole" in name.lower():
             hint = "  ◀ BlackHole"
-        active = " [当前]" if name == current else ""
+        tags = []
+        if name == sys_dev:
+            tags.append("系统音频")
+        if name == mic_dev:
+            tags.append("麦克风")
+        active = f" [当前: {'/'.join(tags)}]" if tags else ""
         print(f"  {name}{hint}{active}")
-        print(f"    → meetingnote config --set device=\"{name}\"")
     print()
 
 
 def cmd_record(args, cfg):
-    title = args.title or f"会议_{datetime.now().strftime('%Y%m%d_%H%M')}"
-
     recordings_dir = CONFIG_DIR / "recordings"
     recordings_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -705,7 +743,7 @@ def cmd_record(args, cfg):
         mic_device=cfg.get("device_mic", "MacBook Air Microphone"),
         sample_rate=cfg["sample_rate"],
     )
-    print(f"\n[录音] BlackHole 2ch（系统音频）+ MacBook Air Microphone（麦克风）")
+    print(f"\n[录音] {cfg.get('device_system_audio')}（系统音频）+ {cfg.get('device_mic')}（麦克风）")
 
     if out_record:
         switch_output(out_record)
@@ -749,7 +787,7 @@ def cmd_record(args, cfg):
     polish_provider      = getattr(args, "polish_provider", None)       or cfg.get("polish_provider", "claude")
     notes_provider       = getattr(args, "meeting_notes_provider", None) or cfg.get("meeting_notes_provider", "claude")
 
-    raw_txt_path = audio_path.with_suffix(".raw.txt")
+    raw_txt_path = audio_path.with_name(audio_path.stem + ".raw.txt")
     proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
 
     if raw_txt_path.exists():
@@ -813,7 +851,7 @@ def cmd_transcribe(args, cfg):
         transcript_polished = None
     else:
         audio_path = input_path
-        raw_txt_path = audio_path.with_suffix(".raw.txt")
+        raw_txt_path = audio_path.with_name(audio_path.stem + ".raw.txt")
         proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
         if raw_txt_path.exists():
             print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过 Whisper")
@@ -901,12 +939,14 @@ def cmd_ui(args, cfg):  # noqa: C901
     timer_job = [None]
     timer_secs = [0]
     cancel_flag = [False]
+    pipeline_running = [False]
 
     # ── i18n ──────────────────────────────────────────────────────────────────
     TR = {
         "zh": dict(
             start="▶   开始录音", stop="◼   停止录音",
             choose="选择录音文件", chosen_none="未选择",
+            chosen_prefix="当前选择文件：",
             action_meeting="开始整理会议纪要",
             action_interview="开始整理面试记录",
             stop_task="◼   停止任务",
@@ -918,6 +958,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         "en": dict(
             start="▶   Start Recording", stop="◼   Stop Recording",
             choose="Choose .wav File", chosen_none="None selected",
+            chosen_prefix="Selected: ",
             action_meeting="Generate Meeting Notes",
             action_interview="Generate Interview Summary",
             stop_task="◼   Stop Task",
@@ -1054,7 +1095,7 @@ def cmd_ui(args, cfg):  # noqa: C901
             return
         add_log(f"[REC] 完成 → {audio_path.name}")
         st.update(status="idle", chosen_path=audio_path)
-        chosen_var.set(f"当前选择文件：{audio_path.name}")
+        chosen_var.set(t("chosen_prefix") + audio_path.name)
         rec_btn.configure(text=t("start"), fg=ACCENT, activeforeground=ACCENT)
         timer_lbl.configure(fg=TEXT)
         _set_action_btns(True)
@@ -1066,7 +1107,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         )
         if path:
             st["chosen_path"] = Path(path)
-            chosen_var.set(f"当前选择文件：{Path(path).name}")
+            chosen_var.set(t("chosen_prefix") + Path(path).name)
             _set_action_btns(True)
 
     def stop_pipeline():
@@ -1081,9 +1122,10 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     def _start_pipeline(mode: str):
         path = st.get("chosen_path")
-        if not path or st["status"] == "processing":
+        if not path or pipeline_running[0]:
             return
         cancel_flag[0] = False
+        pipeline_running[0] = True
         rec_btn.configure(state="disabled")
         _set_action_btns(False)
         st["status"] = "processing"
@@ -1101,13 +1143,15 @@ def cmd_ui(args, cfg):  # noqa: C901
                 while hasattr(real, '_orig'):
                     real = real._orig
                 self._orig, self._buf = real, ""
+                self._lock = _t.Lock()
             def write(self, s):
                 self._orig.write(s)
-                self._buf += s
-                while "\n" in self._buf:
-                    line, self._buf = self._buf.split("\n", 1)
-                    if line.strip():
-                        log_q.put(("log", line))
+                with self._lock:
+                    self._buf += s
+                    while "\n" in self._buf:
+                        line, self._buf = self._buf.split("\n", 1)
+                        if line.strip():
+                            log_q.put(("log", line))
             def flush(self): self._orig.flush()
             def fileno(self): return self._orig.fileno()
 
@@ -1119,7 +1163,7 @@ def cmd_ui(args, cfg):  # noqa: C901
             np_ = cfg.get("meeting_notes_provider", "claude")
 
             audio_path = input_path
-            raw_txt   = audio_path.with_suffix(".raw.txt")
+            raw_txt   = audio_path.with_name(audio_path.stem + ".raw.txt")
             proofread = audio_path.with_name(audio_path.stem + ".proofread.txt")
 
             log_q.put(("progress", 5))
@@ -1149,6 +1193,7 @@ def cmd_ui(args, cfg):  # noqa: C901
             log_q.put(("error", str(e)))
         finally:
             sys.stdout = old_out
+            pipeline_running[0] = False
 
     def open_result():
         path = st.get("result_path")
