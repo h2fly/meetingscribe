@@ -1,21 +1,31 @@
 # MeetingScribe
 
-macOS meeting scribe — captures both speaker and microphone audio, auto-transcribes, and produces AI-generated meeting notes or interview summaries.
+Meeting scribe for macOS and Windows — captures both speaker and microphone audio, auto-transcribes, and produces AI-generated meeting notes or interview summaries.
 
 ---
 
 ## Requirements
 
+### macOS
+
 | Item | Detail |
 |------|--------|
-| macOS 12+ | Uses CoreAudio API, macOS only |
+| macOS 12+ | Uses CoreAudio API |
 | Python 3.9+ | Verify with `python3 --version` |
 | Node.js 18+ | Required for Claude Code CLI |
 | Homebrew | Required to install BlackHole |
 
+### Windows
+
+| Item | Detail |
+|------|--------|
+| Windows 10/11 | 64-bit |
+| Python 3.9+ | Download from [python.org](https://www.python.org/downloads/) — check **"Add to PATH"** and **"tcl/tk"** during install |
+| Node.js 18+ | Required for Claude Code CLI |
+
 ---
 
-## Installation
+## Installation — macOS
 
 ### Step 1: Install Homebrew (skip if already installed)
 
@@ -88,6 +98,65 @@ python3 meetingscribe.py devices
 ```
 
 Speaker names can be found in **System Settings → Sound → Output**.
+
+---
+
+## Installation — Windows
+
+### Step 1: Install VB-Audio Virtual Cable
+
+Download and install **VB-Audio Virtual Cable** (free):
+[https://vb-audio.com/Cable/](https://vb-audio.com/Cable/)
+
+This is the Windows equivalent of BlackHole — it creates a virtual audio device to capture system audio.
+
+### Step 2: Install VoiceMeeter Banana
+
+Download and install **VoiceMeeter Banana** (free):
+[https://vb-audio.com/Voicemeeter/banana.htm](https://vb-audio.com/Voicemeeter/banana.htm)
+
+VoiceMeeter routes system audio to both your speakers and Virtual Cable simultaneously (equivalent to macOS Multi-Output Device).
+
+**Configure VoiceMeeter:**
+
+1. Open VoiceMeeter Banana
+2. In **HARDWARE INPUT 1**, select your microphone
+3. In **HARDWARE OUT A1**, select your real speakers / headphones
+4. In **VIRTUAL INPUTS**, enable routing to **B1** (Virtual Cable)
+5. Right-click the Windows speaker icon in the taskbar → **Sound settings** → set output to **VoiceMeeter Input**
+
+> Once configured, VoiceMeeter runs in the background. No need to change audio devices before each recording.
+
+### Step 3: Install Claude Code CLI
+
+```cmd
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+
+### Step 4: Install Python dependencies
+
+```cmd
+cd meetingscribe
+pip install -r requirements.txt
+```
+
+### Step 5: Update config.jsonc
+
+On Windows, audio device auto-switching is not supported — VoiceMeeter handles routing permanently. Set `output_record` and `output_restore` to empty strings, and update the device names:
+
+```jsonc
+"output_record":  "",                                    // leave empty on Windows
+"output_restore": "",                                    // leave empty on Windows
+"device_system_audio": "CABLE Output (VB-Audio Virtual Cable)",
+"device_mic":     "Microphone (your mic name here)"
+```
+
+**How to find device names:**
+
+```cmd
+python meetingscribe.py devices
+```
 
 ---
 
@@ -190,22 +259,32 @@ Click **Allow** when prompted. If you previously denied it, re-enable it in **Sy
 
 # MeetingScribe
 
-macOS 会议记录助手 — 同时录制扬声器与麦克风声音，自动转写，最终由 AI 生成会议纪要或面试总结。
+支持 macOS 和 Windows 的会议记录助手 — 同时录制扬声器与麦克风声音，自动转写，最终由 AI 生成会议纪要或面试总结。
 
 ---
 
 ## 系统要求
 
+### macOS
+
 | 条件 | 说明 |
 |------|------|
-| macOS 12+ | 使用 CoreAudio API，仅支持 macOS |
+| macOS 12+ | 使用 CoreAudio API |
 | Python 3.9+ | `python3 --version` 确认 |
 | Node.js 18+ | 用于安装 Claude Code CLI |
 | Homebrew | 用于安装 BlackHole |
 
+### Windows
+
+| 条件 | 说明 |
+|------|------|
+| Windows 10/11 64位 | |
+| Python 3.9+ | 从 [python.org](https://www.python.org/downloads/) 下载，安装时勾选 **"Add to PATH"** 和 **"tcl/tk"** |
+| Node.js 18+ | 用于安装 Claude Code CLI |
+
 ---
 
-## 安装步骤
+## 安装步骤 — macOS
 
 ### 第一步：安装 Homebrew（已安装可跳过）
 
@@ -278,6 +357,65 @@ python3 meetingscribe.py devices
 ```
 
 扬声器名称可在系统「声音」设置 → 输出 中查看。
+
+---
+
+## 安装步骤 — Windows
+
+### 第一步：安装 VB-Audio Virtual Cable
+
+下载并安装 **VB-Audio Virtual Cable**（免费）：
+[https://vb-audio.com/Cable/](https://vb-audio.com/Cable/)
+
+这是 BlackHole 的 Windows 等价工具，用于捕获系统播放的音频。
+
+### 第二步：安装 VoiceMeeter Banana
+
+下载并安装 **VoiceMeeter Banana**（免费）：
+[https://vb-audio.com/Voicemeeter/banana.htm](https://vb-audio.com/Voicemeeter/banana.htm)
+
+VoiceMeeter 可以将系统音频同时送到真实扬声器和 Virtual Cable，等价于 macOS 的「多输出设备」。
+
+**VoiceMeeter 配置方法：**
+
+1. 打开 VoiceMeeter Banana
+2. 在 **HARDWARE INPUT 1** 中选择你的麦克风
+3. 在 **HARDWARE OUT A1** 中选择你的扬声器 / 耳机
+4. 在 **VIRTUAL INPUTS** 中，将路由启用到 **B1**（即 Virtual Cable）
+5. 右键任务栏扬声器图标 → 「声音设置」→ 将输出设备改为 **VoiceMeeter Input**
+
+> 配置完成后 VoiceMeeter 后台运行，每次录音无需手动切换音频设备。
+
+### 第三步：安装 Claude Code CLI
+
+```cmd
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+
+### 第四步：安装 Python 依赖
+
+```cmd
+cd meetingscribe
+pip install -r requirements.txt
+```
+
+### 第五步：修改配置文件
+
+Windows 下不需要自动切换输出设备（VoiceMeeter 已常驻处理路由），将 `output_record` 和 `output_restore` 置空，并更新设备名称：
+
+```jsonc
+"output_record":  "",                                        // Windows 下留空
+"output_restore": "",                                        // Windows 下留空
+"device_system_audio": "CABLE Output (VB-Audio Virtual Cable)",
+"device_mic":     "麦克风 (你的麦克风名称)"
+```
+
+**查看设备名称：**
+
+```cmd
+python meetingscribe.py devices
+```
 
 ---
 

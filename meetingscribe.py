@@ -69,6 +69,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
 
 import argparse
 import json
+import os
 import sys
 import time
 import wave
@@ -179,7 +180,9 @@ def save_config(cfg: dict):
 # ── 音频输出切换 ──────────────────────────────────────────────────────────────
 
 def switch_output(device_name: str):
-    """Switch macOS default audio output device via CoreAudio (no extra tools needed)."""
+    """Switch default audio output device. macOS only; no-op on other platforms."""
+    if sys.platform != "darwin":
+        return
     import ctypes, ctypes.util, struct
 
     ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
@@ -1150,8 +1153,12 @@ def cmd_ui(args, cfg):  # noqa: C901
     def open_result():
         path = st.get("result_path")
         if path:
-            import subprocess
-            subprocess.run(["open", path])
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path])
+            else:
+                subprocess.run(["xdg-open", path])
 
     def _poll():
         try:
