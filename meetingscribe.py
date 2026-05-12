@@ -69,6 +69,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -110,6 +111,8 @@ DEFAULT_CONFIG = {
     "stt": {
         "whisper": {
             "model": "base",        # tiny / base / small / medium / large-v3
+            "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
+            "workers": 4,           # 并行转写线程数
         },
         "openai": {
             "api_key": "",
@@ -393,17 +396,87 @@ def transcribe(audio_path: Path, provider: str, cfg: dict) -> str:
 
 
 def _transcribe_whisper(audio_path: Path, pcfg: dict) -> str:
-    model_size = pcfg.get("model", "base")
-    print(f"[转写] 加载 Whisper {model_size}（首次运行会下载模型）...")
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(
-        str(audio_path), language="zh", beam_size=5, vad_filter=True
+    import concurrent.futures, tempfile
+
+    model_size  = pcfg.get("model", "base")
+    chunk_secs  = int(pcfg.get("chunk_secs", 300))
+    max_workers = max(1, int(pcfg.get("workers", 4)))
+
+    # 读取 WAV 元数据
+    with wave.open(str(audio_path), "rb") as wf:
+        total_frames = wf.getnframes()
+        framerate    = wf.getframerate()
+        n_channels   = wf.getnchannels()
+        sampwidth    = wf.getsampwidth()
+    total_secs = total_frames / framerate
+
+    # ── 短录音：直接串行转写 ──────────────────────────────────────────────────
+    if chunk_secs <= 0 or total_secs <= chunk_secs:
+        print(f"[转写] 加载 Whisper {model_size}（首次运行会下载模型）...")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, info = model.transcribe(
+            str(audio_path), language="zh", beam_size=5, vad_filter=True
+        )
+        print(f"[转写] 语言: {info.language}（置信度 {info.language_probability:.0%}）")
+        lines = []
+        for seg in segments:
+            if seg.text.strip():
+                lines.append(f"[{seg.start:05.1f}s] {seg.text.strip()}")
+        return "\n".join(lines)
+
+    # ── 长录音：分块并行转写 ──────────────────────────────────────────────────
+    n_chunks       = math.ceil(total_secs / chunk_secs)
+    actual_workers = min(max_workers, n_chunks)
+    print(
+        f"[转写] 录音时长 {total_secs / 60:.1f} 分钟，分 {n_chunks} 块并发转写"
+        f"（每块 {chunk_secs // 60} 分钟，并发 {actual_workers}）"
+        f"，加载 Whisper {model_size}..."
     )
-    print(f"[转写] 语言: {info.language}（置信度 {info.language_probability:.0%}）")
-    lines = []
-    for seg in segments:
-        lines.append(f"[{seg.start:05.1f}s] {seg.text.strip()}")
-    return "\n".join(lines)
+
+    with tempfile.TemporaryDirectory(prefix="meetingscribe_") as tmpdir:
+        # 切块并写入临时 WAV 文件
+        chunk_args = []
+        with wave.open(str(audio_path), "rb") as wf:
+            for i in range(n_chunks):
+                start_f = int(i * chunk_secs * framerate)
+                end_f   = min(int((i + 1) * chunk_secs * framerate), total_frames)
+                wf.setpos(start_f)
+                chunk_data = wf.readframes(end_f - start_f)
+
+                chunk_path = Path(tmpdir) / f"chunk_{i:04d}.wav"
+                with wave.open(str(chunk_path), "wb") as cw:
+                    cw.setnchannels(n_channels)
+                    cw.setsampwidth(sampwidth)
+                    cw.setframerate(framerate)
+                    cw.writeframes(chunk_data)
+
+                chunk_args.append((str(chunk_path), float(i * chunk_secs), i))
+
+        # 各线程独立加载模型实例，CTranslate2 推理期间释放 GIL，实现真正并行
+        def _run_chunk(args):
+            chunk_path_str, offset, idx = args
+            m = WhisperModel(model_size, device="cpu", compute_type="int8")
+            segs, _ = m.transcribe(
+                chunk_path_str, language="zh", beam_size=5, vad_filter=True
+            )
+            lines = [
+                f"[{seg.start + offset:05.1f}s] {seg.text.strip()}"
+                for seg in segs if seg.text.strip()
+            ]
+            return idx, lines
+
+        results = [None] * n_chunks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(_run_chunk, args): args[2] for args in chunk_args}
+            for future in concurrent.futures.as_completed(futures):
+                idx, lines = future.result()
+                results[idx] = lines
+                print(f"[转写] 第 {idx + 1}/{n_chunks} 块完成")
+
+    all_lines: list[str] = []
+    for chunk_lines in results:
+        all_lines.extend(chunk_lines)
+    return "\n".join(all_lines)
 
 
 def _transcribe_openai(audio_path: Path, pcfg: dict) -> str:
