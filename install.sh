@@ -30,13 +30,23 @@ else
   echo -e "${GREEN}✓${NC} BlackHole 2ch 安装完成"
 fi
 
-# ── 3. 安装 Python 依赖 ─────────────────────────────────────────────────────
+# ── 3. 安装 ffmpeg ──────────────────────────────────────────────────────────
+if command -v ffmpeg &>/dev/null; then
+  echo -e "${GREEN}✓${NC} ffmpeg 已安装"
+else
+  echo ""
+  echo "安装 ffmpeg（FunASR 音频解码依赖）..."
+  brew install ffmpeg
+  echo -e "${GREEN}✓${NC} ffmpeg 安装完成"
+fi
+
+# ── 4. 安装 Python 依赖 ─────────────────────────────────────────────────────
 echo ""
 echo "安装 Python 依赖..."
 pip3 install -r "$SCRIPT_DIR/requirements.txt" -q
 echo -e "${GREEN}✓${NC} Python 依赖安装完成"
 
-# ── 4. 创建 meetingscribe 全局命令 ──────────────────────────────────────────
+# ── 5. 创建 meetingscribe 全局命令 ──────────────────────────────────────────
 LOCAL_BIN="$HOME/.local/bin"
 BIN_PATH="$LOCAL_BIN/meetingscribe"
 mkdir -p "$LOCAL_BIN"
@@ -57,7 +67,7 @@ if [[ ":$PATH:" != *":$LOCAL_BIN:"* ]]; then
   export PATH="$LOCAL_BIN:$PATH"
 fi
 
-# ── 5. 检查 Claude Code CLI ─────────────────────────────────────────────────
+# ── 6. 检查 Claude Code CLI ─────────────────────────────────────────────────
 echo ""
 if command -v claude &>/dev/null; then
   echo -e "${GREEN}✓${NC} claude CLI 已安装：$(which claude)"
@@ -67,7 +77,7 @@ else
   echo "   claude login"
 fi
 
-# ── 6. 音频路由配置说明 ─────────────────────────────────────────────────────
+# ── 7. 音频路由配置说明 ─────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "${YELLOW}【需手动完成】macOS 音频路由配置${NC}"
@@ -85,7 +95,7 @@ echo "  4. 右键该设备 →「将此设备用作系统声音输出」"
 echo ""
 echo "步骤三：更新配置文件 config.jsonc"
 echo "  运行以下命令查看设备名称："
-echo "  python3 \"$SCRIPT_DIR/meetingscribe.py\" devices"
+echo "  python3 meetingscribe.py devices"
 echo ""
 echo "  根据输出修改 config.jsonc 中的："
 echo "    output_record  → 多输出设备的名称"
@@ -96,6 +106,6 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo -e "${GREEN}安装完成！${NC} 配置好音频路由后运行："
 echo ""
-echo "  meetingscribe ui       # 图形界面"
-echo "  meetingscribe record   # 命令行录音"
+echo "  python3 meetingscribe.py ui       # 图形界面"
+echo "  python3 meetingscribe.py record   # 命令行录音"
 echo ""
