@@ -953,7 +953,8 @@ _POLISH_BASE = """\
 2. 将所有片段合并为连贯的自然段落，按语义分段
 3. 纠正明显的错别字和同音字错误
 4. 修复错误的断句和标点
-5. 无法确定的内容用【？】标注
+5. 删除重复内容——语音识别可能对相邻片段重复识别同一句话，检查前后句子，去掉重复的短语或句子
+6. 无法确定的内容用【？】标注
 
 只输出整理后的正文，不要解释修改内容。
 
@@ -1518,10 +1519,6 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     def set_lang(lang):
         st["lang"] = lang
-        btn_zh.configure(bg=LANG_ON if lang == "zh" else BTN,
-                         fg="#1c2b3a" if lang == "zh" else MUTED)
-        btn_en.configure(bg=LANG_ON if lang == "en" else BTN,
-                         fg="#1c2b3a" if lang == "en" else MUTED)
         is_rec = st["status"] == "recording"
         rec_btn.configure(text=t("stop") if is_rec else t("start"))
         choose_btn.configure(text=t("choose"))
@@ -1786,16 +1783,11 @@ def cmd_ui(args, cfg):  # noqa: C901
     else:
         _btn_midi_key = None
         _btn_midi = None
-    btn_zh = tk.Button(lang_row, text="中文", relief="flat", bd=0, padx=8, pady=3,
-                       font=("Menlo", 11), cursor="hand2", bg=LANG_ON, fg="#1c2b3a",
-                       activebackground=LANG_ON, activeforeground="#1c2b3a",
-                       command=lambda: set_lang("zh"))
-    btn_zh.pack(side="left", padx=(0, 3))
-    btn_en = tk.Button(lang_row, text="EN", relief="flat", bd=0, padx=8, pady=3,
-                       font=("Menlo", 11), cursor="hand2", bg=BTN, fg=MUTED,
-                       activebackground=LANG_ON, activeforeground="#1c2b3a",
-                       command=lambda: set_lang("en"))
-    btn_en.pack(side="left")
+    btn_lang = tk.Button(lang_row, text="中文/EN", relief="flat", bd=0, padx=8, pady=3,
+                         font=("Menlo", 11), cursor="hand2", bg=BTN, fg=MUTED,
+                         activebackground=LANG_ON, activeforeground="#1c2b3a",
+                         command=lambda: set_lang("en" if st["lang"] == "zh" else "zh"))
+    btn_lang.pack(side="left")
 
     sep(root)
 
