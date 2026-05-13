@@ -4,15 +4,15 @@
   "sample_rate": 48000,
   // 录音声道数（仅 AudioRecorder 使用，DualStreamRecorder 固定双路）
   "channels": 3,
-  // 录音开始时切换到的输出设备（通常为 Multi-Output Device，让系统音频同时走 BlackHole）
-  // 运行 `python3 meetingscribe.py devices` 查看可用设备名称
-  "output_record": "多输出设备",
-  // 录音结束后恢复的输出设备（填写你自己的扬声器名称，如 "MacBook Pro Speakers"）
-  "output_restore": "MacBook Air Speakers",
-  // 系统音频捕获设备（BlackHole 虚拟声卡，名称固定）
-  "device_system_audio": "BlackHole 2ch",
-  // 麦克风设备（填写你自己的麦克风名称，如 "MacBook Pro Microphone"）
-  "device_mic": "MacBook Air Microphone",
+  // 录音开始时切换到的输出设备（null = 自动探测 Multi-Output Device）
+  // 如需手动指定，运行 `python3 meetingscribe.py devices` 查看可用名称
+  "output_record": null,
+  // 录音结束后恢复的输出设备（null = 自动探测录音前的默认输出）
+  "output_restore": null,
+  // 系统音频捕获设备（null = 自动探测 BlackHole 设备）
+  "device_system_audio": null,
+  // 麦克风设备（null = 自动探测，优先外接麦克风）
+  "device_mic": null,
 
   // ── 运行模式 ─────────────────────────────────────────────────────────────────
   // meeting（会议纪要）| interview（面试总结）

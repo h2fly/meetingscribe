@@ -90,13 +90,15 @@ import sounddevice as sd
 CONFIG_DIR = Path.home() / "Documents" / "meetingscribe"
 CONFIG_FILE = Path(__file__).parent / "config.jsonc"
 
+_funasr_model_cache: dict = {}  # (asr_model, vad_model, punc_model) -> AutoModel instance
+
 DEFAULT_CONFIG = {
     "sample_rate": 48000,
     "channels": 3,
     "output_record": None,
     "output_restore": None,
-    "device_system_audio": "BlackHole 2ch",
-    "device_mic": "MacBook Air Microphone",
+    "device_system_audio": None,
+    "device_mic": None,
     # 模式：meeting（会议纪要）| interview（面试总结）
     "mode": "meeting",
     # LLM 调用超时（秒），长会议建议调大
@@ -238,6 +240,166 @@ def switch_output(device_name: str):
                 )
                 return
     print(f"[警告] 找不到输出设备: {device_name}", file=sys.stderr)
+
+
+def _get_current_output_device() -> str | None:
+    """Return the name of the current default macOS audio output device."""
+    if sys.platform != "darwin":
+        return None
+    import ctypes, ctypes.util, struct
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal, kUTF8 = 1, _fcc("glob"), 0x08000100
+
+    dev_id = ctypes.c_uint32(0)
+    sz = ctypes.c_uint32(4)
+    ca.AudioObjectGetPropertyData(
+        kSystem, ctypes.byref(_Addr(_fcc("dOut"), kGlobal, 0)),
+        0, None, ctypes.byref(sz), ctypes.byref(dev_id),
+    )
+    if not dev_id.value:
+        return None
+
+    cf_str = ctypes.c_void_p(0)
+    sz2 = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+    ca.AudioObjectGetPropertyData(
+        dev_id.value, ctypes.byref(_Addr(_fcc("lnam"), kGlobal, 0)),
+        0, None, ctypes.byref(sz2), ctypes.byref(cf_str),
+    )
+    if not cf_str.value:
+        return None
+    buf = ctypes.create_string_buffer(512)
+    return buf.value.decode("utf-8") if cf.CFStringGetCString(cf_str, buf, 512, kUTF8) else None
+
+
+def _coreaudio_device_info() -> dict[str, str]:
+    """Return {device_name: transport_type_fourcc} for all CoreAudio devices. macOS only.
+
+    Common transport types:
+      'bltn' built-in  |  'virt' virtual (BlackHole)  |  'aggt' aggregate (Multi-Output)
+      'usb ' USB       |  'blue' Bluetooth             |  'blea' Bluetooth LE
+    """
+    if sys.platform != "darwin":
+        return {}
+    import ctypes, ctypes.util, struct
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal, kUTF8 = 1, _fcc("glob"), 0x08000100
+
+    sz = ctypes.c_uint32(0)
+    ca.AudioObjectGetPropertyDataSize(
+        kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz)
+    )
+    ids = (ctypes.c_uint32 * (sz.value // 4))()
+    ca.AudioObjectGetPropertyData(
+        kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz), ids
+    )
+
+    result = {}
+    for dev_id in ids:
+        cf_str = ctypes.c_void_p(0)
+        sz2 = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+        ca.AudioObjectGetPropertyData(
+            dev_id, ctypes.byref(_Addr(_fcc("lnam"), kGlobal, 0)),
+            0, None, ctypes.byref(sz2), ctypes.byref(cf_str),
+        )
+        if not cf_str.value:
+            continue
+        buf = ctypes.create_string_buffer(512)
+        if not cf.CFStringGetCString(cf_str, buf, 512, kUTF8):
+            continue
+        name = buf.value.decode("utf-8")
+
+        transport = ctypes.c_uint32(0)
+        sz3 = ctypes.c_uint32(4)
+        ca.AudioObjectGetPropertyData(
+            dev_id, ctypes.byref(_Addr(_fcc("tran"), kGlobal, 0)),
+            0, None, ctypes.byref(sz3), ctypes.byref(transport),
+        )
+        result[name] = struct.pack(">I", transport.value).decode("latin-1")
+
+    return result
+
+
+def _auto_detect_devices() -> dict:
+    """Scan sounddevice + CoreAudio transport types to find best devices for recording."""
+    transport = _coreaudio_device_info()  # {name: fourcc}; empty dict on non-macOS
+    all_devices = sd.query_devices()
+    input_names = [d["name"] for d in all_devices if d["max_input_channels"] >= 1]
+    output_names = [d["name"] for d in all_devices if d["max_output_channels"] >= 1]
+
+    # System audio: first virtual input device (BlackHole)
+    sys_audio = next(
+        (n for n in input_names if transport.get(n) == "virt" or "BlackHole" in n), None
+    )
+
+    # Mic: sort by transport priority — external (0) > built-in (1) > virtual/skip (inf)
+    def _mic_pri(name):
+        t = transport.get(name, "")
+        if t in ("virt", "aggt") or "BlackHole" in name or "Aggregate" in name:
+            return float("inf")   # skip virtual, aggregate, and app-created devices
+        if t == "bltn":
+            return 1              # built-in: lowest priority
+        return 0                  # USB / BT / any external: highest priority
+
+    mic_candidates = sorted(
+        [n for n in input_names if _mic_pri(n) < float("inf")],
+        key=_mic_pri,
+    )
+    mic = mic_candidates[0] if mic_candidates else None
+
+    # Output for recording: prefer Apple Multi-Output Device (fixed names across locales),
+    # then any aggregate/group output that isn't an app-created aggregate, then BlackHole direct.
+    _multi_out_names = ("Multi-Output Device", "多输出设备", "多重輸出裝置")
+    out_rec = next((n for n in output_names if n in _multi_out_names), None)
+    if not out_rec:
+        out_rec = next(
+            (n for n in output_names
+             if transport.get(n) in ("aggt", "grup") and "Aggregate" not in n),
+            None,
+        )
+    if not out_rec:
+        out_rec = next((n for n in output_names if "BlackHole" in n), None)
+
+    out_rest = _get_current_output_device()
+    # If current output is already the recording device (stuck from a previous session),
+    # fall back to the first built-in output so we have a meaningful restore target.
+    if out_rest and out_rest == out_rec:
+        builtin_out = next((n for n in output_names if transport.get(n) == "bltn"), None)
+        if builtin_out:
+            out_rest = builtin_out
+
+    return {
+        "device_system_audio": sys_audio,
+        "device_mic": mic,
+        "output_record": out_rec,
+        "output_restore": out_rest,
+    }
+
+
+def _resolve_devices(cfg: dict) -> dict:
+    """Return effective device settings; auto-detects any value not set in cfg."""
+    keys = ("device_system_audio", "device_mic", "output_record", "output_restore")
+    if all(cfg.get(k) for k in keys):
+        return {k: cfg[k] for k in keys}
+    detected = _auto_detect_devices()
+    return {k: cfg.get(k) or detected.get(k) for k in keys}
 
 
 # ── 录音 ──────────────────────────────────────────────────────────────────────
@@ -414,18 +576,23 @@ class MultiStreamRecorder:
             raise ValueError("没有选择任何录音设备")
         self.recording = True
         self._frames = [[] for _ in self.devices]
+        self.skipped: list[str] = []
         block = int(self.sample_rate * 0.1)
-        try:
-            for i, device in enumerate(self.devices):
+        opened = 0
+        for i, device in enumerate(self.devices):
+            try:
                 self._streams[i] = sd.InputStream(
                     device=device, samplerate=self.sample_rate,
                     channels=1, dtype="float32",
                     callback=self._make_cb(i), blocksize=block,
                 )
                 self._streams[i].start()
-        except Exception:
+                opened += 1
+            except Exception as e:
+                self.skipped.append(f"{device}: {e}")
+        if opened == 0:
             self.stop()
-            raise
+            raise RuntimeError("所有录音设备均无法打开：" + "; ".join(self.skipped))
 
     def stop(self):
         self.recording = False
@@ -510,9 +677,14 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     total_secs = total_frames / framerate
 
     def _load_model():
-        from funasr import AutoModel
-        return AutoModel(model=asr_model, vad_model=vad_model, punc_model=punc_model,
-                         disable_update=True)
+        key = (asr_model, vad_model, punc_model)
+        if key not in _funasr_model_cache:
+            from funasr import AutoModel
+            _funasr_model_cache[key] = AutoModel(
+                model=asr_model, vad_model=vad_model, punc_model=punc_model,
+                disable_update=True,
+            )
+        return _funasr_model_cache[key]
 
     def _items_to_lines(items, offset_s=0.0):
         lines = []
@@ -553,9 +725,10 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None) -> str:
         f"，加载 FunASR {asr_model}..."
     )
 
+    m = _load_model()
+
     def _run_chunk(args):
         chunk_path_str, offset_s, idx = args
-        m = _load_model()
         kwargs: dict = dict(input=chunk_path_str, batch_size_s=300)
         if hotword:
             kwargs["hotword"] = hotword
@@ -992,25 +1165,40 @@ def save_minutes(minutes: str, audio_path: Path) -> Path:
 # ── 子命令 ────────────────────────────────────────────────────────────────────
 
 def cmd_devices(args, cfg):
-    sys_dev = cfg.get("device_system_audio", "")
-    mic_dev = cfg.get("device_mic", "")
+    transport = _coreaudio_device_info()
+    devs = _resolve_devices(cfg)
+    auto_sys = devs["device_system_audio"]
+    auto_mic = devs["device_mic"]
+    auto_out_rec = devs["output_record"]
+    auto_out_rest = devs["output_restore"]
+
     print("\n可用音频输入设备：\n")
     for dev in sd.query_devices():
         if dev["max_input_channels"] < 1:
             continue
         name = dev["name"]
-        hint = ""
-        if "aggregate" in name.lower() or "聚合" in name or "omi" in name.lower():
-            hint = "  ◀ 推荐（聚合设备）"
-        elif "blackhole" in name.lower():
-            hint = "  ◀ BlackHole"
+        t = transport.get(name, "?")
         tags = []
-        if name == sys_dev:
-            tags.append("系统音频")
-        if name == mic_dev:
-            tags.append("麦克风")
-        active = f" [当前: {'/'.join(tags)}]" if tags else ""
-        print(f"  {name}{hint}{active}")
+        if name == auto_sys:
+            tags.append("系统音频✓")
+        if name == auto_mic:
+            tags.append("麦克风✓")
+        label = f"  [{'/'.join(tags)}]" if tags else ""
+        print(f"  {name}  ({t}){label}")
+
+    print("\n可用音频输出设备：\n")
+    for dev in sd.query_devices():
+        if dev["max_output_channels"] < 1:
+            continue
+        name = dev["name"]
+        t = transport.get(name, "?")
+        tags = []
+        if name == auto_out_rec:
+            tags.append("录音时切换✓")
+        if name == auto_out_rest:
+            tags.append("录音后还原✓")
+        label = f"  [{'/'.join(tags)}]" if tags else ""
+        print(f"  {name}  ({t}){label}")
     print()
 
 
@@ -1020,15 +1208,19 @@ def cmd_record(args, cfg):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     audio_path = recordings_dir / f"{ts}.wav"
 
-    out_record = cfg.get("output_record")
-    out_restore = cfg.get("output_restore")
+    devs = _resolve_devices(cfg)
+    out_record = devs["output_record"]
+    out_restore = devs["output_restore"]
+
+    if not devs["device_system_audio"]:
+        print("[警告] 未找到 BlackHole 设备，系统音频将无法录制。请安装 BlackHole 2ch。", file=sys.stderr)
 
     recorder = DualStreamRecorder(
-        sys_device=cfg.get("device_system_audio", "BlackHole 2ch"),
-        mic_device=cfg.get("device_mic", "MacBook Air Microphone"),
+        sys_device=devs["device_system_audio"],
+        mic_device=devs["device_mic"],
         sample_rate=cfg["sample_rate"],
     )
-    print(f"\n[录音] {cfg.get('device_system_audio')}（系统音频）+ {cfg.get('device_mic')}（麦克风）")
+    print(f"\n[录音] 系统音频={devs['device_system_audio'] or '未找到'} | 麦克风={devs['device_mic'] or '未找到'}")
 
     if out_record:
         switch_output(out_record)
@@ -1357,28 +1549,37 @@ def cmd_ui(args, cfg):  # noqa: C901
         timer_job[0] = root.after(1000, _tick)
 
     def _start_recording():
-        out_record = cfg.get("output_record")
-        if out_record:
-            switch_output(out_record)
+        devs = _resolve_devices(cfg)
+        add_log(f"[设备] 系统音频={devs['device_system_audio'] or '未找到'} | 麦克风={devs['device_mic'] or '未找到'} | 录音输出={devs['output_record'] or '无'} | 还原至={devs['output_restore'] or '未知'}")
+        if devs["output_record"]:
+            switch_output(devs["output_record"])
+
+        def _abort(msg: str):
+            add_log(msg)
+            if devs["output_record"] and devs["output_restore"]:
+                switch_output(devs["output_restore"])
+
         _input_names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] >= 1}
         selected = [
-            name for name in [cfg.get("device_system_audio", ""), cfg.get("device_mic", "")]
+            name for name in [devs["device_system_audio"], devs["device_mic"]]
             if name and name in _input_names
         ]
         if not selected:
-            add_log(f"[ERR] {t('no_device')}")
+            _abort(f"[ERR] {t('no_device')}")
             return
         recorder = MultiStreamRecorder(selected, cfg["sample_rate"])
         try:
             recorder.start()
         except Exception as e:
-            add_log(f"[ERR] 录音设备启动失败: {e}")
+            _abort(f"[ERR] 录音设备启动失败: {e}")
             return
+        for msg in getattr(recorder, "skipped", []):
+            add_log(f"[警告] 跳过设备: {msg}")
         recordings_dir = CONFIG_DIR / "recordings"
         recordings_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_path = recordings_dir / f"{ts}.wav"
-        st.update(status="recording", recorder=recorder, audio_path=audio_path)
+        st.update(status="recording", recorder=recorder, audio_path=audio_path, out_restore=devs["output_restore"])
         rec_btn.configure(text=t("stop"), fg=DANGER, activeforeground=DANGER)
         timer_secs[0] = 0
         timer_var.set("00:00:00")
@@ -1393,7 +1594,7 @@ def cmd_ui(args, cfg):  # noqa: C901
             root.after_cancel(timer_job[0])
         recorder = st["recorder"]
         recorder.stop()
-        out_restore = cfg.get("output_restore")
+        out_restore = st.get("out_restore")
         if out_restore:
             switch_output(out_restore)
         audio_path = st["audio_path"]
