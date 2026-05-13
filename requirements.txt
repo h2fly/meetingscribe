@@ -1,3 +1,12 @@
 sounddevice>=0.4.6
-faster-whisper>=1.0.0
 numpy>=1.24.0
+
+# 语音转写（默认 provider）
+funasr>=1.1.0
+modelscope>=1.9.0
+# PyTorch：FunASR 依赖，需单独安装（平台相关，下方有说明）
+# pip install torch torchaudio   # CPU 版
+# 或访问 https://pytorch.org 选择 GPU 版本安装命令
+
+# 可选：仅在 transcribe_provider=whisper 时需要
+# faster-whisper>=1.0.0

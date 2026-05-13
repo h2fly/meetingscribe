@@ -124,7 +124,7 @@ class TestLoadConfig:
         monkeypatch.setattr(ms, "CONFIG_FILE", tmp_path / "missing.jsonc")
         monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
         cfg = ms.load_config()
-        assert cfg["transcribe_provider"] == "whisper"
+        assert cfg["transcribe_provider"] == "funasr"
         assert cfg["mode"] == "meeting"
 
     def test_merges_on_disk_values(self, tmp_path, monkeypatch):
@@ -133,7 +133,7 @@ class TestLoadConfig:
         monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
         cfg = ms.load_config()
         assert cfg["mode"] == "interview"
-        assert cfg["transcribe_provider"] == "whisper"  # default preserved
+        assert cfg["transcribe_provider"] == "funasr"  # default preserved
 
     def test_deep_merges_nested_stt_config(self, tmp_path, monkeypatch):
         (tmp_path / "cfg.jsonc").write_text(
@@ -431,26 +431,33 @@ class TestTranscribeWhisper:
     _pcfg_serial = {"model": "base", "chunk_secs": 300, "workers": 2, "cpu_threads": 1}
     _pcfg_parallel = {"model": "base", "chunk_secs": 5, "workers": 2, "cpu_threads": 1}
 
-    def test_serial_path_includes_timestamps(self, tmp_path):
+    @pytest.fixture(autouse=True)
+    def _fw(self):
+        # WhisperModel is imported inside _transcribe_whisper, so mock via sys.modules
+        mock_fw = MagicMock()
+        with patch.dict(sys.modules, {"faster_whisper": mock_fw}):
+            yield mock_fw
+
+    def test_serial_path_includes_timestamps(self, tmp_path, _fw):
         wav = _make_wav(tmp_path / "a.wav", duration_secs=5)
-        with patch("meetingscribe.WhisperModel", return_value=_whisper_mock(["hello"])):
-            result = ms._transcribe_whisper(wav, self._pcfg_serial)
+        _fw.WhisperModel.return_value = _whisper_mock(["hello"])
+        result = ms._transcribe_whisper(wav, self._pcfg_serial)
         assert "[000.0s]" in result
         assert "hello" in result
 
-    def test_serial_path_empty_segments_returns_empty_string(self, tmp_path):
+    def test_serial_path_empty_segments_returns_empty_string(self, tmp_path, _fw):
         wav = _make_wav(tmp_path / "a.wav", duration_secs=5)
-        with patch("meetingscribe.WhisperModel", return_value=_whisper_mock([])):
-            assert ms._transcribe_whisper(wav, self._pcfg_serial) == ""
+        _fw.WhisperModel.return_value = _whisper_mock([])
+        assert ms._transcribe_whisper(wav, self._pcfg_serial) == ""
 
-    def test_chunk_secs_zero_forces_serial_even_for_long_file(self, tmp_path):
+    def test_chunk_secs_zero_forces_serial_even_for_long_file(self, tmp_path, _fw):
         wav = _make_wav(tmp_path / "a.wav", duration_secs=600, sample_rate=8000)
         pcfg = {**self._pcfg_serial, "chunk_secs": 0}
-        with patch("meetingscribe.WhisperModel", return_value=_whisper_mock(["full"])):
-            result = ms._transcribe_whisper(wav, pcfg)
+        _fw.WhisperModel.return_value = _whisper_mock(["full"])
+        result = ms._transcribe_whisper(wav, pcfg)
         assert "full" in result
 
-    def test_parallel_path_creates_one_model_per_chunk(self, tmp_path):
+    def test_parallel_path_creates_one_model_per_chunk(self, tmp_path, _fw):
         wav = _make_wav(tmp_path / "a.wav", duration_secs=10, sample_rate=8000)
         call_count = [0]
 
@@ -458,13 +465,13 @@ class TestTranscribeWhisper:
             call_count[0] += 1
             return _whisper_mock([f"seg{call_count[0]}"])
 
-        with patch("meetingscribe.WhisperModel", side_effect=make_model):
-            result = ms._transcribe_whisper(wav, self._pcfg_parallel)
+        _fw.WhisperModel.side_effect = make_model
+        result = ms._transcribe_whisper(wav, self._pcfg_parallel)
 
         assert call_count[0] == 2
         assert "seg1" in result and "seg2" in result
 
-    def test_parallel_path_results_are_in_time_order(self, tmp_path):
+    def test_parallel_path_results_are_in_time_order(self, tmp_path, _fw):
         wav = _make_wav(tmp_path / "a.wav", duration_secs=10, sample_rate=8000)
         call_count = [0]
 
@@ -473,21 +480,20 @@ class TestTranscribeWhisper:
             n = call_count[0]
             return _whisper_mock([f"chunk{n}"])
 
-        with patch("meetingscribe.WhisperModel", side_effect=make_model):
-            result = ms._transcribe_whisper(wav, self._pcfg_parallel)
+        _fw.WhisperModel.side_effect = make_model
+        result = ms._transcribe_whisper(wav, self._pcfg_parallel)
 
         lines = result.splitlines()
         assert len(lines) == 2
-        # Earlier chunk has smaller timestamp
         ts0 = float(lines[0].split("s]")[0].lstrip("["))
         ts1 = float(lines[1].split("s]")[0].lstrip("["))
         assert ts0 < ts1
 
-    def test_on_progress_called_once_per_chunk(self, tmp_path):
+    def test_on_progress_called_once_per_chunk(self, tmp_path, _fw):
         wav = _make_wav(tmp_path / "a.wav", duration_secs=10, sample_rate=8000)
         calls = []
-        with patch("meetingscribe.WhisperModel", return_value=_whisper_mock(["t"])):
-            ms._transcribe_whisper(wav, self._pcfg_parallel, on_progress=calls.append)
+        _fw.WhisperModel.return_value = _whisper_mock(["t"])
+        ms._transcribe_whisper(wav, self._pcfg_parallel, on_progress=calls.append)
         assert len(calls) == 2
         assert all(5 <= v <= 40 for v in calls)
 

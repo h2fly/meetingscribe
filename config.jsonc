@@ -27,8 +27,8 @@
   "polish_max_workers": 8,
 
   // ── 各环节 Provider ───────────────────────────────────────────────────────────
-  // 语音转文字：whisper（本地）| openai | gemini
-  "transcribe_provider": "whisper",
+  // 语音转文字：funasr（本地，默认）| whisper（本地）| openai | gemini
+  "transcribe_provider": "funasr",
   // 转写校对：claude | openai | gemini
   "polish_provider": "claude",
   // 会议纪要 / 面试总结：claude | openai | gemini

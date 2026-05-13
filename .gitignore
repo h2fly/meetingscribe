@@ -23,3 +23,8 @@ env/
 *.wav
 *.raw.txt
 *.proofread.txt
+
+# 本地工具目录
+.claude/
+.nezha/
+openspec/

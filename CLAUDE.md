@@ -24,7 +24,7 @@ The pipeline has four steps, each resumable independently:
 
 ```
 .wav  →  .raw.txt  →  .proofread.txt  →  .md
-        (Whisper)     (LLM polish)      (LLM notes)
+        (FunASR)      (LLM polish)      (LLM notes)
 ```
 
 Each step checks whether its output file already exists and skips if so. This means re-running after a crash resumes from where it stopped.
@@ -36,7 +36,7 @@ Each step checks whether its output file already exists and skips if so. This me
 | `load_config()` | Reads `config.jsonc`, deep-merges with `DEFAULT_CONFIG` |
 | `switch_output(name)` | Switches macOS audio output device via CoreAudio ctypes; **no-op on Windows/Linux** |
 | `DualStreamRecorder` | Two simultaneous `sounddevice.InputStream`s — BlackHole (system audio) + mic |
-| `transcribe()` | Dispatches to `_transcribe_whisper/openai/gemini` |
+| `transcribe()` | Dispatches to `_transcribe_funasr/whisper/openai/gemini` |
 | `polish_transcript()` | Splits transcript into chunks, runs LLM in parallel via `ThreadPoolExecutor` |
 | `generate_notes()` | Single LLM call using `PROMPTS[mode]["notes"]` |
 | `_llm_run()` | Dispatches to `_llm_claude_cli / _llm_openai / _llm_gemini` |
@@ -46,7 +46,7 @@ Each step checks whether its output file already exists and skips if so. This me
 
 Three independently configurable providers (set in `config.jsonc` or via CLI flags):
 
-- `transcribe_provider`: `whisper` (local faster-whisper) | `openai` | `gemini`
+- `transcribe_provider`: `funasr` (local, default) | `whisper` (local faster-whisper) | `openai` | `gemini`
 - `polish_provider`: `claude` | `openai` | `gemini`
 - `meeting_notes_provider`: `claude` | `openai` | `gemini`
 
@@ -89,8 +89,11 @@ All output files share the same stem as the recording:
 
 ```
 sounddevice    # audio capture (cross-platform, wraps PortAudio)
-faster-whisper # local Whisper inference
+funasr         # local FunASR inference (default transcribe provider)
+modelscope     # model downloading for FunASR
+torch          # PyTorch backend for FunASR (install separately via pytorch.org)
 numpy          # audio buffer handling
+faster-whisper # optional: only needed when transcribe_provider=whisper
 ```
 
 Tkinter, wave, argparse, subprocess, ctypes — all stdlib.  

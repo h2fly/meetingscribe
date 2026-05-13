@@ -33,12 +33,11 @@ Meeting scribe for macOS and Windows — captures both speaker and microphone au
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-### Step 2: Install BlackHole virtual audio driver
-
-BlackHole is a free virtual audio device that captures system audio (e.g. audio from meeting apps).
+### Step 2: Install system dependencies
 
 ```bash
-brew install --cask blackhole-2ch
+brew install --cask blackhole-2ch   # virtual audio driver (captures system audio)
+brew install ffmpeg                  # required by FunASR for audio decoding
 ```
 
 ### Step 3: Configure macOS audio routing
@@ -78,6 +77,11 @@ claude --version    # Confirm installation
 
 ```bash
 cd meetingscribe
+
+# Install PyTorch first (CPU version; visit https://pytorch.org for GPU options)
+pip3 install torch torchaudio
+
+# Install remaining dependencies
 pip3 install -r requirements.txt
 ```
 
@@ -138,6 +142,7 @@ claude login
 
 ```cmd
 cd meetingscribe
+pip install torch torchaudio
 pip install -r requirements.txt
 ```
 
@@ -196,7 +201,7 @@ Recordings are saved to `~/Documents/meetingscribe/recordings/`. All output file
 | Extension | Content |
 |-----------|---------|
 | `.wav` | Recording (system audio + microphone, dual stream) |
-| `.raw.txt` | Raw Whisper transcript (with timestamps) |
+| `.raw.txt` | Raw transcript (with timestamps) |
 | `.proofread.txt` | AI-polished transcript |
 | `.md` | Meeting notes / interview summary (Markdown) |
 
@@ -211,17 +216,34 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | Key | Default | Description |
 |-----|---------|-------------|
 | `mode` | `meeting` | `meeting` or `interview` |
-| `transcribe_provider` | `whisper` | `whisper` (local) / `openai` / `gemini` |
+| `transcribe_provider` | `funasr` | `funasr` (local, default) / `whisper` / `openai` / `gemini` |
 | `polish_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | `claude` / `openai` / `gemini` |
-| `stt.whisper.model` | `base` | Whisper model size (see table below) |
+| `stt.funasr.hotword` | `""` | Space-separated hotwords to boost recognition accuracy |
 
-**Whisper model comparison:**
+**FunASR models (configured in `stt.funasr`):**
 
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
+| Key | Default | Description |
+|-----|---------|-------------|
+| `model` | `paraformer-zh` | ASR model — downloaded automatically on first run (~400 MB) |
+| `vad_model` | `fsmn-vad` | Voice activity detection — enables long-audio support |
+| `punc_model` | `ct-punc` | Punctuation restoration |
+| `hotword` | `""` | Domain-specific terms (space-separated) to improve accuracy |
+| `chunk_secs` | `300` | Split audio into chunks of this length (seconds) for parallel transcription; `0` = always serial |
+| `workers` | `0` | Parallel FunASR instances; `0` = auto (`max(2, cpu_count / 2)`); memory scales with this value |
+
+**Optional: switch back to Whisper**
+
+Install `faster-whisper` and set `transcribe_provider` to `whisper` in `config.jsonc`:
+
+```bash
+pip3 install faster-whisper
+```
+
+| Whisper Model | Size | Speed | Accuracy |
+|---------------|------|-------|----------|
 | `tiny` | ~75 MB | Fastest | Fair |
-| `base` | ~150 MB | Fast | Good (**default**) |
+| `base` | ~150 MB | Fast | Good |
 | `small` | ~480 MB | Medium | Better |
 | `medium` | ~1.5 GB | Slow | Very good |
 | `large-v3` | ~3 GB | Slowest | Best |
@@ -242,8 +264,8 @@ claude login
 ```
 Confirm Node.js is installed: `node --version` (requires 18+)
 
-**Q: First Whisper run is slow**
-First run downloads the model (~150 MB for `base`). It is cached locally and not re-downloaded. If your network is slow, switch to `tiny` in `config.jsonc`: `"model": "tiny"`.
+**Q: First run is slow / downloading models**
+FunASR downloads `paraformer-zh`, `fsmn-vad`, and `ct-punc` on the first run (~400 MB total). They are cached locally and not re-downloaded. Ensure a stable network connection for the first run.
 
 **Q: How to confirm device names**
 ```bash
@@ -292,12 +314,11 @@ Click **Allow** when prompted. If you previously denied it, re-enable it in **Sy
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-### 第二步：安装 BlackHole 虚拟音频驱动
-
-BlackHole 是一个免费的虚拟声卡，用于捕获系统播放的音频（会议软件声音）。
+### 第二步：安装系统依赖
 
 ```bash
-brew install --cask blackhole-2ch
+brew install --cask blackhole-2ch   # 虚拟音频驱动，用于捕获系统播放的音频
+brew install ffmpeg                  # FunASR 转写所需的音频解码工具
 ```
 
 ### 第三步：配置 macOS 音频路由
@@ -337,6 +358,11 @@ claude --version    # 确认安装成功
 
 ```bash
 cd meetingscribe
+
+# 先安装 PyTorch（CPU 版；如需 GPU 版请访问 https://pytorch.org 选择对应命令）
+pip3 install torch torchaudio
+
+# 再安装其余依赖
 pip3 install -r requirements.txt
 ```
 
@@ -397,6 +423,7 @@ claude login
 
 ```cmd
 cd meetingscribe
+pip install torch torchaudio
 pip install -r requirements.txt
 ```
 
@@ -457,7 +484,7 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | 文件后缀 | 内容 |
 |----------|------|
 | `.wav` | 录音文件（系统音频 + 麦克风双路） |
-| `.raw.txt` | Whisper 原始转写文本（含时间戳） |
+| `.raw.txt` | 原始转写文本（含时间戳） |
 | `.proofread.txt` | AI 校对后文本 |
 | `.md` | 会议纪要 / 面试总结（Markdown 格式） |
 
@@ -472,17 +499,34 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `mode` | `meeting` | 默认模式：`meeting`（会议）/ `interview`（面试） |
-| `transcribe_provider` | `whisper` | 转写引擎：`whisper`（本地）/ `openai` / `gemini` |
+| `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `whisper` / `openai` / `gemini` |
 | `polish_provider` | `claude` | 校对模型：`claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | 纪要模型：`claude` / `openai` / `gemini` |
-| `stt.whisper.model` | `base` | Whisper 模型大小（见下表） |
+| `stt.funasr.hotword` | `""` | 热词（空格分隔），提升专有名词识别率 |
 
-**Whisper 模型对比：**
+**FunASR 配置项（`stt.funasr` 下）：**
 
-| 模型 | 文件大小 | 速度 | 准确度 |
-|------|----------|------|--------|
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `model` | `paraformer-zh` | ASR 模型，首次运行自动下载（约 400 MB） |
+| `vad_model` | `fsmn-vad` | 语音活动检测，支持长音频分句 |
+| `punc_model` | `ct-punc` | 标点恢复模型 |
+| `hotword` | `""` | 热词（空格分隔），提升领域专有词识别率 |
+| `chunk_secs` | `300` | 超过此时长自动分块并发转写（秒），`0` = 始终串行 |
+| `workers` | `0` | 并发实例数，`0` = 自动（`max(2, CPU核数/2)`），内存随之线性增长 |
+
+**可选：切换回 Whisper**
+
+安装 `faster-whisper` 并在 `config.jsonc` 中将 `transcribe_provider` 改为 `whisper`：
+
+```bash
+pip3 install faster-whisper
+```
+
+| Whisper 模型 | 大小 | 速度 | 准确度 |
+|--------------|------|------|--------|
 | `tiny` | ~75 MB | 最快 | 一般 |
-| `base` | ~150 MB | 快 | 较好（**默认**） |
+| `base` | ~150 MB | 快 | 较好 |
 | `small` | ~480 MB | 中等 | 好 |
 | `medium` | ~1.5 GB | 慢 | 很好 |
 | `large-v3` | ~3 GB | 最慢 | 最佳 |
@@ -503,9 +547,8 @@ claude login
 ```
 确认 Node.js 已安装：`node --version`（需要 18+）
 
-**Q：首次运行 Whisper 很慢**
-首次运行会自动下载模型（base 约 150 MB），下载完成后本地缓存，后续无需重新下载。
-如果网络较慢，可以先改用更小的模型：在 `config.jsonc` 中将 `"model": "base"` 改为 `"model": "tiny"`。
+**Q：首次运行转写很慢 / 正在下载模型**
+FunASR 在首次运行时会自动下载 `paraformer-zh`、`fsmn-vad`、`ct-punc` 三个模型（合计约 400 MB），下载完成后本地缓存，后续无需重新下载。请确保首次运行时网络畅通。
 
 **Q：如何确认设备名称是否正确**
 ```bash

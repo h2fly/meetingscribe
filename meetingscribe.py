@@ -22,7 +22,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
   python3 meetingscribe.py record --mode interview --transcribe-provider gemini --meeting-notes-provider openai
 
 ━━━ 转写已有文件 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # 传 .wav：若同目录已有 .raw.txt 则自动跳过 Whisper，直接校对 + 纪要
+  # 传 .wav：若同目录已有 .raw.txt 则自动跳过转写，直接校对 + 纪要
   python3 meetingscribe.py transcribe audio.wav
   python3 meetingscribe.py transcribe audio.wav --mode interview
   python3 meetingscribe.py transcribe audio.wav --transcribe-provider openai
@@ -31,7 +31,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
   python3 meetingscribe.py transcribe audio.wav --transcribe-provider openai --polish-provider gemini --meeting-notes-provider claude
   python3 meetingscribe.py transcribe audio.wav --mode interview --meeting-notes-provider gemini
 
-  # 传 .raw.txt：直接跳过 Whisper，从校对步骤开始
+  # 传 .raw.txt：直接跳过转写，从校对步骤开始
   python3 meetingscribe.py transcribe audio.raw.txt
   python3 meetingscribe.py transcribe audio.raw.txt --mode interview
   python3 meetingscribe.py transcribe audio.raw.txt --polish-provider gemini --meeting-notes-provider openai
@@ -53,16 +53,16 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
   python3 meetingscribe.py config --set meeting_notes_provider=claude
   python3 meetingscribe.py config --set llm_timeout=1200
   python3 meetingscribe.py config --set polish_chunk_size=3000
-  python3 meetingscribe.py config --set polish_max_workers=5   # 校对并发数，0=不限
+  python3 meetingscribe.py config --set polish_max_workers=5   # 校对并发数，0=自动(max(2, cpu//2))
 
 ━━━ 各环节 provider 可选值 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  --transcribe-provider    whisper（默认，本地）| openai | gemini
+  --transcribe-provider    funasr（默认，本地）| whisper | openai | gemini
   --polish-provider        claude（默认）| openai | gemini
   --meeting-notes-provider claude（默认）| openai | gemini
 
 ━━━ 输出文件（与录音 / 输入文件同目录）━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   <stem>.wav            录音文件
-  <stem>.raw.txt        Whisper 原始转写
+  <stem>.raw.txt        原始转写
   <stem>.proofread.txt  校对后转写（会议纪要/面试总结的输入）
   <stem>.md             会议纪要 / 面试总结
 """
@@ -73,6 +73,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import wave
 from datetime import datetime
@@ -82,7 +83,7 @@ import subprocess
 
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
+# faster_whisper 按需懒加载（仅在 transcribe_provider=whisper 时导入）
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 
@@ -105,11 +106,19 @@ DEFAULT_CONFIG = {
     # 校对并发数（同时调用 LLM 的块数），0 = 不限
     "polish_max_workers": 8,
     # 转写 / 校对 / 纪要各自使用的 provider
-    "transcribe_provider": "whisper",
+    "transcribe_provider": "funasr",
     "polish_provider": "claude",
     "meeting_notes_provider": "claude",
     # 语音转文字 provider 配置
     "stt": {
+        "funasr": {
+            "model": "paraformer-zh",   # ASR 模型（首次运行自动下载）
+            "vad_model": "fsmn-vad",    # VAD 分句模型，支持长音频
+            "punc_model": "ct-punc",    # 标点恢复模型
+            "hotword": "",              # 热词（空格分隔），提升专有名词识别率
+            "chunk_secs": 300,          # 超过此时长自动分块并发（秒），0 = 始终串行
+            "workers": 0,               # 并发实例数；0 = 自动（max(2, CPU核数/2)）
+        },
         "whisper": {
             "model": "base",        # tiny / base / small / medium / large-v3
             "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
@@ -272,7 +281,7 @@ class AudioRecorder:
             return False
         audio = np.concatenate(self._frames, axis=0)  # shape: (frames, channels)
 
-        # Drop silent channels; always write stereo (Whisper handles stereo fine)
+        # Drop silent channels; always write stereo (all STT providers handle stereo)
         if audio.ndim > 1 and audio.shape[1] > 2:
             channel_rms = np.sqrt(np.mean(audio ** 2, axis=0))
             active = [i for i, rms in enumerate(channel_rms) if rms > 1e-5]
@@ -382,17 +391,96 @@ class DualStreamRecorder:
         return True
 
 
+# ── 多路录音 ──────────────────────────────────────────────────────────────────
+
+class MultiStreamRecorder:
+    """从任意多个输入设备同时录制，混合为立体声输出。"""
+
+    def __init__(self, devices: list, sample_rate: int):
+        self.devices = list(devices)
+        self.sample_rate = sample_rate
+        self._frames: list = [[] for _ in self.devices]
+        self._streams: list = [None] * len(self.devices)
+        self.recording = False
+
+    def _make_cb(self, idx: int):
+        def _cb(indata, frames, time_info, status):
+            if self.recording:
+                self._frames[idx].append(indata.copy())
+        return _cb
+
+    def start(self):
+        if not self.devices:
+            raise ValueError("没有选择任何录音设备")
+        self.recording = True
+        self._frames = [[] for _ in self.devices]
+        block = int(self.sample_rate * 0.1)
+        try:
+            for i, device in enumerate(self.devices):
+                self._streams[i] = sd.InputStream(
+                    device=device, samplerate=self.sample_rate,
+                    channels=1, dtype="float32",
+                    callback=self._make_cb(i), blocksize=block,
+                )
+                self._streams[i].start()
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self):
+        self.recording = False
+        for i in range(len(self._streams)):
+            s = self._streams[i]
+            if s:
+                self._streams[i] = None
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def save(self, path: Path) -> bool:
+        channels = []
+        for frames in self._frames:
+            if frames:
+                audio = np.concatenate(frames)
+                channels.append(audio[:, 0] if audio.ndim > 1 else audio)
+        if not channels:
+            return False
+        min_len = min(len(c) for c in channels)
+        channels = [c[:min_len] for c in channels]
+        if len(channels) == 1:
+            mixed = np.column_stack([channels[0], channels[0]])
+        elif len(channels) == 2:
+            mixed = np.column_stack([channels[0], channels[1]])
+        else:
+            mono = np.mean(np.stack(channels, axis=1), axis=1)
+            mixed = np.column_stack([mono, mono])
+        audio_int16 = (np.clip(mixed, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(audio_int16.tobytes())
+        return True
+
+
 # ── 转写 ──────────────────────────────────────────────────────────────────────
 
 def transcribe(audio_path: Path, provider: str, cfg: dict, on_progress=None) -> str:
-    stt_cfgs = {**DEFAULT_CONFIG["stt"], **cfg.get("stt", {})}
+    stt_cfgs = _deep_merge(DEFAULT_CONFIG["stt"], cfg.get("stt", {}))
     pcfg = stt_cfgs.get(provider)
     if pcfg is None:
         print(f"[错误] 未知转写 provider '{provider}'，请在 config stt 中配置")
         sys.exit(1)
 
     print(f"[转写] 使用 {provider} 转写 {audio_path.name} ...")
-    if provider == "whisper":
+    if provider == "funasr":
+        return _transcribe_funasr(audio_path, pcfg, on_progress=on_progress)
+    elif provider == "whisper":
         return _transcribe_whisper(audio_path, pcfg, on_progress=on_progress)
     elif provider == "openai":
         return _transcribe_openai(audio_path, pcfg)
@@ -403,8 +491,114 @@ def transcribe(audio_path: Path, provider: str, cfg: dict, on_progress=None) -> 
         sys.exit(1)
 
 
+def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None) -> str:
+    import concurrent.futures, tempfile
+
+    asr_model   = pcfg.get("model", "paraformer-zh")
+    vad_model   = pcfg.get("vad_model", "fsmn-vad")
+    punc_model  = pcfg.get("punc_model", "ct-punc")
+    hotword     = pcfg.get("hotword", "")
+    chunk_secs       = int(pcfg.get("chunk_secs", 300))
+    _workers_cfg     = int(pcfg.get("workers", 0))
+    max_workers      = _workers_cfg if _workers_cfg > 0 else max(2, (os.cpu_count() or 4) // 2)
+
+    with wave.open(str(audio_path), "rb") as wf:
+        total_frames = wf.getnframes()
+        framerate    = wf.getframerate()
+        n_channels   = wf.getnchannels()
+        sampwidth    = wf.getsampwidth()
+    total_secs = total_frames / framerate
+
+    def _load_model():
+        from funasr import AutoModel
+        return AutoModel(model=asr_model, vad_model=vad_model, punc_model=punc_model,
+                         disable_update=True)
+
+    def _items_to_lines(items, offset_s=0.0):
+        lines = []
+        for item in items:
+            text = item.get("text", "").strip()
+            if not text:
+                continue
+            ts = item.get("timestamp")
+            if ts:
+                start_s = ts[0][0] / 1000.0 + offset_s
+                lines.append(f"[{start_s:05.1f}s] {text}")
+            else:
+                lines.append(text)
+        return lines
+
+    # ── 短录音：直接串行转写 ──────────────────────────────────────────────────
+    if chunk_secs <= 0 or total_secs <= chunk_secs:
+        print(f"[转写] 加载 FunASR {asr_model}（首次运行会自动下载模型）...")
+        m = _load_model()
+        if on_progress:
+            on_progress(10)
+        print(f"[转写] 开始转写 {audio_path.name} ...")
+        kwargs: dict = dict(input=str(audio_path), batch_size_s=300)
+        if hotword:
+            kwargs["hotword"] = hotword
+        results = m.generate(**kwargs)
+        if on_progress:
+            on_progress(38)
+        return "\n".join(_items_to_lines(results))
+
+    # ── 长录音：分块并发转写 ──────────────────────────────────────────────────
+    n_chunks       = math.ceil(total_secs / chunk_secs)
+    actual_workers = min(max_workers, n_chunks)
+    chunk_label = f"{chunk_secs // 60} 分钟" if chunk_secs >= 60 else f"{chunk_secs} 秒"
+    print(
+        f"[转写] 录音时长 {total_secs / 60:.1f} 分钟，分 {n_chunks} 块并发转写"
+        f"（每块 {chunk_label}，并发 {actual_workers}）"
+        f"，加载 FunASR {asr_model}..."
+    )
+
+    def _run_chunk(args):
+        chunk_path_str, offset_s, idx = args
+        m = _load_model()
+        kwargs: dict = dict(input=chunk_path_str, batch_size_s=300)
+        if hotword:
+            kwargs["hotword"] = hotword
+        items = m.generate(**kwargs)
+        return idx, _items_to_lines(items, offset_s)
+
+    with tempfile.TemporaryDirectory(prefix="meetingscribe_") as tmpdir:
+        chunk_args = []
+        with wave.open(str(audio_path), "rb") as wf:
+            for i in range(n_chunks):
+                start_f = int(i * chunk_secs * framerate)
+                end_f   = min(int((i + 1) * chunk_secs * framerate), total_frames)
+                wf.setpos(start_f)
+                chunk_data = wf.readframes(end_f - start_f)
+                chunk_path = Path(tmpdir) / f"chunk_{i:04d}.wav"
+                with wave.open(str(chunk_path), "wb") as cw:
+                    cw.setnchannels(n_channels)
+                    cw.setsampwidth(sampwidth)
+                    cw.setframerate(framerate)
+                    cw.writeframes(chunk_data)
+                chunk_args.append((str(chunk_path), float(i * chunk_secs), i))
+
+        chunk_results = [None] * n_chunks
+        done_count = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(_run_chunk, args): args[2] for args in chunk_args}
+            for future in concurrent.futures.as_completed(futures):
+                idx, lines = future.result()
+                chunk_results[idx] = lines
+                done_count += 1
+                print(f"[转写] 第 {idx + 1}/{n_chunks} 块完成")
+                if on_progress:
+                    on_progress(5 + int(done_count / n_chunks * 33))
+
+    all_lines: list[str] = []
+    for chunk_lines in chunk_results:
+        all_lines.extend(chunk_lines)
+    return "\n".join(all_lines)
+
+
 def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     import concurrent.futures, tempfile
+    from faster_whisper import WhisperModel
 
     model_size  = pcfg.get("model", "base")
     chunk_secs  = int(pcfg.get("chunk_secs", 300))
@@ -438,9 +632,10 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     # ── 长录音：分块并行转写 ──────────────────────────────────────────────────
     n_chunks       = math.ceil(total_secs / chunk_secs)
     actual_workers = min(max_workers, n_chunks)
+    chunk_label = f"{chunk_secs // 60} 分钟" if chunk_secs >= 60 else f"{chunk_secs} 秒"
     print(
         f"[转写] 录音时长 {total_secs / 60:.1f} 分钟，分 {n_chunks} 块并发转写"
-        f"（每块 {chunk_secs // 60} 分钟，并发 {actual_workers}）"
+        f"（每块 {chunk_label}，并发 {actual_workers}）"
         f"，加载 Whisper {model_size}..."
     )
 
@@ -762,7 +957,8 @@ def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "me
     total = len(chunks)
     if total == 0:
         return ""
-    max_workers = cfg.get("polish_max_workers", DEFAULT_CONFIG["polish_max_workers"]) or total
+    _w = cfg.get("polish_max_workers", DEFAULT_CONFIG["polish_max_workers"])
+    max_workers = _w if _w > 0 else max(2, (os.cpu_count() or 4) // 2)
     print(f"[校对] 并行调用 {provider}（{mode} 模式，共 {total} 块，并发 {min(max_workers, total)}）...")
 
     def _run(i_chunk):
@@ -872,7 +1068,7 @@ def cmd_record(args, cfg):
         print(f"[错误] 未知模式 '{mode}'，可选：{list(PROMPTS)}")
         sys.exit(1)
 
-    transcribe_provider  = getattr(args, "transcribe_provider", None)  or cfg.get("transcribe_provider", "whisper")
+    transcribe_provider  = getattr(args, "transcribe_provider", None)  or cfg.get("transcribe_provider", "funasr")
     polish_provider      = getattr(args, "polish_provider", None)       or cfg.get("polish_provider", "claude")
     notes_provider       = getattr(args, "meeting_notes_provider", None) or cfg.get("meeting_notes_provider", "claude")
 
@@ -880,7 +1076,7 @@ def cmd_record(args, cfg):
     proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
 
     if raw_txt_path.exists():
-        print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过 Whisper")
+        print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过转写")
         transcript_raw = raw_txt_path.read_text(encoding="utf-8")
     else:
         transcript_raw = transcribe(audio_path, transcribe_provider, cfg)
@@ -918,7 +1114,7 @@ def cmd_transcribe(args, cfg):
         print(f"[错误] 未知模式 '{mode}'，可选：{list(PROMPTS)}")
         sys.exit(1)
 
-    transcribe_provider  = getattr(args, "transcribe_provider", None)   or cfg.get("transcribe_provider", "whisper")
+    transcribe_provider  = getattr(args, "transcribe_provider", None)   or cfg.get("transcribe_provider", "funasr")
     polish_provider      = getattr(args, "polish_provider", None)        or cfg.get("polish_provider", "claude")
     notes_provider       = getattr(args, "meeting_notes_provider", None) or cfg.get("meeting_notes_provider", "claude")
 
@@ -931,11 +1127,11 @@ def cmd_transcribe(args, cfg):
         transcript_polished = proofread_path.read_text(encoding="utf-8")
         transcript_raw = None
     elif input_path.suffix == ".txt" and input_path.stem.endswith(".raw"):
-        # 直接传入 .raw.txt，跳过 Whisper
+        # 直接传入 .raw.txt，跳过转写
         audio_path = input_path.with_name(input_path.stem[:-4] + ".wav")
         raw_txt_path = input_path
         proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
-        print(f"[转写] 使用已有转写文件: {raw_txt_path.name}（跳过 Whisper）")
+        print(f"[转写] 使用已有转写文件: {raw_txt_path.name}（跳过转写）")
         transcript_raw = raw_txt_path.read_text(encoding="utf-8")
         transcript_polished = None
     else:
@@ -943,7 +1139,7 @@ def cmd_transcribe(args, cfg):
         raw_txt_path = audio_path.with_name(audio_path.stem + ".raw.txt")
         proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
         if raw_txt_path.exists():
-            print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过 Whisper")
+            print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过转写")
             transcript_raw = raw_txt_path.read_text(encoding="utf-8")
         else:
             transcript_raw = transcribe(audio_path, transcribe_provider, cfg)
@@ -998,7 +1194,7 @@ def cmd_ui(args, cfg):  # noqa: C901
     import threading as _t
     try:
         import tkinter as tk
-        from tkinter import ttk, scrolledtext, filedialog
+        from tkinter import ttk, scrolledtext, filedialog, messagebox
     except ImportError:
         print("[错误] tkinter 不可用，请确认 Python 安装包含 tkinter")
         sys.exit(1)
@@ -1043,6 +1239,11 @@ def cmd_ui(args, cfg):  # noqa: C901
             processing="处理中…", done="✓  完成",
             error="✕  出错", open_result="打开结果文件",
             log_title="LOG",
+            devices_label="监听设备",
+            no_device="请至少选择一个录音设备",
+            no_file="请先选择录音文件",
+            open_audio_midi="打开 Audio MIDI 设置",
+            open_sound_settings="打开声音设置",
         ),
         "en": dict(
             start="▶   Start Recording", stop="◼   Stop Recording",
@@ -1055,6 +1256,11 @@ def cmd_ui(args, cfg):  # noqa: C901
             processing="Processing…", done="✓  Done",
             error="✕  Error", open_result="Open Result",
             log_title="LOG",
+            devices_label="Input Devices",
+            no_device="Please select at least one input device",
+            no_file="Please select a recording file first",
+            open_audio_midi="Audio MIDI Setup",
+            open_sound_settings="Sound Settings",
         ),
     }
 
@@ -1064,7 +1270,7 @@ def cmd_ui(args, cfg):  # noqa: C901
     # ── 根窗口 ─────────────────────────────────────────────────────────────────
     root = tk.Tk()
     root.title("MeetingScribe")
-    root.geometry("580x720")
+    root.geometry("580x820")
     root.resizable(False, False)
     root.configure(bg=BG)
 
@@ -1077,18 +1283,19 @@ def cmd_ui(args, cfg):  # noqa: C901
     def sep(parent):
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=20, pady=6)
 
-    def card(parent, pady=(0, 0)):
+    def card(parent, pady=(0, 0), expand=False):
         outer = tk.Frame(parent, bg=BORDER, padx=1, pady=1)
-        outer.pack(fill="x", padx=20, pady=pady)
+        outer.pack(fill="both" if expand else "x", padx=20, pady=pady, expand=expand)
         inner = tk.Frame(outer, bg=CARD, padx=18, pady=14)
-        inner.pack(fill="x")
+        inner.pack(fill="both" if expand else "x", expand=expand)
         return inner
 
     # ── 辅助函数 ───────────────────────────────────────────────────────────────
 
     def add_log(msg):
+        ts = datetime.now().strftime("%H:%M:%S")
         log_box.configure(state="normal")
-        log_box.insert("end", msg + "\n")
+        log_box.insert("end", f"[{ts}] {msg}\n")
         log_box.see("end")
         log_box.configure(state="disabled")
 
@@ -1130,6 +1337,12 @@ def cmd_ui(args, cfg):  # noqa: C901
         btn_interview.configure(text=t("action_interview"))
         stop_btn.configure(text=t("stop_task"))
         open_btn.configure(text=t("open_result"))
+        if _btn_midi:
+            _btn_midi.configure(text=t(_btn_midi_key))
+        if st.get("chosen_path"):
+            chosen_var.set(t("chosen_prefix") + Path(st["chosen_path"]).name)
+        else:
+            chosen_var.set(t("chosen_none"))
 
     def toggle_record():
         if st["status"] == "idle":
@@ -1147,11 +1360,15 @@ def cmd_ui(args, cfg):  # noqa: C901
         out_record = cfg.get("output_record")
         if out_record:
             switch_output(out_record)
-        recorder = DualStreamRecorder(
-            sys_device=cfg.get("device_system_audio", "BlackHole 2ch"),
-            mic_device=cfg.get("device_mic", "MacBook Air Microphone"),
-            sample_rate=cfg["sample_rate"],
-        )
+        _input_names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] >= 1}
+        selected = [
+            name for name in [cfg.get("device_system_audio", ""), cfg.get("device_mic", "")]
+            if name and name in _input_names
+        ]
+        if not selected:
+            add_log(f"[ERR] {t('no_device')}")
+            return
+        recorder = MultiStreamRecorder(selected, cfg["sample_rate"])
         try:
             recorder.start()
         except Exception as e:
@@ -1182,12 +1399,13 @@ def cmd_ui(args, cfg):  # noqa: C901
         audio_path = st["audio_path"]
         if not recorder.save(audio_path):
             add_log("[ERR] 未录到任何音频")
-            st["status"] = "idle"
+            st.update(status="idle", recorder=None)
             rec_btn.configure(text=t("start"), fg=ACCENT, activeforeground=ACCENT)
             timer_lbl.configure(fg=TEXT)
+            _set_action_btns(True)
             return
         add_log(f"[REC] 完成 → {audio_path.name}")
-        st.update(status="idle", chosen_path=audio_path)
+        st.update(status="idle", recorder=None, chosen_path=audio_path)
         chosen_var.set(t("chosen_prefix") + audio_path.name)
         rec_btn.configure(text=t("start"), fg=ACCENT, activeforeground=ACCENT)
         timer_lbl.configure(fg=TEXT)
@@ -1195,8 +1413,8 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     def choose_file():
         path = filedialog.askopenfilename(
-            title="选择录音文件",
-            filetypes=[("WAV 录音", "*.wav")],
+            title=t("choose"),
+            filetypes=[("WAV", "*.wav")],
         )
         if path:
             st["chosen_path"] = Path(path)
@@ -1205,17 +1423,21 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     def stop_pipeline():
         cancel_flag[0] = True
+        pipeline_running[0] = False
         stop_btn.pack_forget()
         action_row.pack(fill="x")
         _draw_progress(0)
         st["status"] = "idle"
         rec_btn.configure(state="normal")
-        _set_action_btns(bool(st.get("chosen_path")))
+        _set_action_btns(True)
         add_log("[STOP] 已停止任务")
 
     def _start_pipeline(mode: str):
         path = st.get("chosen_path")
-        if not path or pipeline_running[0]:
+        if not path:
+            messagebox.showwarning(t("choose"), t("no_file"))
+            return
+        if pipeline_running[0]:
             return
         cancel_flag[0] = False
         pipeline_running[0] = True
@@ -1223,7 +1445,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         _set_action_btns(False)
         st["status"] = "processing"
         _draw_progress(0)
-        result_frame.pack_forget()
+        open_btn.pack_forget()
         action_row.pack_forget()
         stop_btn.pack(fill="x")
         _t.Thread(target=_run_pipeline, args=(path, mode), daemon=True).start()
@@ -1251,7 +1473,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         old_out = sys.stdout
         sys.stdout = _Tee(old_out)
         try:
-            tp  = cfg.get("transcribe_provider", "whisper")
+            tp  = cfg.get("transcribe_provider", "funasr")
             pp  = cfg.get("polish_provider", "claude")
             np_ = cfg.get("meeting_notes_provider", "claude")
 
@@ -1261,7 +1483,7 @@ def cmd_ui(args, cfg):  # noqa: C901
 
             log_q.put(("progress", 5))
             if raw_txt.exists():
-                print(f"[转写] 检测到 {raw_txt.name}，跳过 Whisper")
+                print(f"[转写] 检测到 {raw_txt.name}，跳过转写")
                 transcript_raw = raw_txt.read_text(encoding="utf-8")
             else:
                 def _transcribe_progress(pct):
@@ -1282,8 +1504,8 @@ def cmd_ui(args, cfg):  # noqa: C901
             note_path = save_minutes(notes, audio_path)
             print(f"✓ 完成 → {note_path}")
             log_q.put(("done", str(note_path)))
-        except SystemExit as e:
-            log_q.put(("error", f"Pipeline exited ({e.code})"))
+        except SystemExit:
+            log_q.put(("error", ""))  # actual error already in log via _Tee; just trigger UI reset
         except Exception as e:
             log_q.put(("error", str(e)))
         finally:
@@ -1311,21 +1533,22 @@ def cmd_ui(args, cfg):  # noqa: C901
                 elif kind == "done":
                     stop_btn.pack_forget()
                     action_row.pack(fill="x")
+                    rec_btn.configure(state="normal")
+                    _set_action_btns(True)
                     if not cancel_flag[0]:
                         _draw_progress(100)
                         st.update(status="idle", result_path=msg)
-                        rec_btn.configure(state="normal")
-                        _set_action_btns(bool(st.get("chosen_path")))
-                        result_frame.pack(fill="x", padx=20, pady=(8, 4))
+                        open_btn.pack(padx=20, pady=(8, 4))
                 elif kind == "error":
                     stop_btn.pack_forget()
                     action_row.pack(fill="x")
+                    rec_btn.configure(state="normal")
+                    _set_action_btns(True)
                     if not cancel_flag[0]:
-                        add_log(f"[ERR] {msg}")
+                        if msg:
+                            add_log(f"[ERR] {msg}")
                         _draw_progress(0)
                         st["status"] = "idle"
-                        rec_btn.configure(state="normal")
-                        _set_action_btns(bool(st.get("chosen_path")))
         except _q.Empty:
             pass
         root.after(100, _poll)
@@ -1339,6 +1562,29 @@ def cmd_ui(args, cfg):  # noqa: C901
              font=("Menlo", 14, "bold"), bg=BG, fg=ACCENT).pack(side="left")
     lang_row = tk.Frame(hdr, bg=BG)
     lang_row.pack(side="right")
+    if sys.platform == "darwin":
+        _btn_midi_key = "open_audio_midi"
+        _btn_midi = tk.Button(
+            lang_row, text="", relief="flat", bd=0, padx=8, pady=3,
+            font=("Menlo", 11), cursor="hand2", bg=BTN, fg=MUTED,
+            activebackground=BTN, activeforeground=ACCENT,
+            command=lambda: subprocess.run(
+                ["open", "/System/Applications/Utilities/Audio MIDI Setup.app"]
+            ),
+        )
+        _btn_midi.pack(side="left", padx=(0, 8))
+    elif sys.platform == "win32":
+        _btn_midi_key = "open_sound_settings"
+        _btn_midi = tk.Button(
+            lang_row, text="", relief="flat", bd=0, padx=8, pady=3,
+            font=("Menlo", 11), cursor="hand2", bg=BTN, fg=MUTED,
+            activebackground=BTN, activeforeground=ACCENT,
+            command=lambda: subprocess.run(["control", "mmsys.cpl"]),
+        )
+        _btn_midi.pack(side="left", padx=(0, 8))
+    else:
+        _btn_midi_key = None
+        _btn_midi = None
     btn_zh = tk.Button(lang_row, text="中文", relief="flat", bd=0, padx=8, pady=3,
                        font=("Menlo", 11), cursor="hand2", bg=LANG_ON, fg="#1c2b3a",
                        activebackground=LANG_ON, activeforeground="#1c2b3a",
@@ -1387,16 +1633,16 @@ def cmd_ui(args, cfg):  # noqa: C901
     action_row.pack(fill="x")
     btn_meeting = tk.Button(action_row, text="", font=("Menlo", 12, "bold"),
                             bg=BTN, fg=ACCENT, activebackground=BTN,
-                            activeforeground=ACCENT, disabledforeground=ACCENT,
+                            activeforeground=ACCENT, disabledforeground=MUTED,
                             relief="flat", bd=0, cursor="hand2",
-                            padx=12, pady=11, state="disabled",
+                            padx=12, pady=11, state="normal",
                             command=lambda: _start_pipeline("meeting"))
     btn_meeting.pack(side="left", expand=True, fill="x", padx=(0, 4))
     btn_interview = tk.Button(action_row, text="", font=("Menlo", 12, "bold"),
                               bg=BTN, fg=ACCENT, activebackground=BTN,
-                              activeforeground=ACCENT, disabledforeground=ACCENT,
+                              activeforeground=ACCENT, disabledforeground=MUTED,
                               relief="flat", bd=0, cursor="hand2",
-                              padx=12, pady=11, state="disabled",
+                              padx=12, pady=11, state="normal",
                               command=lambda: _start_pipeline("interview"))
     btn_interview.pack(side="left", expand=True, fill="x")
     stop_btn = tk.Button(ac, text="停止任务", font=("Menlo", 12, "bold"),
@@ -1418,29 +1664,29 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     sep(root)
 
-    # ⑥ 日志
-    lc = card(root, pady=(0, 0))
-    log_title_lbl = tk.Label(lc, text="", bg=CARD, fg=MUTED, font=("Menlo", 10))  # kept for set_lang ref
-    log_box = scrolledtext.ScrolledText(
-        lc, height=11, font=("Menlo", 11),
-        bg="#111d2a", fg=MUTED, insertbackground=ACCENT,
-        relief="flat", bd=0, state="disabled", wrap="word",
-        selectbackground=BORDER,
-    )
-    log_box.pack(fill="x")
-    log_box.configure(state="normal")
-    log_box.insert("end", "LOG\n")
-    log_box.configure(state="disabled")
-
-    # ⑦ 结果（完成后显示）
+    # ⑧ 结果（完成后显示）— 必须在日志卡片之前创建，否则 expand=True 的日志会把它挤到窗口外
     result_frame = tk.Frame(root, bg=BG)
+    result_frame.pack(fill="x")
     open_btn = tk.Button(result_frame, text="",
                          font=("Menlo", 12, "bold"),
                          bg=BTN, fg=ACCENT,
                          activebackground=BTN, activeforeground=ACCENT,
                          relief="flat", bd=0, cursor="hand2",
                          padx=28, pady=11, command=open_result)
-    open_btn.pack()
+    # open_btn intentionally not packed — shown only after pipeline completes
+
+    # ⑦ 日志
+    lc = card(root, pady=(0, 0), expand=True)
+    log_box = scrolledtext.ScrolledText(
+        lc, height=8, font=("Menlo", 11),
+        bg="#111d2a", fg=MUTED, insertbackground=ACCENT,
+        relief="flat", bd=0, state="disabled", wrap="word",
+        selectbackground=BORDER,
+    )
+    log_box.pack(fill="both", expand=True)
+    log_box.configure(state="normal")
+    log_box.insert("end", "LOG\n")
+    log_box.configure(state="disabled")
 
     # ── 初始化并启动 ───────────────────────────────────────────────────────────
     set_lang("zh")
@@ -1457,7 +1703,7 @@ def main():
     )
     sub = parser.add_subparsers(dest="cmd", metavar="<命令>")
 
-    stt_help = "可选：whisper / openai / gemini，或 stt 配置中的任意 key"
+    stt_help = "可选：funasr（默认）/ whisper / openai / gemini，或 stt 配置中的任意 key"
     llm_help = "可选：claude / openai / gemini，或 llm 配置中的任意 key"
 
     mode_help = "运行模式：meeting（会议纪要，默认）| interview（面试总结）"
@@ -1467,8 +1713,6 @@ def main():
 
     p_rec = sub.add_parser("record", help="开始录音（Ctrl+C 停止）")
     p_rec.add_argument("--mode", metavar="MODE", help=mode_help, default=argparse.SUPPRESS)
-    p_rec.add_argument("--title", metavar="标题", help="标题")
-    p_rec.add_argument("--device", metavar="N", help="音频设备编号（见 devices 命令）")
     p_rec.add_argument("--transcribe-provider", metavar="PROVIDER", help=f"语音转文字模型，{stt_help}")
     p_rec.add_argument("--polish-provider", metavar="PROVIDER", help=f"转写校对模型，{llm_help}")
     p_rec.add_argument("--meeting-notes-provider", metavar="PROVIDER", help=f"纪要/总结模型，{llm_help}")
@@ -1476,7 +1720,6 @@ def main():
     p_tr = sub.add_parser("transcribe", help="转写已有音频文件")
     p_tr.add_argument("file", help="音频文件路径")
     p_tr.add_argument("--mode", metavar="MODE", help=mode_help, default=argparse.SUPPRESS)
-    p_tr.add_argument("--title", metavar="标题", help="标题")
     p_tr.add_argument("--transcribe-provider", metavar="PROVIDER", help=f"语音转文字模型，{stt_help}")
     p_tr.add_argument("--polish-provider", metavar="PROVIDER", help=f"转写校对模型，{llm_help}")
     p_tr.add_argument("--meeting-notes-provider", metavar="PROVIDER", help=f"纪要/总结模型，{llm_help}")
