@@ -53,7 +53,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
   python3 meetingscribe.py config --set meeting_notes_provider=claude
   python3 meetingscribe.py config --set llm_timeout=1200
   python3 meetingscribe.py config --set polish_chunk_size=3000
-  python3 meetingscribe.py config --set polish_max_workers=5   # 校对并发数，0=自动(max(2, cpu//2))
+  python3 meetingscribe.py config --set polish_max_workers=5   # 校对并发数，0=自动(max(4, cpu//2))
 
 ━━━ 各环节 provider 可选值 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   --transcribe-provider    funasr（默认，本地）| whisper | openai | gemini
@@ -104,9 +104,9 @@ DEFAULT_CONFIG = {
     # LLM 调用超时（秒），长会议建议调大
     "llm_timeout": 600,
     # 校对时单块最大字符数，超出则分块处理
-    "polish_chunk_size": 3000,
-    # 校对并发数（同时调用 LLM 的块数），0 = 不限
-    "polish_max_workers": 8,
+    "polish_chunk_size": 6000,
+    # 校对并发数（同时调用 LLM 的块数），0 = 自动(max(4, cpu核数/2))
+    "polish_max_workers": 0,
     # 转写 / 校对 / 纪要各自使用的 provider
     "transcribe_provider": "funasr",
     "polish_provider": "claude",
@@ -314,16 +314,17 @@ def get_device_volume(device_name: str) -> float | None:
             continue
         if buf.value.decode("utf-8") != device_name:
             continue
-        # Try master element (0) first, then channel 1 as fallback
-        for elem in (0, 1):
-            vol = ctypes.c_float(0.0)
-            sz3 = ctypes.c_uint32(4)
-            ret = ca.AudioObjectGetPropertyData(
-                dev_id, ctypes.byref(_Addr(_fcc("volu"), kScopeOutput, elem)),
-                0, None, ctypes.byref(sz3), ctypes.byref(vol),
-            )
-            if ret == 0:
-                return vol.value
+        # 'vmvc' = virtual master volume (Mac built-in audio); 'volu' = per-channel (USB/BT)
+        for (prop, elems) in ((_fcc("vmvc"), (0,)), (_fcc("volu"), (0, 1))):
+            for elem in elems:
+                vol = ctypes.c_float(0.0)
+                sz3 = ctypes.c_uint32(4)
+                ret = ca.AudioObjectGetPropertyData(
+                    dev_id, ctypes.byref(_Addr(prop, kScopeOutput, elem)),
+                    0, None, ctypes.byref(sz3), ctypes.byref(vol),
+                )
+                if ret == 0:
+                    return vol.value
     return None
 
 
@@ -363,12 +364,18 @@ def set_device_volume(device_name: str, volume: float):
         if buf.value.decode("utf-8") != device_name:
             continue
         vol = ctypes.c_float(volume)
-        # Set on master (0) and stereo channels (1, 2); failures are silently ignored
-        for elem in (0, 1, 2):
-            ca.AudioObjectSetPropertyData(
-                dev_id, ctypes.byref(_Addr(_fcc("volu"), kScopeOutput, elem)),
-                0, None, ctypes.c_uint32(4), ctypes.byref(vol),
-            )
+        # Try 'vmvc' first (virtual master — Mac built-in / headphone jack)
+        ret = ca.AudioObjectSetPropertyData(
+            dev_id, ctypes.byref(_Addr(_fcc("vmvc"), kScopeOutput, 0)),
+            0, None, ctypes.c_uint32(4), ctypes.byref(vol),
+        )
+        if ret != 0:
+            # Fallback: per-channel 'volu' (USB audio, some external DACs)
+            for elem in (0, 1, 2):
+                ca.AudioObjectSetPropertyData(
+                    dev_id, ctypes.byref(_Addr(_fcc("volu"), kScopeOutput, elem)),
+                    0, None, ctypes.c_uint32(4), ctypes.byref(vol),
+                )
         return
 
 
@@ -1258,7 +1265,7 @@ def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "me
     if total == 0:
         return ""
     _w = cfg.get("polish_max_workers", DEFAULT_CONFIG["polish_max_workers"])
-    max_workers = _w if _w > 0 else max(2, (os.cpu_count() or 4) // 2)
+    max_workers = _w if _w > 0 else max(4, (os.cpu_count() or 8) // 2)
     print(f"[校对] 并行调用 {provider}（{mode} 模式，共 {total} 块，并发 {min(max_workers, total)}）...")
 
     def _run(i_chunk):
