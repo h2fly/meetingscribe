@@ -1970,7 +1970,7 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     if sys.platform == "darwin":
         vol_row = tk.Frame(rc, bg=CARD)
-        vol_row.pack(fill="x", padx=16, pady=(0, 10))
+        vol_row.pack(fill="x", padx=0, pady=(0, 10))
         tk.Label(vol_row, text="🔊", bg=CARD, fg=TEXT,
                  font=("Menlo", 12)).pack(side="left")
         vol_slider = tk.Scale(
