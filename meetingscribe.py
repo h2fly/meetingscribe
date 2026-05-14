@@ -1552,6 +1552,8 @@ def cmd_ui(args, cfg):  # noqa: C901
     timer_secs = [0]
     cancel_flag = [False]
     pipeline_running = [False]
+    vol_device = [None]   # physical output device to target for volume
+    vol_updating = [False]  # suppress feedback loop when slider is set programmatically
 
     # ── i18n ──────────────────────────────────────────────────────────────────
     TR = {
@@ -1673,6 +1675,27 @@ def cmd_ui(args, cfg):  # noqa: C901
         elif st["status"] == "recording":
             _stop_recording()
 
+    def _sync_vol_slider():
+        if sys.platform != "darwin":
+            return
+        d = vol_device[0]
+        if not d:
+            return
+        v = get_device_volume(d)
+        if v is not None:
+            vol_updating[0] = True
+            vol_slider.set(int(v * 100))
+            vol_pct_var.set(f"{int(v * 100)}%")
+            vol_updating[0] = False
+
+    def _on_vol_change(val_str):
+        if vol_updating[0]:
+            return
+        val = int(float(val_str))
+        vol_pct_var.set(f"{val}%")
+        if vol_device[0]:
+            set_device_volume(vol_device[0], val / 100.0)
+
     def _tick():
         timer_secs[0] += 1
         s = timer_secs[0]
@@ -1711,6 +1734,9 @@ def cmd_ui(args, cfg):  # noqa: C901
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_path = recordings_dir / f"{ts}.wav"
         st.update(status="recording", recorder=recorder, audio_path=audio_path, out_restore=devs["output_restore"])
+        if sys.platform == "darwin":
+            vol_device[0] = devs["output_restore"]
+            root.after(1200, _sync_vol_slider)  # wait for switch_output + 1s settle
         rec_btn.configure(text=t("stop"), fg=DANGER, activeforeground=DANGER)
         timer_secs[0] = 0
         timer_var.set("00:00:00")
@@ -1728,6 +1754,9 @@ def cmd_ui(args, cfg):  # noqa: C901
         out_restore = st.get("out_restore")
         if out_restore:
             switch_output(out_restore)
+        if sys.platform == "darwin":
+            vol_device[0] = _get_current_output_device()
+            root.after(100, _sync_vol_slider)
         audio_path = st["audio_path"]
         if not recorder.save(audio_path):
             add_log("[ERR] 未录到任何音频")
