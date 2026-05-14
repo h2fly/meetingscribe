@@ -1696,7 +1696,10 @@ def cmd_ui(args, cfg):  # noqa: C901
         val = int(float(val_str))
         vol_pct_var.set(f"{val}%")
         if vol_device[0]:
-            set_device_volume(vol_device[0], val / 100.0)
+            try:
+                set_device_volume(vol_device[0], val / 100.0)
+            except Exception:
+                pass
 
     def _tick():
         timer_secs[0] += 1
@@ -1970,7 +1973,7 @@ def cmd_ui(args, cfg):  # noqa: C901
 
     if sys.platform == "darwin":
         vol_row = tk.Frame(rc, bg=CARD)
-        vol_row.pack(fill="x", padx=0, pady=(0, 10))
+        vol_row.pack(fill="x", pady=(0, 10))
         tk.Label(vol_row, text="🔊", bg=CARD, fg=TEXT,
                  font=("Menlo", 12)).pack(side="left")
         vol_slider = tk.Scale(
