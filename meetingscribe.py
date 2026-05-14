@@ -344,8 +344,6 @@ def set_device_volume(device_name: str, volume: float):
 
     kSystem, kGlobal, kUTF8 = 1, _fcc("glob"), 0x08000100
     kScopeOutput = _fcc("outp")
-    if volume is None:
-        return
     volume = max(0.0, min(1.0, volume))
 
     sz = ctypes.c_uint32(0)
