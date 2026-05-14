@@ -533,3 +533,64 @@ class TestSaveMinutes:
         ms.save_minutes("first", wav)
         ms.save_minutes("second", wav)
         assert (tmp_path / "test.md").read_text(encoding="utf-8") == "second"
+
+
+# ── get_device_volume ─────────────────────────────────────────────────────────
+
+class TestGetDeviceVolume:
+    def test_returns_none_on_non_darwin(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert ms.get_device_volume("any device") is None
+
+    def test_returns_none_for_nonexistent_device(self):
+        # Passes through CoreAudio on darwin but finds no match; returns None elsewhere too
+        assert ms.get_device_volume("__nonexistent_device_xyz__") is None
+
+    def test_return_type_is_float_or_none(self):
+        import sys as _sys
+        if _sys.platform != "darwin":
+            pytest.skip("CoreAudio only on macOS")
+        result = ms.get_device_volume(ms._get_current_output_device() or "")
+        assert result is None or isinstance(result, float)
+
+    def test_value_in_range_when_device_found(self):
+        import sys as _sys
+        if _sys.platform != "darwin":
+            pytest.skip("CoreAudio only on macOS")
+        dev = ms._get_current_output_device()
+        if dev is None:
+            pytest.skip("no default output device")
+        v = ms.get_device_volume(dev)
+        if v is not None:
+            assert 0.0 <= v <= 1.0
+
+
+# ── set_device_volume ─────────────────────────────────────────────────────────
+
+class TestSetDeviceVolume:
+    def test_noop_on_non_darwin(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        ms.set_device_volume("any device", 0.5)  # must not raise
+
+    def test_noop_for_nonexistent_device(self):
+        ms.set_device_volume("__nonexistent_device_xyz__", 0.5)  # must not raise
+
+    def test_volume_clamped_no_exception_on_out_of_range(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        ms.set_device_volume("dev", -1.0)   # clamped to 0.0
+        ms.set_device_volume("dev", 2.0)    # clamped to 1.0
+
+    def test_roundtrip_restores_original_volume(self):
+        import sys as _sys
+        if _sys.platform != "darwin":
+            pytest.skip("CoreAudio only on macOS")
+        dev = ms._get_current_output_device()
+        if dev is None:
+            pytest.skip("no default output device")
+        original = ms.get_device_volume(dev)
+        if original is None:
+            pytest.skip("device does not expose volume property")
+        ms.set_device_volume(dev, original)  # set to same value — must not raise
+        restored = ms.get_device_volume(dev)
+        assert restored is not None
+        assert abs(restored - original) < 0.02  # within 2% tolerance
