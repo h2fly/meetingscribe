@@ -379,6 +379,176 @@ def set_device_volume(device_name: str, volume: float):
         return
 
 
+def _get_device_uid(device_name: str) -> str | None:
+    """Return kAudioDevicePropertyDeviceUID for a named CoreAudio device. macOS only."""
+    if sys.platform != "darwin":
+        return None
+    import ctypes, ctypes.util, struct
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal, kUTF8 = 1, _fcc("glob"), 0x08000100
+
+    sz = ctypes.c_uint32(0)
+    ca.AudioObjectGetPropertyDataSize(kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz))
+    ids = (ctypes.c_uint32 * (sz.value // 4))()
+    ca.AudioObjectGetPropertyData(kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz), ids)
+
+    for dev_id in ids:
+        cf_name = ctypes.c_void_p(0)
+        sz2 = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+        ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(_Addr(_fcc("lnam"), kGlobal, 0)), 0, None, ctypes.byref(sz2), ctypes.byref(cf_name))
+        if not cf_name.value:
+            continue
+        buf = ctypes.create_string_buffer(512)
+        if not cf.CFStringGetCString(cf_name, buf, 512, kUTF8):
+            continue
+        if buf.value.decode("utf-8") != device_name:
+            continue
+        cf_uid = ctypes.c_void_p(0)
+        sz3 = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+        ret = ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(_Addr(_fcc("uid "), kGlobal, 0)), 0, None, ctypes.byref(sz3), ctypes.byref(cf_uid))
+        if ret != 0 or not cf_uid.value:
+            continue
+        uid_buf = ctypes.create_string_buffer(512)
+        if cf.CFStringGetCString(cf_uid, uid_buf, 512, kUTF8):
+            return uid_buf.value.decode("utf-8")
+    return None
+
+
+def _create_recording_aggregate(physical_name: str, blackhole_name: str) -> tuple[str, int] | None:
+    """Dynamically create a private CoreAudio aggregate = physical_name + blackhole_name.
+
+    The aggregate lets audio play through the physical device AND BlackHole simultaneously,
+    so system audio is captured without causing a 'headphone disconnect' auto-pause.
+    Returns (aggregate_device_name, audio_object_id) or None on failure. macOS only.
+    """
+    if sys.platform != "darwin":
+        return None
+    import ctypes, ctypes.util, struct, plistlib, time as _time
+
+    physical_uid = _get_device_uid(physical_name)
+    blackhole_uid = _get_device_uid(blackhole_name)
+    if not physical_uid or not blackhole_uid:
+        return None
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal = 1, _fcc("glob")
+
+    # Find the CoreAudio HAL plugin — the one that exposes 'cagg' (CreateAggregateDevice)
+    plugin_sz = ctypes.c_uint32(0)
+    ca.AudioObjectGetPropertyDataSize(kSystem, ctypes.byref(_Addr(_fcc("plg#"), kGlobal, 0)), 0, None, ctypes.byref(plugin_sz))
+    plugin_ids = (ctypes.c_uint32 * (plugin_sz.value // 4))()
+    ca.AudioObjectGetPropertyData(kSystem, ctypes.byref(_Addr(_fcc("plg#"), kGlobal, 0)), 0, None, ctypes.byref(plugin_sz), plugin_ids)
+
+    plugin_id = None
+    for pid in plugin_ids:
+        chk = ctypes.c_uint32(0)
+        if ca.AudioObjectGetPropertyDataSize(pid, ctypes.byref(_Addr(_fcc("cagg"), kGlobal, 0)), 0, None, ctypes.byref(chk)) == 0:
+            plugin_id = pid
+            break
+
+    if plugin_id is None:
+        return None
+
+    # Serialize the aggregate description as XML plist, then convert to CFDictionaryRef
+    agg_uid = f"com.meetingscribe.agg.{int(_time.time() * 1000)}"
+    agg_name = "MeetingScribe Aggregate"
+    desc = {
+        "uid": agg_uid,
+        "name": agg_name,
+        "subdevices": [{"uid": physical_uid}, {"uid": blackhole_uid}],
+        "master": physical_uid,
+        "private": 1,
+        "stacked": 0,
+    }
+    plist_bytes = plistlib.dumps(desc, fmt=plistlib.FMT_XML)
+
+    cf.CFDataCreate.restype = ctypes.c_void_p
+    cf.CFDataCreate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long]
+    cf_data = cf.CFDataCreate(None, plist_bytes, len(plist_bytes))
+    if not cf_data:
+        return None
+
+    cf.CFPropertyListCreateWithData.restype = ctypes.c_void_p
+    cf.CFPropertyListCreateWithData.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    cf_dict = cf.CFPropertyListCreateWithData(None, cf_data, 0, None, None)
+    cf.CFRelease(ctypes.c_void_p(cf_data))
+    if not cf_dict:
+        return None
+
+    # GET 'cagg' with the CFDictionary as qualifier → returns AudioObjectID of new device
+    cf_dict_holder = ctypes.c_void_p(cf_dict)
+    new_id = ctypes.c_uint32(0)
+    sz_new = ctypes.c_uint32(ctypes.sizeof(ctypes.c_uint32))
+    ret = ca.AudioObjectGetPropertyData(
+        plugin_id,
+        ctypes.byref(_Addr(_fcc("cagg"), kGlobal, 0)),
+        ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p)),
+        ctypes.byref(cf_dict_holder),
+        ctypes.byref(sz_new),
+        ctypes.byref(new_id),
+    )
+    cf.CFRelease(ctypes.c_void_p(cf_dict))
+
+    if ret != 0 or new_id.value == 0:
+        return None
+
+    return (agg_name, new_id.value)
+
+
+def _destroy_recording_aggregate(device_id: int | None):
+    """Destroy a dynamic aggregate created by _create_recording_aggregate. macOS only."""
+    if sys.platform != "darwin" or not device_id:
+        return
+    import ctypes, ctypes.util, struct
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal = 1, _fcc("glob")
+
+    plugin_sz = ctypes.c_uint32(0)
+    ca.AudioObjectGetPropertyDataSize(kSystem, ctypes.byref(_Addr(_fcc("plg#"), kGlobal, 0)), 0, None, ctypes.byref(plugin_sz))
+    plugin_ids = (ctypes.c_uint32 * (plugin_sz.value // 4))()
+    ca.AudioObjectGetPropertyData(kSystem, ctypes.byref(_Addr(_fcc("plg#"), kGlobal, 0)), 0, None, ctypes.byref(plugin_sz), plugin_ids)
+
+    for pid in plugin_ids:
+        chk = ctypes.c_uint32(0)
+        if ca.AudioObjectGetPropertyDataSize(pid, ctypes.byref(_Addr(_fcc("dagg"), kGlobal, 0)), 0, None, ctypes.byref(chk)) == 0:
+            dev_id_val = ctypes.c_uint32(device_id)
+            ca.AudioObjectSetPropertyData(
+                pid,
+                ctypes.byref(_Addr(_fcc("dagg"), kGlobal, 0)),
+                0, None,
+                ctypes.c_uint32(4),
+                ctypes.byref(dev_id_val),
+            )
+            return
+
+
 def _coreaudio_device_info() -> dict[str, str]:
     """Return {device_name: transport_type_fourcc} for all CoreAudio devices. macOS only.
 
@@ -499,6 +669,46 @@ def _resolve_devices(cfg: dict) -> dict:
         return {k: cfg[k] for k in keys}
     detected = _auto_detect_devices()
     return {k: cfg.get(k) or detected.get(k) for k in keys}
+
+
+def _prepare_recording_devices(cfg: dict) -> dict:
+    """Like _resolve_devices but creates a dynamic CoreAudio aggregate on macOS when needed.
+
+    When the user has not explicitly configured output_record AND BlackHole is available,
+    this creates a private aggregate device (current_output + BlackHole) so that audio
+    continues playing through the current output (e.g. headphones) while also being
+    captured by BlackHole — preventing the 'headphone disconnect' auto-pause.
+
+    Returns the same keys as _resolve_devices plus 'output_record_id' (int | None).
+    Caller must call _destroy_recording_aggregate(result['output_record_id']) when done.
+    """
+    devs = _resolve_devices(cfg)
+
+    # Only create dynamic aggregate when: macOS + output_record not pinned by user + BlackHole found
+    if sys.platform != "darwin" or cfg.get("output_record") or not devs.get("device_system_audio"):
+        return {**devs, "output_record_id": None}
+
+    current_out = devs.get("output_restore")
+    blackhole = devs["device_system_audio"]
+    if not current_out or current_out == blackhole:
+        return {**devs, "output_record_id": None}
+
+    # Skip if current output is already an aggregate (avoid nested aggregates)
+    transport = _coreaudio_device_info()
+    if transport.get(current_out, "") in ("aggt", "grup"):
+        return {**devs, "output_record_id": None}
+
+    result = _create_recording_aggregate(current_out, blackhole)
+    if not result:
+        return {**devs, "output_record_id": None}
+
+    agg_name, agg_id = result
+    return {
+        **devs,
+        "output_record": agg_name,
+        "output_restore": current_out,
+        "output_record_id": agg_id,
+    }
 
 
 # ── 录音 ──────────────────────────────────────────────────────────────────────
@@ -1350,9 +1560,10 @@ def cmd_record(args, cfg):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     audio_path = recordings_dir / f"{ts}.wav"
 
-    devs = _resolve_devices(cfg)
+    devs = _prepare_recording_devices(cfg)
     out_record = devs["output_record"]
     out_restore = devs["output_restore"]
+    agg_id = devs.get("output_record_id")
 
     if not devs["device_system_audio"]:
         print("[警告] 未找到 BlackHole 设备，系统音频将无法录制。请安装 BlackHole 2ch。", file=sys.stderr)
@@ -1390,6 +1601,7 @@ def cmd_record(args, cfg):
     if out_restore:
         switch_output(out_restore)
         print(f"[音频] 输出已还原至: {out_restore}")
+    _destroy_recording_aggregate(agg_id)
 
     if not recorder.save(audio_path):
         print("[错误] 未录到任何音频")
@@ -1715,7 +1927,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         timer_job[0] = root.after(1000, _tick)
 
     def _start_recording():
-        devs = _resolve_devices(cfg)
+        devs = _prepare_recording_devices(cfg)
         add_log(f"[设备] 系统音频={devs['device_system_audio'] or '未找到'} | 麦克风={devs['device_mic'] or '未找到'} | 录音输出={devs['output_record'] or '无'} | 还原至={devs['output_restore'] or '未知'}")
         if devs["output_record"]:
             switch_output(devs["output_record"])
@@ -1724,6 +1936,7 @@ def cmd_ui(args, cfg):  # noqa: C901
             add_log(msg)
             if devs["output_record"] and devs["output_restore"]:
                 switch_output(devs["output_restore"])
+            _destroy_recording_aggregate(devs.get("output_record_id"))
 
         _input_names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] >= 1}
         selected = [
@@ -1745,7 +1958,8 @@ def cmd_ui(args, cfg):  # noqa: C901
         recordings_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_path = recordings_dir / f"{ts}.wav"
-        st.update(status="recording", recorder=recorder, audio_path=audio_path, out_restore=devs["output_restore"])
+        st.update(status="recording", recorder=recorder, audio_path=audio_path,
+                  out_restore=devs["output_restore"], agg_id=devs.get("output_record_id"))
         if sys.platform == "darwin":
             vol_device[0] = devs["output_restore"]
             root.after(1200, _sync_vol_slider)  # wait for switch_output + 1s settle
@@ -1766,6 +1980,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         out_restore = st.get("out_restore")
         if out_restore:
             switch_output(out_restore)
+        _destroy_recording_aggregate(st.pop("agg_id", None))
         if sys.platform == "darwin":
             vol_device[0] = out_restore or _get_current_output_device()
             root.after(100, _sync_vol_slider)
