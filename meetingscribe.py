@@ -1683,10 +1683,12 @@ def cmd_ui(args, cfg):  # noqa: C901
             return
         v = get_device_volume(d)
         if v is not None:
-            vol_updating[0] = True
-            vol_slider.set(int(v * 100))
-            vol_pct_var.set(f"{int(v * 100)}%")
-            vol_updating[0] = False
+            try:
+                vol_updating[0] = True
+                vol_slider.set(int(v * 100))
+                vol_pct_var.set(f"{int(v * 100)}%")
+            finally:
+                vol_updating[0] = False
 
     def _on_vol_change(val_str):
         if vol_updating[0]:
@@ -1755,7 +1757,7 @@ def cmd_ui(args, cfg):  # noqa: C901
         if out_restore:
             switch_output(out_restore)
         if sys.platform == "darwin":
-            vol_device[0] = _get_current_output_device()
+            vol_device[0] = out_restore or _get_current_output_device()
             root.after(100, _sync_vol_slider)
         audio_path = st["audio_path"]
         if not recorder.save(audio_path):
