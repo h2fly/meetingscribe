@@ -63,7 +63,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
 ━━━ 输出文件（与录音 / 输入文件同目录）━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   <stem>.wav            录音文件
   <stem>.raw.txt        原始转写
-  <stem>.proofread.txt  校对后转写（会议纪要/面试总结的输入）
+  <stem>.polish.txt     校对后转写（会议纪要/面试总结的输入）
   <stem>.md             会议纪要 / 面试总结
 """
 
@@ -278,6 +278,100 @@ def _get_current_output_device() -> str | None:
         return None
     buf = ctypes.create_string_buffer(512)
     return buf.value.decode("utf-8") if cf.CFStringGetCString(cf_str, buf, 512, kUTF8) else None
+
+
+def get_device_volume(device_name: str) -> float | None:
+    """Get master output volume (0.0–1.0) for a named device. macOS only."""
+    if sys.platform != "darwin":
+        return None
+    import ctypes, ctypes.util, struct
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal, kUTF8 = 1, _fcc("glob"), 0x08000100
+    kScopeOutput = _fcc("outp")
+
+    sz = ctypes.c_uint32(0)
+    ca.AudioObjectGetPropertyDataSize(kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz))
+    ids = (ctypes.c_uint32 * (sz.value // 4))()
+    ca.AudioObjectGetPropertyData(kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz), ids)
+
+    for dev_id in ids:
+        cf_str = ctypes.c_void_p(0)
+        sz2 = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+        ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(_Addr(_fcc("lnam"), kGlobal, 0)), 0, None, ctypes.byref(sz2), ctypes.byref(cf_str))
+        if not cf_str.value:
+            continue
+        buf = ctypes.create_string_buffer(512)
+        if not cf.CFStringGetCString(cf_str, buf, 512, kUTF8):
+            continue
+        if buf.value.decode("utf-8") != device_name:
+            continue
+        # Try master element (0) first, then channel 1 as fallback
+        for elem in (0, 1):
+            vol = ctypes.c_float(0.0)
+            sz3 = ctypes.c_uint32(4)
+            ret = ca.AudioObjectGetPropertyData(
+                dev_id, ctypes.byref(_Addr(_fcc("volu"), kScopeOutput, elem)),
+                0, None, ctypes.byref(sz3), ctypes.byref(vol),
+            )
+            if ret == 0:
+                return vol.value
+    return None
+
+
+def set_device_volume(device_name: str, volume: float):
+    """Set output volume (0.0–1.0) on a named device. macOS only; no-op elsewhere."""
+    if sys.platform != "darwin":
+        return
+    import ctypes, ctypes.util, struct
+
+    ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+    cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+    class _Addr(ctypes.Structure):
+        _fields_ = [("sel", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("elem", ctypes.c_uint32)]
+
+    def _fcc(s):
+        return struct.unpack(">I", s.encode())[0]
+
+    kSystem, kGlobal, kUTF8 = 1, _fcc("glob"), 0x08000100
+    kScopeOutput = _fcc("outp")
+    if volume is None:
+        return
+    volume = max(0.0, min(1.0, volume))
+
+    sz = ctypes.c_uint32(0)
+    ca.AudioObjectGetPropertyDataSize(kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz))
+    ids = (ctypes.c_uint32 * (sz.value // 4))()
+    ca.AudioObjectGetPropertyData(kSystem, ctypes.byref(_Addr(_fcc("dev#"), kGlobal, 0)), 0, None, ctypes.byref(sz), ids)
+
+    for dev_id in ids:
+        cf_str = ctypes.c_void_p(0)
+        sz2 = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+        ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(_Addr(_fcc("lnam"), kGlobal, 0)), 0, None, ctypes.byref(sz2), ctypes.byref(cf_str))
+        if not cf_str.value:
+            continue
+        buf = ctypes.create_string_buffer(512)
+        if not cf.CFStringGetCString(cf_str, buf, 512, kUTF8):
+            continue
+        if buf.value.decode("utf-8") != device_name:
+            continue
+        vol = ctypes.c_float(volume)
+        # Set on master (0) and stereo channels (1, 2); failures are silently ignored
+        for elem in (0, 1, 2):
+            ca.AudioObjectSetPropertyData(
+                dev_id, ctypes.byref(_Addr(_fcc("volu"), kScopeOutput, elem)),
+                0, None, ctypes.c_uint32(4), ctypes.byref(vol),
+            )
+        return
 
 
 def _coreaudio_device_info() -> dict[str, str]:
@@ -966,7 +1060,7 @@ _POLISH_BASE = """\
 PROMPTS = {
     "meeting": {
         "polish": "你是一位专业的文字校对助手，正在处理一段会议录音的转写文本。\n\n" + _POLISH_BASE,
-        "notes": """\
+        "notes_zh": """\
 你是一位专业的会议纪要助手。请根据以下转写文本生成结构化会议纪要。
 
 要求：
@@ -982,10 +1076,26 @@ PROMPTS = {
 【会议转写】
 {transcript}
 """,
+        "notes_en": """\
+You are a professional meeting notes assistant. Based on the following meeting transcript, generate structured meeting notes in English.
+
+Requirements:
+1. **Meeting Summary** — 2–3 sentences summarizing the core content
+2. **Key Topics** — list each major topic discussed
+3. **Decisions Made** — explicit decisions or consensus reached
+4. **Action Items** — format: Owner · Task · Due Date (mark "TBD" if unknown)
+5. **Key Insights** — notable observations worth recording
+
+Output in English, Markdown format, concise and clear. If the content is short or incomplete, state so honestly.
+
+---
+[Meeting Transcript]
+{transcript}
+""",
     },
     "interview": {
         "polish": "你是一位专业的文字校对助手，正在处理一段面试录音的转写文本。如能区分面试官与候选人，请在段落前标注「面试官：」或「候选人：」。\n\n" + _POLISH_BASE,
-        "notes": """\
+        "notes_zh": """\
 你是一位专业的面试评估助手。请根据以下面试转写文本生成结构化的面试总结。
 
 要求：
@@ -1001,6 +1111,24 @@ PROMPTS = {
 
 ---
 【面试转写】
+{transcript}
+""",
+        "notes_en": """\
+You are a professional interview evaluation assistant. Based on the following interview transcript, generate a structured interview summary in English.
+
+Requirements:
+1. **Candidate Overview** — name (if mentioned), role applied for, overall impression (2–3 sentences)
+2. **Q&A Summary** — key questions and candidate's responses, grouped by theme
+3. **Technical / Professional Skills** — depth and breadth of specific skills demonstrated
+4. **Soft Skills** — communication, logical thinking, learning ability, teamwork, etc.
+5. **Highlights** — standout moments or particularly impressive answers
+6. **Gaps / To Verify** — vague answers, lacking experience, or areas needing follow-up
+7. **Overall Assessment & Recommendation** — whether to advance to next round, with reasoning
+
+Output in English, Markdown format, objective and professional. If the content is short or incomplete, state so honestly.
+
+---
+[Interview Transcript]
 {transcript}
 """,
     },
@@ -1149,10 +1277,18 @@ def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "me
 
 
 def generate_notes(transcript: str, provider: str, cfg: dict, mode: str = "meeting") -> str:
+    import concurrent.futures
     label = "面试总结" if mode == "interview" else "会议纪要"
-    print(f"[{label}] 调用 {provider} 生成{label}...")
-    prompt = PROMPTS[mode]["notes"].format(transcript=transcript)
-    return _llm_run(prompt, provider, cfg, label)
+    print(f"[{label}] 并行生成中英文版本（{provider}）...")
+    prompt_zh = PROMPTS[mode]["notes_zh"].format(transcript=transcript)
+    prompt_en = PROMPTS[mode]["notes_en"].format(transcript=transcript)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        fut_zh = ex.submit(_llm_run, prompt_zh, provider, cfg, f"{label}(中文)")
+        fut_en = ex.submit(_llm_run, prompt_en, provider, cfg, f"{label}(English)")
+        notes_zh = fut_zh.result()
+        notes_en = fut_en.result()
+    divider = "\n\n---\n\n"
+    return notes_zh + divider + notes_en
 
 
 # ── 保存纪要 ──────────────────────────────────────────────────────────────────
@@ -1266,7 +1402,7 @@ def cmd_record(args, cfg):
     notes_provider       = getattr(args, "meeting_notes_provider", None) or cfg.get("meeting_notes_provider", "claude")
 
     raw_txt_path = audio_path.with_name(audio_path.stem + ".raw.txt")
-    proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
+    polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
 
     if raw_txt_path.exists():
         print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过转写")
@@ -1275,14 +1411,14 @@ def cmd_record(args, cfg):
         transcript_raw = transcribe(audio_path, transcribe_provider, cfg)
         raw_txt_path.write_text(transcript_raw, encoding="utf-8")
 
-    if proofread_path.exists():
-        print(f"[校对] 检测到已有校对文件 {proofread_path.name}，跳过校对")
-        transcript_polished = proofread_path.read_text(encoding="utf-8")
+    if polish_path.exists():
+        print(f"[校对] 检测到已有校对文件 {polish_path.name}，跳过校对")
+        transcript_polished = polish_path.read_text(encoding="utf-8")
     else:
         transcript_polished = polish_transcript(transcript_raw, polish_provider, cfg, mode)
-        proofread_path.write_text(transcript_polished, encoding="utf-8")
+        polish_path.write_text(transcript_polished, encoding="utf-8")
 
-    print(f"\n[校对] 已保存: {proofread_path}")
+    print(f"\n[校对] 已保存: {polish_path}")
     print("\n── 校对后转写 " + "─" * 46)
     print(transcript_polished)
     print("─" * 60)
@@ -1311,26 +1447,26 @@ def cmd_transcribe(args, cfg):
     polish_provider      = getattr(args, "polish_provider", None)        or cfg.get("polish_provider", "claude")
     notes_provider       = getattr(args, "meeting_notes_provider", None) or cfg.get("meeting_notes_provider", "claude")
 
-    # 支持直接传入 .raw.txt 或 .proofread.txt，或传 .wav 自动检测跳过已完成步骤
-    if input_path.suffix == ".txt" and input_path.stem.endswith(".proofread"):
-        # 直接传入 .proofread.txt，跳过转写和校对
+    # 支持直接传入 .raw.txt 或 .polish.txt，或传 .wav 自动检测跳过已完成步骤
+    if input_path.suffix == ".txt" and input_path.stem.endswith(".polish"):
+        # 直接传入 .polish.txt，跳过转写和校对
         audio_path = input_path.with_name(input_path.stem[:-10] + ".wav")
-        proofread_path = input_path
-        print(f"[校对] 使用已有校对文件: {proofread_path.name}（跳过转写和校对）")
-        transcript_polished = proofread_path.read_text(encoding="utf-8")
+        polish_path = input_path
+        print(f"[校对] 使用已有校对文件: {polish_path.name}（跳过转写和校对）")
+        transcript_polished = polish_path.read_text(encoding="utf-8")
         transcript_raw = None
     elif input_path.suffix == ".txt" and input_path.stem.endswith(".raw"):
         # 直接传入 .raw.txt，跳过转写
         audio_path = input_path.with_name(input_path.stem[:-4] + ".wav")
         raw_txt_path = input_path
-        proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
+        polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
         print(f"[转写] 使用已有转写文件: {raw_txt_path.name}（跳过转写）")
         transcript_raw = raw_txt_path.read_text(encoding="utf-8")
         transcript_polished = None
     else:
         audio_path = input_path
         raw_txt_path = audio_path.with_name(audio_path.stem + ".raw.txt")
-        proofread_path = audio_path.with_name(audio_path.stem + ".proofread.txt")
+        polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
         if raw_txt_path.exists():
             print(f"[转写] 检测到已有转写文件 {raw_txt_path.name}，跳过转写")
             transcript_raw = raw_txt_path.read_text(encoding="utf-8")
@@ -1340,15 +1476,15 @@ def cmd_transcribe(args, cfg):
         transcript_polished = None
 
     if transcript_polished is None:
-        if proofread_path.exists():
-            print(f"[校对] 检测到已有校对文件 {proofread_path.name}，跳过校对")
-            transcript_polished = proofread_path.read_text(encoding="utf-8")
+        if polish_path.exists():
+            print(f"[校对] 检测到已有校对文件 {polish_path.name}，跳过校对")
+            transcript_polished = polish_path.read_text(encoding="utf-8")
         else:
             transcript_polished = polish_transcript(transcript_raw, polish_provider, cfg, mode)
-            proofread_path.write_text(transcript_polished, encoding="utf-8")
+            polish_path.write_text(transcript_polished, encoding="utf-8")
 
     notes_label = "面试总结" if mode == "interview" else "会议纪要"
-    print(f"\n[校对] 已保存: {proofread_path}")
+    print(f"\n[校对] 已保存: {polish_path}")
     print("\n── 校对后转写 " + "─" * 46)
     print(transcript_polished)
     print("─" * 60)
@@ -1677,7 +1813,7 @@ def cmd_ui(args, cfg):  # noqa: C901
 
             audio_path = input_path
             raw_txt   = audio_path.with_name(audio_path.stem + ".raw.txt")
-            proofread = audio_path.with_name(audio_path.stem + ".proofread.txt")
+            polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
 
             log_q.put(("progress", 5))
             if raw_txt.exists():
@@ -1690,12 +1826,12 @@ def cmd_ui(args, cfg):  # noqa: C901
                 raw_txt.write_text(transcript_raw, encoding="utf-8")
 
             log_q.put(("progress", 40))
-            if proofread.exists():
-                print(f"[校对] 检测到 {proofread.name}，跳过校对")
-                transcript_polished = proofread.read_text(encoding="utf-8")
+            if polish_path.exists():
+                print(f"[校对] 检测到 {polish_path.name}，跳过校对")
+                transcript_polished = polish_path.read_text(encoding="utf-8")
             else:
                 transcript_polished = polish_transcript(transcript_raw, pp, cfg, mode)
-                proofread.write_text(transcript_polished, encoding="utf-8")
+                polish_path.write_text(transcript_polished, encoding="utf-8")
 
             log_q.put(("progress", 85))
             notes = generate_notes(transcript_polished, np_, cfg, mode)
