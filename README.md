@@ -40,6 +40,8 @@ brew install --cask blackhole-2ch   # virtual audio driver (captures system audi
 brew install ffmpeg                  # required by FunASR for audio decoding
 ```
 
+> ⚠️ **Restart your Mac after installing BlackHole.** The virtual audio driver is loaded at boot — without a restart, `BlackHole 2ch` will not appear in Audio MIDI Setup in Step 3.
+
 ### Step 3: Configure macOS audio routing
 
 This step routes system audio to both your speakers and BlackHole simultaneously.
@@ -320,6 +322,8 @@ Click **Allow** when prompted. If you previously denied it, re-enable it in **Sy
 brew install --cask blackhole-2ch   # 虚拟音频驱动，用于捕获系统播放的音频
 brew install ffmpeg                  # FunASR 转写所需的音频解码工具
 ```
+
+> ⚠️ **安装完 BlackHole 后请重启电脑。** 虚拟音频驱动需要随系统启动加载，不重启的话第三步在「音频 MIDI 设置」中看不到 `BlackHole 2ch` 设备。
 
 ### 第三步：配置 macOS 音频路由
 
