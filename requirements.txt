@@ -7,3 +7,9 @@ modelscope>=1.9.0
 # PyTorch：FunASR 依赖，需单独安装（平台相关，下方有说明）
 # pip install torch torchaudio   # CPU 版
 # 或访问 https://pytorch.org 选择 GPU 版本安装命令
+
+# 桌面 GUI（python3 meetingscribe.py ui）
+# 注意：包名是 PyQt6-Fluent-Widgets（带 6），不是 PyQt-Fluent-Widgets——后者会拖入
+# PyQt5，与 PyQt6 在同一进程中冲突（ObjC class 重复注册）。
+PyQt6>=6.6.0
+PyQt6-Fluent-Widgets>=1.5.0

@@ -20,7 +20,7 @@ Meeting scribe for macOS and Windows — captures both speaker and microphone au
 | Item | Detail |
 |------|--------|
 | Windows 10/11 | 64-bit |
-| Python 3.9+ | Download from [python.org](https://www.python.org/downloads/) — check **"Add to PATH"** and **"tcl/tk"** during install |
+| Python 3.9+ | Download from [python.org](https://www.python.org/downloads/) — check **"Add to PATH"** during install |
 | Node.js 18+ | Required for Claude Code CLI |
 
 ---
@@ -169,27 +169,23 @@ python meetingscribe.py devices
 
 ## Quick Start
 
-### GUI — Tkinter (default, no extra deps)
+### GUI
 
 ```bash
 python3 meetingscribe.py ui
 ```
 
-1. Click **▶ Start Recording** to begin
-2. Click **◼ Stop Recording** when done
-3. Click **Generate Meeting Notes** or **Generate Interview Summary**
-4. When complete, click **Open Result** to view the Markdown output
+The desktop GUI is a PyQt6 + Fluent Widgets app (single window, three views in the left navigation):
 
-### GUI — PyQt6 + Fluent (richer, optional)
+1. **录音 / Recording** — click the big circular mic button to start; click again to stop. Pick a previously recorded meeting from the right-side history sidebar to act on it. Three pipeline buttons below the timer:
+   - **Transcribe** — runs FunASR + LLM polish, produces `.polish.txt`
+   - **Generate meeting notes** — full pipeline → `.meeting.md`
+   - **Generate interview report** — full pipeline → `.interview.md`
+   When the corresponding output file already exists on disk, the button flips to "Open …" (blue) and just opens the file.
+2. **历史 / History** — full meeting list with four filter tabs (all / summarized / transcribed / pending), inline detail pane, and the same three pipeline buttons for rerunning steps on an old recording. Right-click any row to rename or delete (with confirmation).
+3. **配置 / Settings** — quick concurrency slider + a raw JSONC editor for `config.jsonc` (syntax highlighted; the editor is the canonical way to customise pipeline prompts, see `cfg["prompts"]`).
 
-```bash
-python3 -m pip install PyQt6 PyQt6-Fluent-Widgets
-python3 meetingscribe.py ui-qt
-```
-
-Coexists with the Tk version. Adds a left-side navigation between **录音** (recording) and **历史** (history) views, a meeting list with `.md` detail preview, and a Fluent-styled overall look. All Tk features are preserved.
-
-> Phase 0 MVP: search / filter / participants / todos in the history view are currently mocked placeholders; they will be backed by real data in a later phase.
+A 中文 / EN toggle in the top right flips every label, dialog and message in real time.
 
 ### Command Line
 
@@ -215,8 +211,11 @@ Recordings are saved to `~/Documents/meetingscribe/recordings/`. All output file
 |-----------|---------|
 | `.wav` | Recording (system audio + microphone, dual stream) |
 | `.raw.txt` | Raw transcript (with timestamps) |
-| `.proofread.txt` | AI-polished transcript |
-| `.md` | Meeting notes / interview summary (Markdown) |
+| `.polish.txt` | AI-polished transcript |
+| `.meeting.md` | Meeting notes (Markdown), generated when `mode=meeting` |
+| `.interview.md` | Interview report (Markdown), generated when `mode=interview` |
+
+A meeting may also have a human-readable suffix — `<timestamp>.<custom_name>.<ext>` (e.g. `20260512_090120.客户访谈.wav`). The legacy single-`.md` filename (no `.meeting` / `.interview` infix) is still recognised for backward compatibility.
 
 > Re-running automatically detects completed steps and skips them — no need to re-transcribe.
 
@@ -298,7 +297,7 @@ Click **Allow** when prompted. If you previously denied it, re-enable it in **Sy
 | 条件 | 说明 |
 |------|------|
 | Windows 10/11 64位 | |
-| Python 3.9+ | 从 [python.org](https://www.python.org/downloads/) 下载，安装时勾选 **"Add to PATH"** 和 **"tcl/tk"** |
+| Python 3.9+ | 从 [python.org](https://www.python.org/downloads/) 下载，安装时勾选 **"Add to PATH"** |
 | Node.js 18+ | 用于安装 Claude Code CLI |
 
 ---
@@ -447,18 +446,23 @@ python meetingscribe.py devices
 
 ## 快速开始
 
-### 图形界面（推荐）
+### 图形界面
 
 ```bash
 python3 meetingscribe.py ui
 ```
 
-使用流程：
+桌面界面基于 PyQt6 + Fluent Widgets，单窗口三个视图（左侧导航切换）：
 
-1. 点击「▶ 开始录音」→ 开始会议
-2. 会议结束后点「◼ 停止录音」
-3. 点击「开始整理会议纪要」或「开始整理面试记录」
-4. 等待处理完成，点击「打开结果文件」查看 Markdown 纪要
+1. **录音** — 点中间的大麦克风按钮开始录音，再点一次停止。右侧历史侧栏可以挑一条已有录音作为操作对象。计时器下方三个按钮：
+   - **语音转文字** — 跑 FunASR + LLM 校对，生成 `.polish.txt`
+   - **生成会议纪要** — 整条流水线 → `.meeting.md`
+   - **生成面试报告** — 整条流水线 → `.interview.md`
+   对应输出文件已存在时，按钮会变成蓝色的「打开 X」，点击直接打开文件。
+2. **历史** — 完整会议列表，四个筛选 tab（全部 / 已总结 / 已录音转文字 / 待处理），右侧详情面板，并复用同三个按钮以对旧录音重新跑流水线。任一会议右键可以重命名或删除（带二次确认）。
+3. **配置** — 一键调整三个并发参数 + 一个带语法高亮的 `config.jsonc` 原文编辑器（直接在这里改 `cfg["prompts"]` 自定义流水线 prompt）。
+
+右上角有 **中文 / EN** 切换按钮，实时翻转所有界面文字、对话框和提示。
 
 ### 命令行
 
@@ -484,8 +488,11 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 |----------|------|
 | `.wav` | 录音文件（系统音频 + 麦克风双路） |
 | `.raw.txt` | 原始转写文本（含时间戳） |
-| `.proofread.txt` | AI 校对后文本 |
-| `.md` | 会议纪要 / 面试总结（Markdown 格式） |
+| `.polish.txt` | AI 校对后的文本 |
+| `.meeting.md` | 会议纪要（Markdown），`mode=meeting` 时生成 |
+| `.interview.md` | 面试报告（Markdown），`mode=interview` 时生成 |
+
+录音也可以带一个可读后缀 — `<时间戳>.<自定义名字>.<后缀>`（例如 `20260512_090120.客户访谈.wav`），可通过历史界面的右键「重命名」设置。早期的单一 `.md` 文件（没有 `.meeting` / `.interview` 中段）仍然兼容识别。
 
 > 重复运行时会自动检测已完成的步骤并跳过，无需重新转写。
 

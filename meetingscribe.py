@@ -4012,8 +4012,8 @@ def _cmd_ui_body(args, cfg):
         "zh": {
             # ── Top bar / window
             "app.title": "MeetingScribe",
-            "topbar.lang_zh": "中文",
-            "topbar.lang_en": "EN",
+            "topbar.lang_zh": "中文/EN",
+            "topbar.lang_en": "中文/EN",
             # ── Nav
             "nav.recording": "录音",
             "nav.history": "历史",
@@ -4127,8 +4127,8 @@ def _cmd_ui_body(args, cfg):
         },
         "en": {
             "app.title": "MeetingScribe",
-            "topbar.lang_zh": "中文",
-            "topbar.lang_en": "EN",
+            "topbar.lang_zh": "中文/EN",
+            "topbar.lang_en": "中文/EN",
             "nav.recording": "Recording",
             "nav.history": "History",
             "nav.config": "Settings",
@@ -6075,11 +6075,11 @@ def _cmd_ui_body(args, cfg):
             self.stack.currentChanged.connect(self._on_view_changed)
 
             # ── Top language-switch bar ──────────────────────────────────
-            # Right-aligned single 中文 / EN toggle, sits above the stacked
-            # views. The button label shows the CURRENT language ("中文" in
-            # zh mode, "EN" in en mode) rendered in the accent-blue style.
-            # Clicking it flips `_LANG["current"]` to the other language
-            # and calls `apply_language()` on every view + the nav.
+            # Right-aligned 中文/EN toggle above the stacked views. Label is
+            # the literal "中文/EN" in both modes (so the button advertises
+            # both options regardless of which one is active). Clicking it
+            # flips `_LANG["current"]` to the other language and calls
+            # `apply_language()` on every view + the nav.
             self.topbar = QWidget(self)
             self.topbar.setObjectName("langTopbar")
             tb = QHBoxLayout(self.topbar)
@@ -6170,12 +6170,11 @@ def _cmd_ui_body(args, cfg):
                                 f"{type(e).__name__}: {e}")
 
         def _apply_lang_button_style(self):
-            """Render the single toggle button: label = the CURRENT language
-            ("中文" in zh mode, "EN" in en mode) with the accent-blue fill,
-            so the user can see at a glance which mode they're in. Clicking
-            flips to the other language via `_toggle_language`."""
-            key = "topbar.lang_zh" if _LANG["current"] == "zh" else "topbar.lang_en"
-            self.lang_toggle_btn.setText(_t(key))
+            """Render the single toggle button: label is the literal
+            "中文/EN" in both modes (advertises both options regardless of
+            which is active) with the accent-blue fill. Clicking flips to
+            the other language via `_toggle_language`."""
+            self.lang_toggle_btn.setText(_t("topbar.lang_zh"))
             self.lang_toggle_btn.setStyleSheet(
                 "PushButton {"
                 "  background-color: #0066d2;"
