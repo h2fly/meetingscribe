@@ -266,39 +266,42 @@ def _setup_log_file():
 _funasr_model_cache: dict = {}  # (asr_model, vad_model, punc_model) -> AutoModel instance
 
 DEFAULT_CONFIG = {
-    "sample_rate": 48000,
-    "channels": 3,
-    "output_record": None,
-    "output_restore": None,
-    "device_system_audio": None,
-    "device_mic": None,
-    # 模式：meeting（会议纪要）| interview（面试总结）
-    "mode": "meeting",
+    # ── 并发控制 / 性能 ────────────────────────────────────────────────────
     # LLM 调用超时（秒），长会议建议调大
     "llm_timeout": 600,
     # 校对时单块最大字符数，超出则分块处理
     "polish_chunk_size": 12000,
     # 校对并发数（同时调用 LLM 的块数），0 = 自动(max(4, cpu核数/2))
     "polish_max_workers": 0,
-    # 转写 / 校对 / 纪要各自使用的 provider
+    # ── 运行模式 ──────────────────────────────────────────────────────────
+    # meeting（会议纪要）| interview（面试总结）
+    "mode": "meeting",
+    # ── 各环节 provider ───────────────────────────────────────────────────
     "transcribe_provider": "funasr",
     "polish_provider": "claude",
     "meeting_notes_provider": "claude",
-    # 语音转文字 provider 配置
+    # ── 录音设备 ──────────────────────────────────────────────────────────
+    "sample_rate": 48000,
+    "channels": 3,
+    "output_record": None,
+    "output_restore": None,
+    "device_system_audio": None,
+    "device_mic": None,
+    # ── 语音转文字 provider 配置（含并发参数）─────────────────────────────
     "stt": {
         "funasr": {
+            "workers": 0,               # 并发实例数；0 = 自动（max(2, CPU核数/2)）
+            "chunk_secs": 300,          # 超过此时长自动分块并发（秒），0 = 始终串行
             "model": "paraformer-zh",   # ASR 模型（首次运行自动下载）
             "vad_model": "fsmn-vad",    # VAD 分句模型，支持长音频
             "punc_model": "ct-punc",    # 标点恢复模型
             "hotword": "",              # 热词（空格分隔），提升专有名词识别率
-            "chunk_secs": 300,          # 超过此时长自动分块并发（秒），0 = 始终串行
-            "workers": 0,               # 并发实例数；0 = 自动（max(2, CPU核数/2)）
         },
         "whisper": {
-            "model": "base",        # tiny / base / small / medium / large-v3
-            "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
             "workers": 2,           # 并行实例数；内存占用 = workers × 模型大小
+            "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
             "cpu_threads": 0,       # 每个实例的内部线程数；0 = 自动（CPU 核数 / 2）
+            "model": "base",        # tiny / base / small / medium / large-v3
         },
         "openai": {
             "api_key": "",
@@ -362,9 +365,129 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
+    """Save cfg to CONFIG_FILE.
+
+    When the existing file is a parseable JSONC document, edit it in place
+    so that comments, blank lines and key ordering are preserved — only the
+    leaf values that actually differ between `cfg` and disk are rewritten.
+    Falls back to a plain `json.dump` (comments dropped) when there is no
+    existing file, the existing file is unparseable, or any diff can't be
+    applied line-locally (e.g. a brand-new key was introduced).
+    """
     CONFIG_DIR.mkdir(exist_ok=True)
+    if _save_config_preserving_comments(cfg):
+        return
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _save_config_preserving_comments(cfg: dict) -> bool:
+    """Patch `CONFIG_FILE` in place so that JSONC comments survive a
+    ``config --set`` operation.
+
+    Algorithm:
+      1. Read existing file as text + parse the comment-stripped JSON to
+         know each key's current value.
+      2. Diff the parsed existing dict against `cfg` and collect a list of
+         ``(path, new_value)`` leaf changes. ``path`` is a tuple of keys
+         from root, e.g. ``("stt", "funasr", "workers")``.
+      3. Walk the file line by line. Track the scope (a stack of dict
+         keys) by recognising ``"key": {`` as a scope-open and a leading
+         ``}`` on a stripped line as a scope-close.
+      4. When a line ``"key": <value>...`` matches a pending diff, splice
+         in the new value at the front of `<value>` and keep the trailing
+         comma / whitespace / inline ``// comment`` exactly as written.
+
+    Returns True on a successful in-place write. Returns False (with a
+    diagnostic ``[CONFIG]`` log line) when the in-place strategy can't
+    handle the change — the caller then falls back to ``json.dump``.
+    """
+    if not CONFIG_FILE.exists():
+        return False
+    try:
+        text = CONFIG_FILE.read_text(encoding="utf-8")
+        existing = json.loads(_strip_jsonc_comments(text))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        _log("CONFIG", f"in-place save: parse failed: {type(e).__name__}: {e}")
+        return False
+
+    diffs: list[tuple[tuple[str, ...], object]] = []
+
+    def _collect(old, new, prefix):
+        if isinstance(new, dict) and isinstance(old, dict):
+            for k in new:
+                if k not in old:
+                    diffs.append((prefix + (k,), new[k]))
+                else:
+                    _collect(old[k], new[k], prefix + (k,))
+            return
+        if new != old:
+            diffs.append((prefix, new))
+
+    _collect(existing, cfg, ())
+    if not diffs:
+        return True
+
+    import re
+    KEY_RE = re.compile(
+        r'^(?P<indent>\s*)"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*(?P<rest>.*)$'
+    )
+
+    lines = text.splitlines(keepends=True)
+    pending: dict[tuple[str, ...], object] = {p: v for p, v in diffs}
+    scope: list[str] = []
+
+    for i, raw in enumerate(lines):
+        # Strip the line terminator so KEY_RE works regardless of CRLF / LF;
+        # rebuild it from the original `raw` after the substitution.
+        line = raw.rstrip("\n").rstrip("\r")
+        eol = raw[len(line):]
+        m = KEY_RE.match(line)
+        if m:
+            key = m.group("key")
+            rest = m.group("rest").rstrip()
+            current_path = tuple(scope) + (key,)
+
+            if rest == "{":
+                scope.append(key)
+                continue
+            if rest.startswith("{") and rest != "{":
+                _log("CONFIG", f"in-place save: inline object at {current_path}; "
+                               f"falling back to json.dump")
+                return False
+
+            if current_path in pending:
+                new_val = pending.pop(current_path)
+                # Find old value via the parsed existing dict.
+                cursor: object = existing
+                try:
+                    for k in current_path:
+                        cursor = cursor[k]  # type: ignore[index]
+                except (KeyError, TypeError):
+                    return False
+                old_json = json.dumps(cursor, ensure_ascii=False)
+                new_json = json.dumps(new_val, ensure_ascii=False)
+                if not rest.startswith(old_json):
+                    _log("CONFIG", f"in-place save: value mismatch at {current_path}; "
+                                   f"expected start={old_json!r} got={rest[:40]!r}; "
+                                   f"falling back to json.dump")
+                    return False
+                trailer = rest[len(old_json):]  # ',' + ' // comment' or ''
+                lines[i] = f"{m.group('indent')}\"{key}\": {new_json}{trailer}{eol}"
+            continue
+
+        # Non-key line: detect scope close on a stripped, comment-less view.
+        commentless = re.sub(r'//.*$', '', line)
+        if commentless.strip().startswith("}") and scope:
+            scope.pop()
+
+    if pending:
+        _log("CONFIG", f"in-place save: {len(pending)} diff(s) unapplied "
+                       f"(keys: {list(pending)}); falling back to json.dump")
+        return False
+
+    CONFIG_FILE.write_text("".join(lines), encoding="utf-8")
+    return True
 
 
 # ── 音频输出切换 ──────────────────────────────────────────────────────────────

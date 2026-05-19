@@ -1,5 +1,25 @@
 {
-  // ── 录音设备 ────────────────────────────────────────────────────────────────
+  // ── 并发控制 / 性能 ─────────────────────────────────────────────────────────
+  // 单次 LLM 调用超时（秒），长会议建议设为 1200 以上
+  "llm_timeout": 1200,
+  // 校对分块大小（字符数），超出则拆分为多块并行处理
+  "polish_chunk_size": 3000,
+  // 校对并发 worker 数（同时调用 LLM 的块数），0 = 不限
+  "polish_max_workers": 3,
+
+  // ── 运行模式 ─────────────────────────────────────────────────────────────────
+  // meeting（会议纪要，默认）| interview（面试总结）
+  "mode": "meeting",
+
+  // ── 各环节 Provider ──────────────────────────────────────────────────────────
+  // 语音转文字：funasr（本地，默认）| whisper（本地）| openai | gemini
+  "transcribe_provider": "funasr",
+  // 转写校对：claude | openai | gemini
+  "polish_provider": "claude",
+  // 会议纪要 / 面试总结：claude | openai | gemini
+  "meeting_notes_provider": "claude",
+
+  // ── 录音设备 ─────────────────────────────────────────────────────────────────
   // 录音采样率（Hz），建议与设备原生采样率一致
   "sample_rate": 48000,
   // 录音声道数（仅 AudioRecorder 使用，DualStreamRecorder 固定双路）
@@ -14,29 +34,29 @@
   // 麦克风设备（null = 自动探测，优先外接麦克风）
   "device_mic": null,
 
-  // ── 运行模式 ─────────────────────────────────────────────────────────────────
-  // meeting（会议纪要）| interview（面试总结）
-  "mode": "meeting",
-
-  // ── LLM 调用参数 ──────────────────────────────────────────────────────────────
-  // 单次 LLM 调用超时（秒），长会议建议设为 1200 以上
-  "llm_timeout": 1200,
-  // 校对分块大小（字符数），超出则拆分为多块并行处理
-  "polish_chunk_size": 3000,
-  // 校对并发数（同时调用 LLM 的块数），0 = 不限
-  "polish_max_workers": 8,
-
-  // ── 各环节 Provider ───────────────────────────────────────────────────────────
-  // 语音转文字：funasr（本地，默认）| whisper（本地）| openai | gemini
-  "transcribe_provider": "funasr",
-  // 转写校对：claude | openai | gemini
-  "polish_provider": "claude",
-  // 会议纪要 / 面试总结：claude | openai | gemini
-  "meeting_notes_provider": "claude",
-
   // ── 语音转文字（STT）Provider 配置 ────────────────────────────────────────────
   "stt": {
+    "funasr": {
+      // 并发实例数：0 = 自动（max(2, CPU 核数 / 2)），>0 = 指定数量；内存随之线性增长
+      "workers": 3,
+      // 超过此时长（秒）自动分块并行转写；0 = 始终串行
+      "chunk_secs": 300,
+      // ASR 模型，首次运行自动下载（约 400 MB）
+      "model": "paraformer-zh",
+      // 语音活动检测（VAD），支持长音频分句
+      "vad_model": "fsmn-vad",
+      // 标点恢复模型
+      "punc_model": "ct-punc",
+      // 热词（空格分隔），提升专有名词识别率
+      "hotword": ""
+    },
     "whisper": {
+      // 并发实例数（每实例独立加载模型，注意内存占用）
+      "workers": 3,
+      // 超过此时长（秒）自动分块并行转写
+      "chunk_secs": 300,
+      // 每个 whisper 实例使用的 CPU 线程数；0 = faster-whisper 默认
+      "cpu_threads": 0,
       // tiny / base / small / medium / large-v3，越大越准但越慢
       "model": "base"
     },
@@ -55,7 +75,9 @@
   "llm": {
     "claude": {
       // claude-cli 使用本地安装的 Claude Code CLI（`claude -p`）
-      "type": "claude-cli"
+      "type": "claude-cli",
+      // 可选：指定 claude-cli 的模型（空字符串 = 使用 CLI 默认）
+      "model": ""
     },
     "openai": {
       "type": "openai",

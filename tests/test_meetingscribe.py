@@ -2012,3 +2012,129 @@ class TestGetMultiOutputPhysicalSubs:
         ]
         with patch.object(ms, "_coreaudio_device_raw_dump", return_value=dump):
             assert ms._get_multi_output_physical_subs("多输出设备") == []
+
+
+# ── save_config JSONC comment preservation ─────────────────────────────────
+
+
+class TestSaveConfigPreservesComments:
+    """`save_config` is invoked by `config --set k=v`. Before this fix it
+    used `json.dump` and silently stripped all comments. The in-place editor
+    walks the existing JSONC text, finds the lines whose values diverge from
+    `cfg`, and rewrites only those values — preserving every comment,
+    blank line and key ordering exactly. When the change is too structural
+    to patch line-locally (new key, malformed file, missing file), the
+    function falls back to plain `json.dump`."""
+
+    SAMPLE_JSONC = (
+        "{\n"
+        "  // ── 并发控制 ────────────────────────────\n"
+        "  // LLM 超时（秒）\n"
+        "  \"llm_timeout\": 600,\n"
+        "  // 并发 worker 数\n"
+        "  \"polish_max_workers\": 0,\n"
+        "\n"
+        "  // ── 运行模式 ────────────────────────────\n"
+        "  \"mode\": \"meeting\",\n"
+        "\n"
+        "  // STT 配置\n"
+        "  \"stt\": {\n"
+        "    \"funasr\": {\n"
+        "      \"workers\": 0,        // 0 = auto\n"
+        "      \"chunk_secs\": 300,\n"
+        "      \"model\": \"paraformer-zh\"\n"
+        "    },\n"
+        "    \"whisper\": {\n"
+        "      \"model\": \"base\"\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+
+    def _patch_paths(self, tmp_path):
+        cfg_dir = tmp_path
+        cfg_file = cfg_dir / "config.jsonc"
+        cfg_file.write_text(self.SAMPLE_JSONC, encoding="utf-8")
+        return patch.multiple(ms, CONFIG_DIR=cfg_dir, CONFIG_FILE=cfg_file)
+
+    def _parsed_cfg(self):
+        """Parse SAMPLE_JSONC directly — bypass load_config's DEFAULT_CONFIG
+        merge so we can drive `save_config` with a dict that contains only
+        the keys we wrote into the test file. (The merge would otherwise
+        inject every DEFAULT_CONFIG default and make them look like new
+        keys to the in-place patcher.)"""
+        return json.loads(ms._strip_jsonc_comments(self.SAMPLE_JSONC))
+
+    def test_top_level_value_change_preserves_all_comments(self, tmp_path):
+        with self._patch_paths(tmp_path):
+            cfg = self._parsed_cfg()
+            cfg["polish_max_workers"] = 5
+            ms.save_config(cfg)
+            text = ms.CONFIG_FILE.read_text(encoding="utf-8")
+        # Every comment line from the original survives byte-for-byte.
+        original_comment_lines = [l for l in self.SAMPLE_JSONC.splitlines() if "//" in l]
+        new_comment_lines = [l for l in text.splitlines() if "//" in l]
+        assert new_comment_lines == original_comment_lines
+        assert '"polish_max_workers": 5' in text
+        # Untouched values stay verbatim
+        assert '"llm_timeout": 600' in text
+
+    def test_nested_value_change_preserves_inline_comment(self, tmp_path):
+        with self._patch_paths(tmp_path):
+            cfg = self._parsed_cfg()
+            cfg["stt"]["funasr"]["workers"] = 7
+            ms.save_config(cfg)
+            text = ms.CONFIG_FILE.read_text(encoding="utf-8")
+        # Inline `// 0 = auto` comment on the workers line must survive.
+        assert '"workers": 7,        // 0 = auto' in text
+
+    def test_string_value_change_round_trips(self, tmp_path):
+        with self._patch_paths(tmp_path):
+            cfg = self._parsed_cfg()
+            cfg["mode"] = "interview"
+            ms.save_config(cfg)
+            text = ms.CONFIG_FILE.read_text(encoding="utf-8")
+        assert '"mode": "interview"' in text
+        assert "// ── 运行模式 ────" in text
+
+    def test_no_change_is_noop_and_keeps_file_byte_identical(self, tmp_path):
+        with self._patch_paths(tmp_path):
+            cfg = self._parsed_cfg()
+            ms.save_config(cfg)
+            text = ms.CONFIG_FILE.read_text(encoding="utf-8")
+        assert text == self.SAMPLE_JSONC
+
+    def test_new_key_falls_back_to_plain_json(self, tmp_path):
+        """A key in `cfg` that is not in the existing file can't be patched
+        line-locally; the save MUST cleanly fall back to json.dump (which
+        is allowed to drop comments rather than corrupting the file)."""
+        with self._patch_paths(tmp_path):
+            cfg = self._parsed_cfg()
+            cfg["brand_new_setting"] = "hello"
+            ms.save_config(cfg)
+            text = ms.CONFIG_FILE.read_text(encoding="utf-8")
+        reloaded = json.loads(text)
+        # Round-trip preserves data
+        assert reloaded["brand_new_setting"] == "hello"
+        # Comments are dropped (expected fallback behavior)
+        assert "//" not in text
+        assert reloaded["polish_max_workers"] == 0
+
+    def test_missing_file_falls_back_to_plain_json(self, tmp_path):
+        cfg_dir = tmp_path
+        cfg_file = cfg_dir / "config.jsonc"
+        assert not cfg_file.exists()
+        with patch.multiple(ms, CONFIG_DIR=cfg_dir, CONFIG_FILE=cfg_file):
+            ms.save_config({"polish_max_workers": 3})
+            text = cfg_file.read_text(encoding="utf-8")
+        # Plain JSON, no comments
+        assert json.loads(text) == {"polish_max_workers": 3}
+
+    def test_corrupt_existing_file_falls_back_to_plain_json(self, tmp_path):
+        cfg_dir = tmp_path
+        cfg_file = cfg_dir / "config.jsonc"
+        cfg_file.write_text("{ not valid json", encoding="utf-8")
+        with patch.multiple(ms, CONFIG_DIR=cfg_dir, CONFIG_FILE=cfg_file):
+            ms.save_config({"polish_max_workers": 4})
+            text = cfg_file.read_text(encoding="utf-8")
+        assert json.loads(text) == {"polish_max_workers": 4}
