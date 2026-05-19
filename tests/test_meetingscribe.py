@@ -1185,17 +1185,31 @@ class TestPolishTranscript:
 # ── save_minutes ──────────────────────────────────────────────────────────────
 
 class TestSaveMinutes:
-    def test_writes_md_next_to_wav(self, tmp_path):
+    def test_writes_meeting_md_by_default(self, tmp_path):
         wav = tmp_path / "20260101_120000.wav"
         out = ms.save_minutes("# Notes", wav)
-        assert out == tmp_path / "20260101_120000.md"
+        # Default mode='meeting' → <stem>.meeting.md (interview mode produces
+        # <stem>.interview.md). The mode-tagged suffix lets the same .wav
+        # carry both a meeting summary AND an interview report side by side.
+        assert out == tmp_path / "20260101_120000.meeting.md"
         assert out.read_text(encoding="utf-8") == "# Notes"
+
+    def test_writes_interview_md_for_interview_mode(self, tmp_path):
+        wav = tmp_path / "20260101_120000.wav"
+        out = ms.save_minutes("# Report", wav, mode="interview")
+        assert out == tmp_path / "20260101_120000.interview.md"
+        assert out.read_text(encoding="utf-8") == "# Report"
 
     def test_overwrites_existing_md_file(self, tmp_path):
         wav = tmp_path / "test.wav"
         ms.save_minutes("first", wav)
         ms.save_minutes("second", wav)
-        assert (tmp_path / "test.md").read_text(encoding="utf-8") == "second"
+        assert (tmp_path / "test.meeting.md").read_text(encoding="utf-8") == "second"
+
+    def test_unknown_mode_falls_back_to_meeting_suffix(self, tmp_path):
+        wav = tmp_path / "x.wav"
+        out = ms.save_minutes("body", wav, mode="bogus")
+        assert out.name == "x.meeting.md"
 
 
 # ── get_device_volume ─────────────────────────────────────────────────────────
@@ -1675,16 +1689,21 @@ class TestNoSilentExcepts:
         # Expected silent-pass sites (must stay silent — see design doc D6):
         #   • _log file-write recursion guard
         #   • _log console-mirror recursion guard
-        #   • _setup_log_file restore after handle cleared
+        #   • stdlib-logging → file Handler.emit (avoid logging-from-logging recursion)
+        #   • _setup_log_file._restore: removeHandler (idempotent cleanup)
+        #   • _setup_log_file._restore: fh.close (already-closed handle is fine)
         #   • CoreAudio listener callback (must not raise into HAL thread)
-        #   • config _set value-cast fallback loop
-        #   • _poll _q.Empty sentinel
-        #   • _atexit_restore_mutes inner-log fallback (never raise from atexit)
+        #   • _atexit_restore_mutes outer (atexit never raises)
+        #   • _atexit_restore_mutes inner-log fallback (logging itself might fail)
         #   • module-level _recover_persisted_mutes inner-log fallback (never
         #     raise from module import)
+        #   • config _set value-cast fallback loop
+        #   • _poll _q.Empty sentinel
+        #   • cmd_ui_qt _start_recording dOut-failure mute-rollback (best-effort;
+        #     we're already in an error path, don't shadow the original failure)
         # If you add a new silent pass, document it here AND in the design doc.
-        assert len(matches) <= 9, (
-            f"Found {len(matches)} silent except: pass blocks — expected ≤9. "
+        assert len(matches) <= 12, (
+            f"Found {len(matches)} silent except: pass blocks — expected ≤12. "
             f"Either log the failure or document it as deliberate."
         )
 
