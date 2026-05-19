@@ -169,7 +169,7 @@ python meetingscribe.py devices
 
 ## Quick Start
 
-### GUI (recommended)
+### GUI — Tkinter (default, no extra deps)
 
 ```bash
 python3 meetingscribe.py ui
@@ -179,6 +179,17 @@ python3 meetingscribe.py ui
 2. Click **◼ Stop Recording** when done
 3. Click **Generate Meeting Notes** or **Generate Interview Summary**
 4. When complete, click **Open Result** to view the Markdown output
+
+### GUI — PyQt6 + Fluent (richer, optional)
+
+```bash
+python3 -m pip install PyQt6 PyQt6-Fluent-Widgets
+python3 meetingscribe.py ui-qt
+```
+
+Coexists with the Tk version. Adds a left-side navigation between **录音** (recording) and **历史** (history) views, a meeting list with `.md` detail preview, and a Fluent-styled overall look. All Tk features are preserved.
+
+> Phase 0 MVP: search / filter / participants / todos in the history view are currently mocked placeholders; they will be backed by real data in a later phase.
 
 ### Command Line
 

@@ -144,6 +144,52 @@ def _log(category: str, message: str):
             pass
 
 
+class _LogFileHandler:
+    """Bridge Python ``logging`` records into the shared daily log file.
+
+    Third-party libraries (modelscope, jieba, funasr, ...) emit through the
+    ``logging`` module. Their default StreamHandlers grabbed the original
+    sys.stderr at import time, so our sys.stderr swap in _setup_log_file()
+    doesn't catch them. This handler is installed on the root logger inside
+    _setup_log_file() and writes WARNING+ records into the same file as
+    ``_log()`` — sharing _log_file_lock so writes interleave cleanly.
+
+    Note: not a logging.Handler subclass to avoid importing ``logging`` at
+    module load. Duck-typed: only ``level``, ``handle()``, ``createLock()``,
+    ``acquire()``, ``release()`` are exercised by logging.Logger.callHandlers.
+    """
+
+    def __init__(self, level):
+        self.level = level
+        self._lock = threading.RLock()
+
+    def createLock(self):
+        pass  # already created in __init__
+
+    def acquire(self):
+        self._lock.acquire()
+
+    def release(self):
+        self._lock.release()
+
+    def handle(self, record):
+        if record.levelno < self.level:
+            return
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = str(record.msg)
+            line = f"[{ts}] [LOG-{record.levelname}] {record.name}: {msg}\n"
+            with _log_file_lock:
+                if _log_file_handle is not None:
+                    _log_file_handle.write(line)
+                    _log_file_handle.flush()
+        except Exception:
+            pass
+
+
 def _dbg(msg: str):
     """Deprecated: prefer _log(category, message). Kept as a thin shim that
     forwards uncategorised diagnostic messages to the log file (and to stderr
@@ -251,8 +297,23 @@ def _setup_log_file():
     # same file as the stdout/stderr tee — chronologically interleaved.
     _log_file_handle = fh
 
+    # Capture Python `logging` records (modelscope / jieba / funasr / urllib3
+    # ...) into the same file. Their existing StreamHandlers retain their
+    # references to the original stderr — those still print to the terminal,
+    # so the user-visible behavior is unchanged; we just additionally tee
+    # WARNING+ records into the log file. INFO/DEBUG are filtered out to keep
+    # the file readable; bump to logging.INFO here if more verbosity is
+    # needed during diagnostics.
+    import logging as _logging
+    log_handler = _LogFileHandler(level=_logging.WARNING)
+    _logging.root.addHandler(log_handler)
+
     def _restore():
         global _log_file_handle
+        try:
+            _logging.root.removeHandler(log_handler)
+        except Exception:
+            pass
         sys.stdout, sys.stderr = saved_out, saved_err
         with _log_file_lock:
             _log_file_handle = None
@@ -2995,8 +3056,20 @@ def transcribe_and_polish(
 
 # ── 保存纪要 ──────────────────────────────────────────────────────────────────
 
-def save_minutes(minutes: str, audio_path: Path) -> Path:
-    note_path = audio_path.with_suffix(".md")
+_NOTES_SUFFIX = {"meeting": ".meeting.md", "interview": ".interview.md"}
+
+
+def save_minutes(minutes: str, audio_path: Path, mode: str = "meeting") -> Path:
+    """Persist generated notes / interview report next to the audio file.
+
+    Output path:
+      mode='meeting'   → <stem>.meeting.md   (会议纪要)
+      mode='interview' → <stem>.interview.md (面试报告)
+
+    Unknown modes fall back to .meeting.md to avoid silent data loss.
+    """
+    suffix = _NOTES_SUFFIX.get(mode, ".meeting.md")
+    note_path = audio_path.with_name(audio_path.stem + suffix)
     note_path.write_text(minutes, encoding="utf-8")
     return note_path
 
@@ -3294,7 +3367,7 @@ def _cmd_record_body(args, cfg):
     print(f"\n── {notes_label} " + "─" * (58 - len(notes_label)))
     print(notes)
     print("─" * 60)
-    note_path = save_minutes(notes, audio_path)
+    note_path = save_minutes(notes, audio_path, mode)
     print(f"\n✅ 完成！{notes_label}已保存: {note_path}")
 
 
@@ -3376,7 +3449,7 @@ def _cmd_transcribe_body(args, cfg):
     print(f"\n── {notes_label} " + "─" * (58 - len(notes_label)))
     print(notes)
     print("─" * 60)
-    note_path = save_minutes(notes, audio_path)
+    note_path = save_minutes(notes, audio_path, mode)
     print(f"\n✅ 完成！{notes_label}已保存: {note_path}")
 
 
@@ -3954,7 +4027,7 @@ def _cmd_ui_body(args, cfg):  # noqa: C901
 
             log_q.put(("progress", 85))
             notes = generate_notes(transcript_polished, np_, cfg, mode)
-            note_path = save_minutes(notes, audio_path)
+            note_path = save_minutes(notes, audio_path, mode)
             print(f"✓ 完成 → {note_path}")
             log_q.put(("done", str(note_path)))
         except SystemExit:
@@ -4236,6 +4309,1072 @@ def _cmd_ui_body(args, cfg):  # noqa: C901
     root.mainloop()
 
 
+# ── PyQt6 + PyQt6-Fluent-Widgets GUI (Phase 0 MVP) ──────────────────────────
+#
+# Coexists with cmd_ui (Tkinter). The Tk version remains the cross-platform
+# fallback; this one is the richer, Fluent-styled experience. Imports are
+# lazy inside the function so users who only run the Tk version don't need
+# to install PyQt.
+#
+# Phase 0 scope (per user decision):
+#   - Sidebar nav (录音 / 历史)
+#   - Recording: 1:1 functional migration of cmd_ui (start/stop, timer,
+#     device combo, volume slider, transcribe/notes/interview/open buttons,
+#     existing-file picker, progress bar, log view)
+#   - History: list from filesystem + .md detail (full markdown render)
+#   - Search/filter, participants, todos: rendered with mock placeholder data
+#   - Waveform, settings, account: NOT in Phase 0
+#
+# Phase 1+ (future): real participant data, real todos, structured 关键要点
+# extraction, search index, waveform meter, account / settings panes.
+
+def cmd_ui_qt(args, cfg):
+    """Phase 0 MVP of the PyQt6 + PyQt6-Fluent-Widgets GUI.
+
+    Run: ``python3 meetingscribe.py ui-qt``
+    Requires: ``python3 -m pip install PyQt6 PyQt6-Fluent-Widgets``
+
+    Note: do NOT install ``PyQt-Fluent-Widgets`` (without the ``6``) — that one
+    pulls in PyQt5 as a dependency and collides with PyQt6 in the same process
+    (duplicate ObjC class registrations → QApplication construction abort on
+    macOS). Always use the ``PyQt6-Fluent-Widgets`` package name.
+
+    Wraps the body with _setup_log_file() (matching cmd_ui / cmd_record /
+    cmd_transcribe) so every print() and `logging` WARNING+ record from the
+    pipeline thread is timestamped and persisted to the daily log file.
+    """
+    _, restore = _setup_log_file()
+    try:
+        _cmd_ui_qt_body(args, cfg)
+    finally:
+        restore()
+
+
+def _cmd_ui_qt_body(args, cfg):
+    try:
+        from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
+        from PyQt6.QtGui import QFont
+        from PyQt6.QtWidgets import (
+            QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
+            QListWidgetItem, QFileDialog,
+        )
+        from qfluentwidgets import (
+            FluentWindow, FluentIcon, setTheme, Theme,
+            PrimaryPushButton, PushButton, ComboBox, Slider, ListWidget,
+            TextEdit, ProgressBar, SegmentedWidget, BodyLabel,
+            StrongBodyLabel, TitleLabel, SubtitleLabel, CaptionLabel,
+            SearchLineEdit, TextBrowser, ScrollArea,
+        )
+    except ImportError as e:
+        print(
+            "[错误] ui-qt 需要 PyQt6 和 PyQt6-Fluent-Widgets。\n"
+            "请安装：\n"
+            "    python3 -m pip install PyQt6 PyQt6-Fluent-Widgets\n"
+            "注意：包名是 PyQt6-Fluent-Widgets，不是 PyQt-Fluent-Widgets。\n"
+            "后者会拖入 PyQt5，与 PyQt6 在同一进程中冲突（ObjC class 重复注册）。\n"
+            f"详细错误: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    RECORDINGS_DIR = CONFIG_DIR / "recordings"
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _list_recordings() -> list[dict]:
+        """Scan recordings dir for .wav files with their companion artifacts."""
+        if not RECORDINGS_DIR.exists():
+            return []
+        out: list[dict] = []
+        for p in sorted(RECORDINGS_DIR.glob("*.wav"),
+                        key=lambda x: x.stat().st_mtime, reverse=True):
+            stem = p.stem
+            # New format: <stem>.meeting.md / <stem>.interview.md
+            # Legacy format: <stem>.md (still detected for backward compat)
+            meeting_md = p.with_name(stem + ".meeting.md")
+            interview_md = p.with_name(stem + ".interview.md")
+            legacy_md = p.with_name(stem + ".md")
+            # Pick the first existing artifact; meeting > interview > legacy
+            if meeting_md.exists():
+                md_path, md_mode = meeting_md, "meeting"
+            elif interview_md.exists():
+                md_path, md_mode = interview_md, "interview"
+            elif legacy_md.exists():
+                md_path, md_mode = legacy_md, "meeting"  # legacy assumed meeting
+            else:
+                md_path, md_mode = None, None
+            raw = p.with_name(stem + ".raw.txt")
+            polish = p.with_name(stem + ".polish.txt")
+            out.append({
+                "wav_path": p,
+                "stem": stem,
+                "mtime": p.stat().st_mtime,
+                "has_md": md_path is not None,
+                "has_polish": polish.exists(),
+                "has_raw": raw.exists(),
+                "md_path": md_path,
+                "md_mode": md_mode,
+                "meeting_md_path": meeting_md if meeting_md.exists() else None,
+                "interview_md_path": interview_md if interview_md.exists() else None,
+                "polish_path": polish if polish.exists() else None,
+                "raw_path": raw if raw.exists() else None,
+            })
+        return out
+
+    def _format_timestamp_label(stem: str) -> str:
+        """20260518_174926 → 2026/05/18 17:49"""
+        try:
+            return datetime.strptime(stem, "%Y%m%d_%H%M%S").strftime("%Y/%m/%d %H:%M")
+        except ValueError:
+            return stem
+
+    def _audio_duration_secs(wav_path: Path) -> int | None:
+        try:
+            with wave.open(str(wav_path), "rb") as w:
+                return int(w.getnframes() / max(w.getframerate(), 1))
+        except Exception:
+            return None
+
+    def _format_duration(secs: int | None) -> str:
+        if not secs:
+            return "未知时长"
+        if secs >= 3600:
+            return f"{secs // 3600} 小时 {(secs % 3600) // 60} 分钟"
+        if secs >= 60:
+            return f"{secs // 60} 分钟"
+        return f"{secs} 秒"
+
+    def _open_path(path) -> None:
+        path = str(path)
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path])
+            else:
+                subprocess.run(["xdg-open", path])
+        except Exception as e:
+            _log("ERR", f"qt open path={path!r}: {type(e).__name__}: {e}")
+
+    # Mock data for participants / todos (Phase 0 placeholder)
+    _MOCK_PARTICIPANTS = ["张伟", "李娜", "王强", "陈晨", "刘畅", "周浩"]
+    _MOCK_TODOS = [
+        {"text": "完成录音启动流程优化的原型设计", "owner": "张伟", "due": "5月25日", "done": True},
+        {"text": "优化摘要生成引擎，提升处理速度", "owner": "李娜", "due": "5月27日", "done": True},
+        {"text": "实现离线识别模块并完成测试", "owner": "王强", "due": "5月30日", "done": False},
+        {"text": "设计新版摘要结构化展示方案", "owner": "陈晨", "due": "6月 2日", "done": False},
+        {"text": "制定智能标签识别规则与模型训练计划", "owner": "刘畅", "due": "6月 3日", "done": False},
+    ]
+
+    # ── Pipeline worker (runs on QThread) ─────────────────────────────────
+
+    class _PipelineWorker(QObject):
+        """Runs transcribe → polish → notes on a background QThread, emitting
+        Qt signals for progress and completion. Mirrors cmd_ui's _run_pipeline
+        but uses Qt signals instead of queue.Queue + root.after polling."""
+        progress = pyqtSignal(int)
+        log = pyqtSignal(str)
+        done = pyqtSignal(str)   # result md path
+        failed = pyqtSignal(str)  # error message
+
+        def __init__(self, audio_path: Path, mode: str, cfg_: dict,
+                     transcribe_only: bool = False, parent=None):
+            super().__init__(parent)
+            self.audio_path = audio_path
+            self.mode = mode
+            self.cfg = cfg_
+            self.transcribe_only = transcribe_only
+
+        def run(self):
+            tp = self.cfg.get("transcribe_provider", "funasr")
+            pp = self.cfg.get("polish_provider", "claude")
+            np_ = self.cfg.get("meeting_notes_provider", "claude")
+            try:
+                audio_path = self.audio_path
+                raw_txt = audio_path.with_name(audio_path.stem + ".raw.txt")
+                polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
+
+                self.progress.emit(5)
+                need_transcribe = not raw_txt.exists()
+                need_polish = not polish_path.exists()
+
+                def _on_pct(pct: int):
+                    # Reserve 0-80 for transcribe stage so the bar feels even
+                    self.progress.emit(min(80, max(5, int(pct * 0.8))))
+
+                if self.transcribe_only:
+                    # "仅语音转文字" = transcribe + polish, no notes generation.
+                    # Outputs the polished text (.polish.txt) — raw FunASR
+                    # output has no punctuation/segmentation, so the polish
+                    # pass is what makes it actually readable.
+                    if need_transcribe and need_polish:
+                        raw, polished = transcribe_and_polish(
+                            audio_path, tp, pp, self.cfg, self.mode, on_progress=_on_pct)
+                        raw_txt.write_text(raw, encoding="utf-8")
+                        polish_path.write_text(polished, encoding="utf-8")
+                    elif need_transcribe:
+                        self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
+                        raw = transcribe(audio_path, tp, self.cfg, on_progress=_on_pct)
+                        raw_txt.write_text(raw, encoding="utf-8")
+                    elif need_polish:
+                        self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
+                        raw = raw_txt.read_text(encoding="utf-8")
+                        polished = polish_transcript(raw, pp, self.cfg, self.mode)
+                        polish_path.write_text(polished, encoding="utf-8")
+                    else:
+                        self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
+                        self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
+                    self.progress.emit(100)
+                    self.done.emit(str(polish_path))
+                    return
+
+                if need_transcribe and need_polish:
+                    raw, polished = transcribe_and_polish(
+                        audio_path, tp, pp, self.cfg, self.mode, on_progress=_on_pct)
+                    raw_txt.write_text(raw, encoding="utf-8")
+                    polish_path.write_text(polished, encoding="utf-8")
+                elif need_transcribe:
+                    self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
+                    raw = transcribe(audio_path, tp, self.cfg, on_progress=_on_pct)
+                    raw_txt.write_text(raw, encoding="utf-8")
+                    polished = polish_path.read_text(encoding="utf-8")
+                elif need_polish:
+                    self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
+                    raw = raw_txt.read_text(encoding="utf-8")
+                    polished = polish_transcript(raw, pp, self.cfg, self.mode)
+                    polish_path.write_text(polished, encoding="utf-8")
+                else:
+                    self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
+                    self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
+                    polished = polish_path.read_text(encoding="utf-8")
+
+                self.progress.emit(85)
+                self.log.emit("[纪要] 生成中...")
+                notes = generate_notes(polished, np_, self.cfg, self.mode)
+                note_path = save_minutes(notes, audio_path, self.mode)
+                self.progress.emit(100)
+                self.done.emit(str(note_path))
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                _log("ERR", f"Qt pipeline: {type(e).__name__}: {e}\n{tb}")
+                self.failed.emit(f"{type(e).__name__}: {e}")
+
+    # ── Recording lifecycle wrapper (QObject for signals) ─────────────────
+
+    class _RecorderState(QObject):
+        """Wraps MultiStreamRecorder + dOut / mute lifecycle in Qt signals."""
+        status_changed = pyqtSignal(str)   # 'idle' | 'recording' | 'processing'
+        elapsed_changed = pyqtSignal(int)  # seconds
+        warning = pyqtSignal(str)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._recorder: "MultiStreamRecorder | None" = None
+            self._audio_path: "Path | None" = None
+            self._plan: "AudioPlan | None" = None
+            self._start_time = 0.0
+            self._status = "idle"
+            self._tick = QTimer(self)
+            self._tick.setInterval(1000)
+            self._tick.timeout.connect(self._on_tick)
+
+        @property
+        def status(self) -> str:
+            return self._status
+
+        @property
+        def audio_path(self) -> "Path | None":
+            return self._audio_path
+
+        @property
+        def plan(self) -> "AudioPlan | None":
+            return self._plan
+
+        def set_status(self, s: str) -> None:
+            if s != self._status:
+                self._status = s
+                self.status_changed.emit(s)
+
+        def _on_tick(self):
+            if self._start_time:
+                self.elapsed_changed.emit(int(time.time() - self._start_time))
+
+        def start_recording(self, plan: "AudioPlan", audio_path: Path) -> bool:
+            wanted = [n for n in (plan.sys_source_name, plan.mic_name) if n]
+            role_labels: list[str] = []
+            if plan.sys_source_name:
+                role_labels.append("system")
+            if plan.mic_name:
+                role_labels.append("mic")
+            if not wanted:
+                self.warning.emit("没有可用的录音设备")
+                return False
+            recorder = MultiStreamRecorder(wanted, cfg["sample_rate"], role_labels=role_labels)
+            recorder.on_warning = lambda code: self.warning.emit(code)
+            try:
+                recorder.start()
+            except Exception as e:
+                _log("ERR", f"Qt recorder.start: {type(e).__name__}: {e}")
+                self.warning.emit(f"录音设备启动失败: {e}")
+                return False
+            self._recorder = recorder
+            self._audio_path = audio_path
+            self._plan = plan
+            self._start_time = time.time()
+            self._tick.start()
+            self.set_status("recording")
+            return True
+
+        def stop_recording(self) -> "Path | None":
+            if not self._recorder:
+                return None
+            try:
+                self._recorder.stop()
+            except Exception as e:
+                _log("ERR", f"Qt recorder.stop: {type(e).__name__}: {e}")
+            self._tick.stop()
+            saved_path = None
+            if self._audio_path and self._recorder.save(self._audio_path):
+                saved_path = self._audio_path
+            self._recorder = None
+            self._audio_path = None
+            self._start_time = 0.0
+            self.set_status("idle")
+            return saved_path
+
+    # ── Recording view ────────────────────────────────────────────────────
+
+    class RecordingInterface(QWidget):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("recordingInterface")
+            self.state = _RecorderState(self)
+            self._last_recorded: "Path | None" = None
+            self._result_path: "Path | None" = None
+            self._vol_device: "str | None" = None
+            self._pipeline_thread: "QThread | None" = None
+            self._pipeline_worker: "_PipelineWorker | None" = None
+            self._build_ui()
+            self._wire()
+            self._refresh_devices()
+            self._refresh_history()
+            self._refresh_action_buttons()
+            QTimer.singleShot(300, self._sync_vol_slider)
+
+        # ── UI build
+        def _build_ui(self):
+            root = QHBoxLayout(self)
+            root.setContentsMargins(28, 28, 28, 28)
+            root.setSpacing(24)
+
+            # Left column — recording controls
+            left = QFrame(self)
+            lv = QVBoxLayout(left)
+            lv.setContentsMargins(0, 0, 0, 0)
+            lv.setSpacing(16)
+
+            self.title_label = TitleLabel("开始录音", self)
+            self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            self.subtitle_label = BodyLabel(
+                "点击下方按钮开始录制会议\n我们将自动转录并生成总结", self)
+            self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            self.rec_btn = PrimaryPushButton(FluentIcon.MICROPHONE, "开始录音", self)
+            self.rec_btn.setMinimumHeight(72)
+            self.rec_btn.setMinimumWidth(260)
+            f = QFont(); f.setPointSize(15); f.setBold(True)
+            self.rec_btn.setFont(f)
+
+            mic_row = QHBoxLayout()
+            mic_row.addStretch(1)
+            mic_row.addWidget(self.rec_btn)
+            mic_row.addStretch(1)
+
+            self.timer_label = TitleLabel("00:00:00", self)
+            self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            # Device row
+            device_row = QHBoxLayout()
+            device_row.addStretch(1)
+            device_row.addWidget(BodyLabel("麦克风：", self))
+            self.device_combo = ComboBox(self)
+            self.device_combo.setMinimumWidth(220)
+            device_row.addWidget(self.device_combo)
+            device_row.addStretch(1)
+
+            # Volume row
+            vol_row = QHBoxLayout()
+            vol_row.addStretch(1)
+            vol_row.addWidget(BodyLabel("输出音量：", self))
+            self.vol_slider = Slider(Qt.Orientation.Horizontal, self)
+            self.vol_slider.setRange(0, 100)
+            self.vol_slider.setValue(50)
+            self.vol_slider.setMinimumWidth(220)
+            vol_row.addWidget(self.vol_slider)
+            self.vol_pct = CaptionLabel("--%", self)
+            self.vol_pct.setMinimumWidth(40)
+            vol_row.addWidget(self.vol_pct)
+            vol_row.addStretch(1)
+
+            # Action buttons — each toggles between "generate" and "open" based
+            # on whether the corresponding output artifact already exists on disk.
+            # See _refresh_action_buttons() / _on_*_clicked() for the wiring.
+            self.transcribe_btn = PushButton("语音转文字", self)
+            self.notes_btn = PrimaryPushButton("生成会议纪要", self)
+            self.interview_btn = PushButton("生成面试报告", self)
+
+            actions = QHBoxLayout()
+            actions.addStretch(1)
+            actions.addWidget(self.transcribe_btn)
+            actions.addWidget(self.notes_btn)
+            actions.addWidget(self.interview_btn)
+            actions.addStretch(1)
+
+            # File chooser row
+            self.choose_btn = PushButton(FluentIcon.FOLDER, "选择已有音频文件", self)
+            self.chosen_label = CaptionLabel("", self)
+            choose_row = QHBoxLayout()
+            choose_row.addStretch(1)
+            choose_row.addWidget(self.choose_btn)
+            choose_row.addWidget(self.chosen_label)
+            choose_row.addStretch(1)
+
+            # Progress + log + cancel
+            self.progress_bar = ProgressBar(self)
+            self.progress_bar.setVisible(False)
+            self.cancel_btn = PushButton("停止任务", self)
+            self.cancel_btn.setVisible(False)
+            self.log_view = TextEdit(self)
+            self.log_view.setReadOnly(True)
+            self.log_view.setMaximumHeight(160)
+            self.log_view.setVisible(False)
+
+            lv.addWidget(self.title_label)
+            lv.addWidget(self.subtitle_label)
+            lv.addSpacing(12)
+            lv.addLayout(mic_row)
+            lv.addWidget(self.timer_label)
+            lv.addSpacing(8)
+            lv.addLayout(device_row)
+            lv.addLayout(vol_row)
+            lv.addSpacing(8)
+            lv.addLayout(actions)
+            lv.addLayout(choose_row)
+            lv.addWidget(self.progress_bar)
+            lv.addWidget(self.cancel_btn)
+            lv.addWidget(self.log_view)
+            lv.addStretch(1)
+
+            # Right column — history sidebar
+            right = QFrame(self)
+            right.setMinimumWidth(320)
+            right.setMaximumWidth(420)
+            rv = QVBoxLayout(right)
+            rv.setContentsMargins(0, 0, 0, 0)
+            rv.setSpacing(12)
+
+            rv.addWidget(SubtitleLabel("会议历史", self))
+            self.search_sidebar = SearchLineEdit(self)
+            self.search_sidebar.setPlaceholderText("搜索会议（占位）")
+            rv.addWidget(self.search_sidebar)
+
+            self.history_list = ListWidget(self)
+            rv.addWidget(self.history_list, stretch=1)
+
+            root.addWidget(left, stretch=2)
+            root.addWidget(right, stretch=1)
+
+        # ── Wiring
+        def _wire(self):
+            self.rec_btn.clicked.connect(self._on_record_clicked)
+            self.transcribe_btn.clicked.connect(self._on_transcribe_clicked)
+            self.notes_btn.clicked.connect(self._on_meeting_clicked)
+            self.interview_btn.clicked.connect(self._on_interview_clicked)
+            self.choose_btn.clicked.connect(self._on_choose_file)
+            self.cancel_btn.clicked.connect(self._on_cancel_pipeline)
+            self.vol_slider.valueChanged.connect(self._on_vol_changed)
+
+            self.state.status_changed.connect(self._on_status_changed)
+            self.state.elapsed_changed.connect(self._on_elapsed_changed)
+            self.state.warning.connect(self._on_warning)
+
+            self.history_list.itemClicked.connect(self._on_history_pick)
+
+            monitor = _get_audio_monitor()
+            monitor.on_recording_plan_change = self._on_plan_change
+
+        # ── Devices + history
+        def _refresh_devices(self):
+            self.device_combo.clear()
+            try:
+                with _portaudio_lock:
+                    names = sorted({
+                        d["name"] for d in sd.query_devices()
+                        if d.get("max_input_channels", 0) >= 1
+                    })
+                self.device_combo.addItems(names)
+                try:
+                    plan = resolve_audio_devices()
+                except Exception:
+                    plan = None
+                if plan and plan.mic_name:
+                    idx = self.device_combo.findText(plan.mic_name)
+                    if idx >= 0:
+                        self.device_combo.setCurrentIndex(idx)
+            except Exception as e:
+                _log("ERR", f"Qt device refresh: {type(e).__name__}: {e}")
+
+        def _refresh_history(self):
+            self.history_list.clear()
+            for m in _list_recordings():
+                label = _format_timestamp_label(m["stem"])
+                if m["has_md"]:
+                    badge = "✓ 已总结"
+                elif m["has_raw"] or m["has_polish"]:
+                    badge = "待生成纪要"
+                else:
+                    badge = "仅录音"
+                item = QListWidgetItem(f"{label}\n{badge}")
+                item.setData(Qt.ItemDataRole.UserRole, m)
+                self.history_list.addItem(item)
+
+        # ── Volume slider
+        def _on_vol_changed(self, val: int):
+            self.vol_pct.setText(f"{val}%")
+            if self._vol_device:
+                try:
+                    set_device_volume(self._vol_device, val / 100.0)
+                except Exception as e:
+                    _log("ERR", f"Qt set_volume: {type(e).__name__}: {e}")
+
+        def _sync_vol_slider(self):
+            if not self._vol_device:
+                try:
+                    self._vol_device = _get_current_output_device()
+                except Exception:
+                    return
+            if not self._vol_device:
+                return
+            v = get_device_volume(self._vol_device)
+            if v is None:
+                return
+            pct = int(v * 100)
+            self.vol_slider.blockSignals(True)
+            try:
+                self.vol_slider.setValue(pct)
+            finally:
+                self.vol_slider.blockSignals(False)
+            self.vol_pct.setText(f"{pct}%")
+
+        # ── Recording lifecycle
+        def _on_record_clicked(self):
+            if self.state.status == "idle":
+                self._start_recording()
+            elif self.state.status == "recording":
+                self._stop_recording()
+
+        def _start_recording(self):
+            try:
+                plan = resolve_audio_devices(query_fresh=True)
+            except Exception as e:
+                self._on_warning(f"无法枚举设备: {e}")
+                return
+
+            chosen_mic = self.device_combo.currentText()
+            if chosen_mic and chosen_mic != plan.mic_name:
+                plan = AudioPlan(
+                    mic_index=plan.mic_index,
+                    mic_name=chosen_mic,
+                    sys_source_index=plan.sys_source_index,
+                    sys_source_name=plan.sys_source_name,
+                    multi_output_name=plan.multi_output_name,
+                    restore_output_name=plan.restore_output_name,
+                    is_external_output=plan.is_external_output,
+                    warnings=list(plan.warnings),
+                )
+
+            _recording_did_switch.clear()
+            _log("AUDIO", "session gate cleared (did_switch=False at start-of-lifecycle)")
+            _log_device_raw_dump(reason="recording-start:qt-ui")
+
+            prev_dout = _get_current_output_device()
+            if plan.multi_output_name and prev_dout != plan.multi_output_name:
+                switch_output(plan.multi_output_name)
+                _recording_did_switch.set()
+                _log("AUDIO", f"start switch: from={prev_dout!r} to={plan.multi_output_name!r} performed=True")
+            else:
+                _log("AUDIO", f"start switch: from={prev_dout!r} to={plan.multi_output_name!r} performed=False")
+
+            _reconcile_recording_mutes(plan)
+
+            RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            audio_path = RECORDINGS_DIR / f"{ts}.wav"
+
+            self._vol_device = plan.restore_output_name
+            ok = self.state.start_recording(plan, audio_path)
+            if ok:
+                QTimer.singleShot(300, self._sync_vol_slider)
+            else:
+                # Recording failed to start — undo the dOut switch we just did.
+                try:
+                    _restore_all_recording_mutes()
+                except Exception:
+                    pass
+
+        def _stop_recording(self):
+            try:
+                _restore_all_recording_mutes()
+            except Exception as e:
+                _log("ERR", f"Qt stop restore_mutes: {type(e).__name__}: {e}")
+            try:
+                _restore_output_if_needed(
+                    resolve_audio_devices(query_fresh=True),
+                    reason="post-recording",
+                )
+            except Exception as e:
+                _log("ERR", f"Qt stop output restore: {type(e).__name__}: {e}")
+
+            saved = self.state.stop_recording()
+            if saved:
+                self._last_recorded = saved
+                self.chosen_label.setText(f"已录制：{saved.name}")
+                self._result_path = None
+            self._refresh_action_buttons()
+            self._refresh_history()
+            QTimer.singleShot(200, self._sync_vol_slider)
+
+        def _on_status_changed(self, s: str):
+            if s == "idle":
+                self.rec_btn.setText("开始录音")
+                self.rec_btn.setIcon(FluentIcon.MICROPHONE)
+                self.title_label.setText("开始录音")
+                self.subtitle_label.setText(
+                    "点击下方按钮开始录制会议\n我们将自动转录并生成总结")
+                self.timer_label.setText("00:00:00")
+                for b in (self.transcribe_btn, self.notes_btn,
+                          self.interview_btn, self.choose_btn):
+                    b.setEnabled(True)
+            elif s == "recording":
+                self.rec_btn.setText("停止录音")
+                self.rec_btn.setIcon(FluentIcon.PAUSE)
+                self.title_label.setText("正在录音…")
+                self.subtitle_label.setText("会议结束后点击「停止录音」")
+                for b in (self.transcribe_btn, self.notes_btn,
+                          self.interview_btn, self.choose_btn):
+                    b.setEnabled(False)
+            elif s == "processing":
+                pass  # buttons handled by pipeline-start
+
+        def _on_elapsed_changed(self, secs: int):
+            h, rem = divmod(secs, 3600)
+            m, s = divmod(rem, 60)
+            self.timer_label.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+        def _on_warning(self, msg: str):
+            self.log_view.setVisible(True)
+            self._ui_log(f"[警告] {msg}")
+
+        # AudioDeviceMonitor → vol_device rebind on mid-recording hotplug.
+        # Runs on the monitor thread; schedule UI work via QTimer.singleShot.
+        def _on_plan_change(self, plan: "AudioPlan"):
+            new_dev = plan.restore_output_name
+            if not new_dev or new_dev == self._vol_device:
+                return
+            self._vol_device = new_dev
+            QTimer.singleShot(0, self._sync_vol_slider)
+
+        # ── Pipeline
+        def _start_pipeline(self, transcribe_only: bool = False,
+                            mode: "str | None" = None):
+            target = self._last_recorded
+            if not target or not Path(target).exists():
+                self._on_warning("请先录音或选择 .wav 文件")
+                return
+            chosen_mode = mode or getattr(args, "mode", None) or cfg.get("mode", "meeting")
+
+            self.log_view.setVisible(True)
+            self.log_view.clear()
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.cancel_btn.setVisible(True)
+            for b in (self.rec_btn, self.transcribe_btn, self.notes_btn,
+                      self.interview_btn, self.choose_btn):
+                b.setEnabled(False)
+            self.state.set_status("processing")
+
+            thread = QThread(self)
+            worker = _PipelineWorker(target, chosen_mode, cfg,
+                                     transcribe_only=transcribe_only)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self.progress_bar.setValue)
+            worker.log.connect(self._ui_log)
+            worker.done.connect(self._on_pipeline_done)
+            worker.failed.connect(self._on_pipeline_failed)
+            worker.done.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            thread.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            self._pipeline_worker = worker
+            self._pipeline_thread = thread
+            thread.start()
+
+        def _on_pipeline_done(self, path_str: str):
+            self._reset_after_pipeline()
+            self._ui_log(f"✓ 完成 → {path_str}")
+            self._result_path = Path(path_str)
+            self._refresh_action_buttons()
+            self._refresh_history()
+
+        def _on_pipeline_failed(self, msg: str):
+            self._reset_after_pipeline()
+            self._ui_log(f"✗ 失败：{msg}")
+
+        def _reset_after_pipeline(self):
+            self.progress_bar.setVisible(False)
+            self.cancel_btn.setVisible(False)
+            for b in (self.rec_btn, self.transcribe_btn, self.notes_btn,
+                      self.interview_btn, self.choose_btn):
+                b.setEnabled(True)
+            self.state.set_status("idle")
+
+        def _on_cancel_pipeline(self):
+            # transcribe/polish/generate don't have built-in cancel hooks;
+            # we simply detach the UI. The thread keeps running until natural
+            # completion (and any partial writes are kept on disk so a re-run
+            # resumes from the checkpoint).
+            self._ui_log("[提示] 已停止前台显示；后台任务仍会跑完")
+            self._reset_after_pipeline()
+
+        # ── File pick
+        def _on_choose_file(self):
+            path_str, _flt = QFileDialog.getOpenFileName(
+                self, "选择音频文件", str(RECORDINGS_DIR),
+                "WAV files (*.wav);;All files (*)")
+            if path_str:
+                self._last_recorded = Path(path_str)
+                self.chosen_label.setText(f"已选择：{Path(path_str).name}")
+                self._result_path = None
+                self._refresh_action_buttons()
+
+        def _on_history_pick(self, item: QListWidgetItem):
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not data:
+                return
+            self._last_recorded = data["wav_path"]
+            self.chosen_label.setText(f"已选择：{data['wav_path'].name}")
+            self._result_path = data.get("md_path")
+            self._refresh_action_buttons()
+
+        # ── Action buttons — toggle between "generate" and "open" based on
+        # whether the corresponding artifact already exists for _last_recorded.
+        def _refresh_action_buttons(self):
+            audio = self._last_recorded
+            if not audio:
+                self.transcribe_btn.setText("语音转文字")
+                self.notes_btn.setText("生成会议纪要")
+                self.interview_btn.setText("生成面试报告")
+                return
+            polish = audio.with_name(audio.stem + ".polish.txt")
+            meeting_md = audio.with_name(audio.stem + ".meeting.md")
+            interview_md = audio.with_name(audio.stem + ".interview.md")
+            self.transcribe_btn.setText(
+                "打开语音转文字结果" if polish.exists() else "语音转文字"
+            )
+            self.notes_btn.setText(
+                "打开会议纪要" if meeting_md.exists() else "生成会议纪要"
+            )
+            self.interview_btn.setText(
+                "打开面试报告" if interview_md.exists() else "生成面试报告"
+            )
+
+        def _on_transcribe_clicked(self):
+            audio = self._last_recorded
+            if not audio:
+                self._on_warning("请先录音或选择 .wav 文件")
+                return
+            polish = audio.with_name(audio.stem + ".polish.txt")
+            if polish.exists():
+                _open_path(polish)
+            else:
+                self._start_pipeline(transcribe_only=True)
+
+        def _on_meeting_clicked(self):
+            audio = self._last_recorded
+            if not audio:
+                self._on_warning("请先录音或选择 .wav 文件")
+                return
+            meeting_md = audio.with_name(audio.stem + ".meeting.md")
+            if meeting_md.exists():
+                _open_path(meeting_md)
+            else:
+                self._start_pipeline(mode="meeting")
+
+        def _on_interview_clicked(self):
+            audio = self._last_recorded
+            if not audio:
+                self._on_warning("请先录音或选择 .wav 文件")
+                return
+            interview_md = audio.with_name(audio.stem + ".interview.md")
+            if interview_md.exists():
+                _open_path(interview_md)
+            else:
+                self._start_pipeline(mode="interview")
+
+        # ── Log helper — prefix every UI log line with a wall-clock timestamp
+        # so the log_view and the file log share the same time reference.
+        def _ui_log(self, msg: str):
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.log_view.append(f"[{ts}] {msg}")
+
+    # ── History view ──────────────────────────────────────────────────────
+
+    class HistoryInterface(QWidget):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("historyInterface")
+            self._current: "dict | None" = None
+            self._build_ui()
+            self._wire()
+            self.refresh()
+
+        def _build_ui(self):
+            root = QHBoxLayout(self)
+            root.setContentsMargins(24, 24, 24, 24)
+            root.setSpacing(20)
+
+            # Left: search + filter + list
+            left = QFrame(self)
+            left.setMinimumWidth(340)
+            left.setMaximumWidth(440)
+            lv = QVBoxLayout(left)
+            lv.setSpacing(12)
+
+            self.search = SearchLineEdit(self)
+            self.search.setPlaceholderText("搜索会议标题、参与人或关键词…（占位）")
+
+            self.filter = SegmentedWidget(self)
+            self.filter.addItem("all", "全部")
+            self.filter.addItem("done", "已总结")
+            self.filter.addItem("pending", "待处理")
+            self.filter.setCurrentItem("all")
+
+            self.list_w = ListWidget(self)
+            self.count_label = CaptionLabel("", self)
+            self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            lv.addWidget(self.search)
+            lv.addWidget(self.filter)
+            lv.addWidget(self.list_w, stretch=1)
+            lv.addWidget(self.count_label)
+
+            # Right: detail (scrollable)
+            scroll = ScrollArea(self)
+            scroll.setWidgetResizable(True)
+            scroll.setStyleSheet("ScrollArea{background:transparent;border:none}")
+
+            detail = QWidget()
+            dv = QVBoxLayout(detail)
+            dv.setContentsMargins(16, 8, 16, 16)
+            dv.setSpacing(14)
+
+            self.detail_title = TitleLabel("选择左侧会议查看详情", self)
+            dv.addWidget(self.detail_title)
+
+            meta_row = QHBoxLayout()
+            self.meta_date = CaptionLabel("", self)
+            self.meta_dur = CaptionLabel("", self)
+            self.meta_participants = CaptionLabel("", self)
+            meta_row.addWidget(self.meta_date)
+            meta_row.addSpacing(12)
+            meta_row.addWidget(self.meta_dur)
+            meta_row.addSpacing(12)
+            meta_row.addWidget(self.meta_participants)
+            meta_row.addStretch(1)
+            dv.addLayout(meta_row)
+            dv.addWidget(self._sep())
+
+            self.body_title = StrongBodyLabel("会议内容", self)
+            self.body_browser = TextBrowser(self)
+            self.body_browser.setMinimumHeight(320)
+            dv.addWidget(self.body_title)
+            dv.addWidget(self.body_browser)
+            dv.addWidget(self._sep())
+
+            dv.addWidget(StrongBodyLabel("参与者（示例数据）", self))
+            self.participants_row = QHBoxLayout()
+            self.participants_row.setSpacing(8)
+            participants_holder = QWidget()
+            participants_holder.setLayout(self.participants_row)
+            dv.addWidget(participants_holder)
+            dv.addWidget(self._sep())
+
+            dv.addWidget(StrongBodyLabel("待办事项（示例数据）", self))
+            self.todo_list = ListWidget(self)
+            self.todo_list.setMaximumHeight(220)
+            dv.addWidget(self.todo_list)
+
+            dv.addStretch(1)
+            scroll.setWidget(detail)
+
+            root.addWidget(left)
+            root.addWidget(scroll, stretch=1)
+
+        def _sep(self) -> QFrame:
+            s = QFrame(self)
+            s.setFrameShape(QFrame.Shape.HLine)
+            s.setFrameShadow(QFrame.Shadow.Sunken)
+            return s
+
+        def _wire(self):
+            self.list_w.itemClicked.connect(self._on_pick)
+            self.search.textChanged.connect(lambda _t: self.refresh())
+            self.filter.currentItemChanged.connect(lambda _k: self.refresh())
+
+        def refresh(self):
+            self.list_w.clear()
+            q = (self.search.text() or "").strip().lower()
+            mode = self.filter.currentItem()  # 'all'|'done'|'pending'
+            shown = 0
+            for m in _list_recordings():
+                if mode == "done" and not m["has_md"]:
+                    continue
+                if mode == "pending" and m["has_md"]:
+                    continue
+                if q and q not in m["stem"].lower():
+                    continue
+                label = _format_timestamp_label(m["stem"])
+                dur = _audio_duration_secs(m["wav_path"])
+                badge = "✓ 已总结" if m["has_md"] else "待处理"
+                item = QListWidgetItem(f"{label}\n时长 {_format_duration(dur)}  ·  {badge}")
+                item.setData(Qt.ItemDataRole.UserRole, m)
+                self.list_w.addItem(item)
+                shown += 1
+            self.count_label.setText(f"共 {shown} 条会议记录")
+
+        def _on_pick(self, item: QListWidgetItem):
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not data:
+                return
+            self._show_detail(data)
+
+        def _show_detail(self, m: dict):
+            self._current = m
+            label = _format_timestamp_label(m["stem"])
+            self.detail_title.setText(label)
+            self.meta_date.setText(f"📅 {label}")
+            dur = _audio_duration_secs(m["wav_path"])
+            self.meta_dur.setText(f"⏱ {_format_duration(dur)}")
+            self.meta_participants.setText(f"👥 {len(_MOCK_PARTICIPANTS)} 位参与者")
+
+            body_path = m.get("md_path") or m.get("polish_path") or m.get("raw_path")
+            if body_path and Path(body_path).exists():
+                text = Path(body_path).read_text(encoding="utf-8")
+                if str(body_path).endswith(".md"):
+                    self.body_browser.setMarkdown(text)
+                    self.body_title.setText("会议纪要 (.md)")
+                else:
+                    self.body_browser.setPlainText(text)
+                    self.body_title.setText(
+                        f"会议内容 ({Path(body_path).suffix.lstrip('.')})")
+            else:
+                self.body_browser.setPlainText("（尚未生成转写 / 纪要文件）")
+                self.body_title.setText("会议内容")
+
+            self._render_participants()
+            self._render_todos()
+
+        def _render_participants(self):
+            # Clear row
+            while self.participants_row.count():
+                ch = self.participants_row.takeAt(0)
+                if ch.widget():
+                    ch.widget().deleteLater()
+            for name in _MOCK_PARTICIPANTS:
+                lbl = CaptionLabel(name, self)
+                self.participants_row.addWidget(lbl)
+            self.participants_row.addStretch(1)
+
+        def _render_todos(self):
+            self.todo_list.clear()
+            for t in _MOCK_TODOS:
+                mark = "✓" if t["done"] else "○"
+                self.todo_list.addItem(
+                    f"{mark}  {t['text']}    · {t['owner']} · {t['due']}")
+
+    # ── Main window ───────────────────────────────────────────────────────
+
+    class MainWindow(FluentWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("MeetingScribe")
+            self.resize(1280, 800)
+            self.setMinimumSize(1000, 640)
+
+            self.recording_view = RecordingInterface()
+            self.history_view = HistoryInterface()
+
+            self.addSubInterface(self.recording_view, FluentIcon.MICROPHONE, "录音")
+            self.addSubInterface(self.history_view, FluentIcon.HISTORY, "历史")
+
+            # When the user switches to the history tab, refresh the list so
+            # any new recording from the recording tab shows up.
+            self.stackedWidget.currentChanged.connect(self._on_view_changed)
+
+        def _on_view_changed(self, _idx):
+            try:
+                w = self.stackedWidget.currentWidget()
+            except Exception:
+                return
+            if w is self.history_view:
+                self.history_view.refresh()
+            elif w is self.recording_view:
+                self.recording_view._refresh_history()
+
+        def closeEvent(self, ev):
+            # Mirror cmd_ui._on_close: best-effort cleanup so a quit during a
+            # recording doesn't leave dOut/mutes in a bad state.
+            try:
+                rec = self.recording_view.state._recorder
+                if rec is not None:
+                    rec.stop()
+            except Exception as e:
+                _log("ERR", f"Qt closeEvent stop recorder: {type(e).__name__}: {e}")
+            try:
+                _get_audio_monitor().stop()
+            except Exception as e:
+                _log("ERR", f"Qt closeEvent monitor.stop: {type(e).__name__}: {e}")
+            try:
+                _restore_all_recording_mutes()
+            except Exception as e:
+                _log("ERR", f"Qt closeEvent restore_mutes: {type(e).__name__}: {e}")
+            try:
+                _restore_output_if_needed(
+                    resolve_audio_devices(query_fresh=False),
+                    reason="post-recording",
+                )
+            except Exception as e:
+                _log("ERR", f"Qt closeEvent restore output: {type(e).__name__}: {e}")
+            try:
+                _remove_device_listeners()
+            except Exception as e:
+                _log("ERR", f"Qt closeEvent remove_listeners: {type(e).__name__}: {e}")
+            super().closeEvent(ev)
+
+    # ── Run ───────────────────────────────────────────────────────────────
+    _install_device_listeners()
+    _get_audio_monitor().start()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    setTheme(Theme.LIGHT)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -4267,7 +5406,8 @@ def main():
     p_tr.add_argument("--polish-provider", metavar="PROVIDER", help=f"转写校对模型，{llm_help}")
     p_tr.add_argument("--meeting-notes-provider", metavar="PROVIDER", help=f"纪要/总结模型，{llm_help}")
 
-    sub.add_parser("ui", help="打开桌面图形界面")
+    sub.add_parser("ui", help="打开桌面图形界面（Tkinter，跨平台保底）")
+    sub.add_parser("ui-qt", help="打开桌面图形界面（PyQt6 + Fluent；需要 python3 -m pip install PyQt6 PyQt6-Fluent-Widgets）")
 
     p_dev = sub.add_parser("devices", help="列出可用音频设备")
     p_dev.add_argument(
@@ -4291,6 +5431,7 @@ def main():
         "record": cmd_record,
         "transcribe": cmd_transcribe,
         "ui": cmd_ui,
+        "ui-qt": cmd_ui_qt,
         "devices": cmd_devices,
         "config": cmd_config,
     }

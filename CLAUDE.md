@@ -11,7 +11,8 @@ Single-file Python tool: record audio → Whisper transcribe → LLM polish → 
 ## Running the Tool
 
 ```bash
-python3 meetingscribe.py ui                  # GUI
+python3 meetingscribe.py ui                  # GUI — Tkinter (default, no extra deps)
+python3 meetingscribe.py ui-qt               # GUI — PyQt6 + Fluent (needs `python3 -m pip install PyQt6 PyQt6-Fluent-Widgets`)
 python3 meetingscribe.py record              # CLI recording
 python3 meetingscribe.py transcribe foo.wav  # process existing file
 python3 meetingscribe.py devices             # list audio devices
@@ -47,6 +48,7 @@ Each step checks whether its output file already exists and skips if so. This me
 | `generate_notes()` | Single LLM call using `PROMPTS[mode]["notes"]` |
 | `_llm_run()` | Dispatches to `_llm_claude_cli / _llm_openai / _llm_gemini` |
 | `cmd_ui()` | Full Tkinter GUI (~400 lines); uses `queue.Queue` + `root.after(100, _poll)` for thread→UI updates |
+| `cmd_ui_qt()` | PyQt6 + PyQt6-Fluent-Widgets GUI (Phase 0 MVP). Coexists with `cmd_ui()`. Lazy imports so PyQt is not required for the Tk path. Inner classes: `_PipelineWorker` (QObject on QThread), `_RecorderState` (Qt signals wrap of `MultiStreamRecorder` + dOut/mute lifecycle), `RecordingInterface` (mic button / timer / device combo / volume slider / action buttons / progress / history sidebar), `HistoryInterface` (search + filter SegmentedWidget + list + `.md` TextBrowser detail; participants/todos are mock data in Phase 0), `MainWindow` (FluentWindow with two sub-interfaces). Cross-thread UI updates use `QTimer.singleShot(0, ...)` instead of Tk's `queue.Queue + root.after` polling. Reuses every backend function (`MultiStreamRecorder`, `_reconcile_recording_mutes`, `_restore_all_recording_mutes`, `_restore_output_if_needed`, `_get_audio_monitor`, `transcribe`, `polish_transcript`, `generate_notes`, `save_minutes`). |
 
 ## Provider System
 
@@ -143,12 +145,14 @@ All output files share the same stem as the recording:
 ## Dependencies
 
 ```
-sounddevice    # audio capture (cross-platform, wraps PortAudio)
-funasr         # local FunASR inference (default transcribe provider)
-modelscope     # model downloading for FunASR
-torch          # PyTorch backend for FunASR (install separately via pytorch.org)
-numpy          # audio buffer handling
-faster-whisper # optional: only needed when transcribe_provider=whisper
+sounddevice           # audio capture (cross-platform, wraps PortAudio)
+funasr                # local FunASR inference (default transcribe provider)
+modelscope            # model downloading for FunASR
+torch                 # PyTorch backend for FunASR (install separately via pytorch.org)
+numpy                 # audio buffer handling
+faster-whisper        # optional: only needed when transcribe_provider=whisper
+PyQt6                 # optional: only needed for `ui-qt` (Fluent GUI)
+PyQt6-Fluent-Widgets  # optional: only needed for `ui-qt` (Fluent GUI). NOT PyQt-Fluent-Widgets — that one pulls PyQt5 and collides with PyQt6.
 ```
 
 Tkinter, wave, argparse, subprocess, ctypes — all stdlib.  
