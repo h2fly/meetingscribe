@@ -20,7 +20,7 @@ Meeting scribe for macOS and Windows — captures both speaker and microphone au
 | Item | Detail |
 |------|--------|
 | Windows 10/11 | 64-bit |
-| Python 3.9+ | Download from [python.org](https://www.python.org/downloads/) — check **"Add to PATH"** and **"tcl/tk"** during install |
+| Python 3.9+ | Download from [python.org](https://www.python.org/downloads/) — check **"Add to PATH"** during install |
 | Node.js 18+ | Required for Claude Code CLI |
 
 ---
@@ -169,16 +169,23 @@ python meetingscribe.py devices
 
 ## Quick Start
 
-### GUI (recommended)
+### GUI
 
 ```bash
 python3 meetingscribe.py ui
 ```
 
-1. Click **▶ Start Recording** to begin
-2. Click **◼ Stop Recording** when done
-3. Click **Generate Meeting Notes** or **Generate Interview Summary**
-4. When complete, click **Open Result** to view the Markdown output
+The desktop GUI is a PyQt6 + Fluent Widgets app (single window, three views in the left navigation):
+
+1. **录音 / Recording** — click the big circular mic button to start; click again to stop. Pick a previously recorded meeting from the right-side history sidebar to act on it. Three pipeline buttons below the timer:
+   - **Transcribe** — runs FunASR + LLM polish, produces `.polish.txt`
+   - **Generate meeting notes** — full pipeline → `.meeting.md`
+   - **Generate interview report** — full pipeline → `.interview.md`
+   When the corresponding output file already exists on disk, the button flips to "Open …" (blue) and just opens the file.
+2. **历史 / History** — full meeting list with four filter tabs (all / summarized / transcribed / pending), inline detail pane, and the same three pipeline buttons for rerunning steps on an old recording. Right-click any row to rename or delete (with confirmation).
+3. **配置 / Settings** — quick concurrency slider + a raw JSONC editor for `config.jsonc` (syntax highlighted; the editor is the canonical way to customise pipeline prompts, see `cfg["prompts"]`).
+
+A 中文 / EN toggle in the top right flips every label, dialog and message in real time.
 
 ### Command Line
 
@@ -204,8 +211,11 @@ Recordings are saved to `~/Documents/meetingscribe/recordings/`. All output file
 |-----------|---------|
 | `.wav` | Recording (system audio + microphone, dual stream) |
 | `.raw.txt` | Raw transcript (with timestamps) |
-| `.proofread.txt` | AI-polished transcript |
-| `.md` | Meeting notes / interview summary (Markdown) |
+| `.polish.txt` | AI-polished transcript |
+| `.meeting.md` | Meeting notes (Markdown), generated when `mode=meeting` |
+| `.interview.md` | Interview report (Markdown), generated when `mode=interview` |
+
+A meeting may also have a human-readable suffix — `<timestamp>.<custom_name>.<ext>` (e.g. `20260512_090120.客户访谈.wav`). The legacy single-`.md` filename (no `.meeting` / `.interview` infix) is still recognised for backward compatibility.
 
 > Re-running automatically detects completed steps and skips them — no need to re-transcribe.
 
@@ -218,7 +228,7 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | Key | Default | Description |
 |-----|---------|-------------|
 | `mode` | `meeting` | `meeting` or `interview` |
-| `transcribe_provider` | `funasr` | `funasr` (local, default) / `whisper` / `openai` / `gemini` |
+| `transcribe_provider` | `funasr` | `funasr` (local, default) / `openai` / `gemini` |
 | `polish_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `stt.funasr.hotword` | `""` | Space-separated hotwords to boost recognition accuracy |
@@ -233,22 +243,6 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | `hotword` | `""` | Domain-specific terms (space-separated) to improve accuracy |
 | `chunk_secs` | `300` | Split audio into chunks of this length (seconds) for parallel transcription; `0` = always serial |
 | `workers` | `0` | Parallel FunASR instances; `0` = auto (`max(2, cpu_count / 2)`); memory scales with this value |
-
-**Optional: switch back to Whisper**
-
-Install `faster-whisper` and set `transcribe_provider` to `whisper` in `config.jsonc`:
-
-```bash
-pip3 install faster-whisper
-```
-
-| Whisper Model | Size | Speed | Accuracy |
-|---------------|------|-------|----------|
-| `tiny` | ~75 MB | Fastest | Fair |
-| `base` | ~150 MB | Fast | Good |
-| `small` | ~480 MB | Medium | Better |
-| `medium` | ~1.5 GB | Slow | Very good |
-| `large-v3` | ~3 GB | Slowest | Best |
 
 ---
 
@@ -303,7 +297,7 @@ Click **Allow** when prompted. If you previously denied it, re-enable it in **Sy
 | 条件 | 说明 |
 |------|------|
 | Windows 10/11 64位 | |
-| Python 3.9+ | 从 [python.org](https://www.python.org/downloads/) 下载，安装时勾选 **"Add to PATH"** 和 **"tcl/tk"** |
+| Python 3.9+ | 从 [python.org](https://www.python.org/downloads/) 下载，安装时勾选 **"Add to PATH"** |
 | Node.js 18+ | 用于安装 Claude Code CLI |
 
 ---
@@ -452,18 +446,23 @@ python meetingscribe.py devices
 
 ## 快速开始
 
-### 图形界面（推荐）
+### 图形界面
 
 ```bash
 python3 meetingscribe.py ui
 ```
 
-使用流程：
+桌面界面基于 PyQt6 + Fluent Widgets，单窗口三个视图（左侧导航切换）：
 
-1. 点击「▶ 开始录音」→ 开始会议
-2. 会议结束后点「◼ 停止录音」
-3. 点击「开始整理会议纪要」或「开始整理面试记录」
-4. 等待处理完成，点击「打开结果文件」查看 Markdown 纪要
+1. **录音** — 点中间的大麦克风按钮开始录音，再点一次停止。右侧历史侧栏可以挑一条已有录音作为操作对象。计时器下方三个按钮：
+   - **语音转文字** — 跑 FunASR + LLM 校对，生成 `.polish.txt`
+   - **生成会议纪要** — 整条流水线 → `.meeting.md`
+   - **生成面试报告** — 整条流水线 → `.interview.md`
+   对应输出文件已存在时，按钮会变成蓝色的「打开 X」，点击直接打开文件。
+2. **历史** — 完整会议列表，四个筛选 tab（全部 / 已总结 / 已录音转文字 / 待处理），右侧详情面板，并复用同三个按钮以对旧录音重新跑流水线。任一会议右键可以重命名或删除（带二次确认）。
+3. **配置** — 一键调整三个并发参数 + 一个带语法高亮的 `config.jsonc` 原文编辑器（直接在这里改 `cfg["prompts"]` 自定义流水线 prompt）。
+
+右上角有 **中文 / EN** 切换按钮，实时翻转所有界面文字、对话框和提示。
 
 ### 命令行
 
@@ -489,8 +488,11 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 |----------|------|
 | `.wav` | 录音文件（系统音频 + 麦克风双路） |
 | `.raw.txt` | 原始转写文本（含时间戳） |
-| `.proofread.txt` | AI 校对后文本 |
-| `.md` | 会议纪要 / 面试总结（Markdown 格式） |
+| `.polish.txt` | AI 校对后的文本 |
+| `.meeting.md` | 会议纪要（Markdown），`mode=meeting` 时生成 |
+| `.interview.md` | 面试报告（Markdown），`mode=interview` 时生成 |
+
+录音也可以带一个可读后缀 — `<时间戳>.<自定义名字>.<后缀>`（例如 `20260512_090120.客户访谈.wav`），可通过历史界面的右键「重命名」设置。早期的单一 `.md` 文件（没有 `.meeting` / `.interview` 中段）仍然兼容识别。
 
 > 重复运行时会自动检测已完成的步骤并跳过，无需重新转写。
 
@@ -503,7 +505,7 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `mode` | `meeting` | 默认模式：`meeting`（会议）/ `interview`（面试） |
-| `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `whisper` / `openai` / `gemini` |
+| `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `openai` / `gemini` |
 | `polish_provider` | `claude` | 校对模型：`claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | 纪要模型：`claude` / `openai` / `gemini` |
 | `stt.funasr.hotword` | `""` | 热词（空格分隔），提升专有名词识别率 |
@@ -518,22 +520,6 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | `hotword` | `""` | 热词（空格分隔），提升领域专有词识别率 |
 | `chunk_secs` | `300` | 超过此时长自动分块并发转写（秒），`0` = 始终串行 |
 | `workers` | `0` | 并发实例数，`0` = 自动（`max(2, CPU核数/2)`），内存随之线性增长 |
-
-**可选：切换回 Whisper**
-
-安装 `faster-whisper` 并在 `config.jsonc` 中将 `transcribe_provider` 改为 `whisper`：
-
-```bash
-pip3 install faster-whisper
-```
-
-| Whisper 模型 | 大小 | 速度 | 准确度 |
-|--------------|------|------|--------|
-| `tiny` | ~75 MB | 最快 | 一般 |
-| `base` | ~150 MB | 快 | 较好 |
-| `small` | ~480 MB | 中等 | 好 |
-| `medium` | ~1.5 GB | 慢 | 很好 |
-| `large-v3` | ~3 GB | 最慢 | 最佳 |
 
 ---
 

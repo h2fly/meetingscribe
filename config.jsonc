@@ -4,7 +4,7 @@
   "llm_timeout": 1200,
   // 校对分块大小（字符数），超出则拆分为多块并行处理
   "polish_chunk_size": 3000,
-  // 校对并发 worker 数（同时调用 LLM 的块数），0 = 不限
+  // 校对并发 worker 数（同时调用 LLM 的块数），0 = 自动(max(4, cpu核数/2))
   "polish_max_workers": 3,
 
   // ── 运行模式 ─────────────────────────────────────────────────────────────────
@@ -12,7 +12,7 @@
   "mode": "meeting",
 
   // ── 各环节 Provider ──────────────────────────────────────────────────────────
-  // 语音转文字：funasr（本地，默认）| whisper（本地）| openai | gemini
+  // 语音转文字：funasr（本地，默认）| openai | gemini
   "transcribe_provider": "funasr",
   // 转写校对：claude | openai | gemini
   "polish_provider": "claude",
@@ -50,16 +50,6 @@
       // 热词（空格分隔），提升专有名词识别率
       "hotword": ""
     },
-    "whisper": {
-      // 并发实例数（每实例独立加载模型，注意内存占用）
-      "workers": 3,
-      // 超过此时长（秒）自动分块并行转写
-      "chunk_secs": 300,
-      // 每个 whisper 实例使用的 CPU 线程数；0 = faster-whisper 默认
-      "cpu_threads": 0,
-      // tiny / base / small / medium / large-v3，越大越准但越慢
-      "model": "base"
-    },
     "openai": {
       "api_key": "",
       "model": "whisper-1",
@@ -89,6 +79,131 @@
       "type": "gemini",
       "api_key": "",
       "model": "gemini-1.5-pro"
+    }
+  },
+
+  // ── 音频高级选项（一般不需要修改）────────────────────────────────────────────
+  "audio": {
+    // AudioDeviceMonitor 兜底唤醒间隔（秒）。HAL listener 失效时的自愈上限——
+    // 平时由热插拔事件驱动，不会触发；联调可调小到 5
+    "monitor_safety_timeout_sec": 30.0,
+    // 自动探测 Multi-Output Device 时匹配的设备名（简中 / 繁中 / 英）。
+    // 若你在 Audio MIDI Setup 里把 Multi-Output 设备重命名了，
+    // 把那个名字加进来即可恢复自动探测
+    "multi_output_device_names": [
+      "Multi-Output Device", "多输出设备", "多重輸出裝置"
+    ]
+  },
+
+  // ── 流水线 Prompt 模板 ──────────────────────────────────────────────────────
+  // 你可以直接修改下面任何一条 prompt 来定制 AI 的行为。
+  //
+  //   • polish    — 校对 / 整理转写文本（按块并行调用），**与 mode 无关**
+  //   • meeting   → notes_zh / notes_en：会议纪要中英文
+  //   • interview → notes_zh / notes_en：面试报告中英文
+  //
+  // 每条 prompt 是一个 **字符串数组**——加载时会用 "\n" 把数组拼成完整文本。
+  // JSON 不允许字符串里包含真正的换行，这是把多行 prompt 写得可读的标准做法。
+  // 单一字符串也接受。
+  //
+  // 占位符只识别 {transcript}（区分大小写、按字面替换），其他大括号不需要转义。
+  // 删除整段 "prompts" 或某一个 key 即可回退到代码里的内置默认值。
+  "prompts": {
+    "polish": [
+      "你是一位专业的文字校对助手，正在处理一段录音的自动转写文本（可能来自会议、面试或其他场景）。",
+      "",
+      "以下是语音识别自动转写的文本，带有时间戳，可能存在错别字、同音字混淆、断句不当等问题。",
+      "",
+      "请在**不改变原意**的前提下：",
+      "1. 去掉所有时间戳（如 [00.0s]）",
+      "2. 将所有片段合并为连贯的自然段落，按语义分段",
+      "3. 纠正明显的错别字和同音字错误",
+      "4. 修复错误的断句和标点",
+      "5. 删除重复内容——语音识别可能对相邻片段重复识别同一句话，检查前后句子，去掉重复的短语或句子",
+      "6. 无法确定的内容用【？】标注",
+      "7. 如能可靠区分不同发言者，请在段落前标注角色或姓名（如「面试官：」/「候选人：」/「主持人：」/具体姓名）；若无法可靠区分则不要强行标注",
+      "",
+      "只输出整理后的正文，不要解释修改内容。",
+      "",
+      "---",
+      "【原始转写】",
+      "{transcript}"
+    ],
+    "meeting": {
+      "notes_zh": [
+        "你是一位专业的会议纪要助手。请根据以下转写文本生成结构化会议纪要。",
+        "",
+        "要求：",
+        "1. **会议概要** — 2~3 句话概括核心内容",
+        "2. **主要议题** — 逐条列出讨论的关键议题",
+        "3. **决策事项** — 明确达成的决定或共识",
+        "4. **行动项** — 格式：负责人 · 事项 · 截止时间（无明确信息则标\"待确认\"）",
+        "5. **关键洞察** — 值得记录的重要观点",
+        "",
+        "用中文输出，格式为 Markdown，简洁清晰。若内容较短或不完整，如实说明。",
+        "",
+        "---",
+        "【会议转写】",
+        "{transcript}"
+      ],
+      "notes_en": [
+        "You are a professional meeting notes assistant. Based on the following meeting transcript, generate structured meeting notes in English.",
+        "",
+        "Requirements:",
+        "1. **Meeting Summary** — 2–3 sentences summarizing the core content",
+        "2. **Key Topics** — list each major topic discussed",
+        "3. **Decisions Made** — explicit decisions or consensus reached",
+        "4. **Action Items** — format: Owner · Task · Due Date (mark \"TBD\" if unknown)",
+        "5. **Key Insights** — notable observations worth recording",
+        "",
+        "Output in English, Markdown format, concise and clear. If the content is short or incomplete, state so honestly.",
+        "",
+        "---",
+        "[Meeting Transcript]",
+        "{transcript}"
+      ]
+    },
+    "interview": {
+      "notes_zh": [
+        "你是一位专业的面试评估助手。请根据以下面试转写文本生成结构化的面试总结。",
+        "",
+        "要求：",
+        "1. **候选人概况** — 姓名（如提及）、应聘岗位、整体印象（2~3 句）",
+        "2. **核心问答摘要** — 按主题归纳关键问题与候选人的回答要点",
+        "3. **技术 / 专业能力** — 具体技能掌握程度、深度、广度",
+        "4. **综合素质** — 沟通表达、逻辑思维、学习能力、团队意识等",
+        "5. **亮点** — 突出表现或印象深刻的回答",
+        "6. **不足 / 待确认** — 回答模糊、经验欠缺或需进一步了解的方面",
+        "7. **专业能力评估** — 从专业知识、方案设计、项目管理、数据分析等维度逐项评估",
+        "8. **价值观评估** — 从客户成功、极客精神、快速交付、简单直接、多元兼容等维度逐项评估",
+        "9. **综合评价与建议** — 是否推荐进入下一轮，及理由",
+        "",
+        "用中文及英文输出，格式为 Markdown，客观专业。若内容较短或不完整，如实说明。",
+        "",
+        "---",
+        "【面试转写】",
+        "{transcript}"
+      ],
+      "notes_en": [
+        "You are a professional interview evaluation assistant. Based on the following interview transcript, generate a structured interview summary in English.",
+        "",
+        "Requirements:",
+        "1. **Candidate Overview** — name (if mentioned), role applied for, overall impression (2–3 sentences)",
+        "2. **Q&A Summary** — key questions and candidate's responses, grouped by theme",
+        "3. **Technical / Professional Skills** — depth and breadth of specific skills demonstrated",
+        "4. **Soft Skills** — communication, logical thinking, learning ability, teamwork, etc.",
+        "5. **Highlights** — standout moments or particularly impressive answers",
+        "6. **Gaps / To Verify** — vague answers, lacking experience, or areas needing follow-up",
+        "7. **Professional Competency Assessment** — evaluate across dimensions such as domain knowledge, solution design, project management, and data analysis",
+        "8. **Values Assessment** — evaluate across dimensions such as customer success, geek spirit, fast delivery, simple & direct, and diversity & inclusion",
+        "9. **Overall Assessment & Recommendation** — whether to advance to next round, with reasoning",
+        "",
+        "Output in English, Markdown format, objective and professional. If the content is short or incomplete, state so honestly.",
+        "",
+        "---",
+        "[Interview Transcript]",
+        "{transcript}"
+      ]
     }
   }
 }

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Single-file Python tool: record audio → Whisper transcribe → LLM polish → meeting notes / interview summary.
+Single-file Python tool: record audio → FunASR transcribe → LLM polish → meeting notes / interview summary.
 
 - **Entry point**: `meetingscribe.py` (everything in one file)
 - **Config**: `config.jsonc` (JSONC with `//` comments, sits next to the script)
@@ -11,7 +11,7 @@ Single-file Python tool: record audio → Whisper transcribe → LLM polish → 
 ## Running the Tool
 
 ```bash
-python3 meetingscribe.py ui                  # GUI
+python3 meetingscribe.py ui                  # GUI — PyQt6 + Fluent (needs `python3 -m pip install PyQt6 PyQt6-Fluent-Widgets`)
 python3 meetingscribe.py record              # CLI recording
 python3 meetingscribe.py transcribe foo.wav  # process existing file
 python3 meetingscribe.py devices             # list audio devices
@@ -42,17 +42,19 @@ Each step checks whether its output file already exists and skips if so. This me
 | `_install_device_listeners()` / `_remove_device_listeners()` | macOS-only CoreAudio HAL property listeners on `kAudioHardwarePropertyDevices` + `…DefaultSystemOutputDevice`. Set the module-level `_hotplug_event` so the recorder reacts within ~100 ms. |
 | `AudioDeviceMonitor` | Event-driven daemon thread, started by `cmd_ui` and `cmd_record`. Blocks on `_hotplug_event.wait(timeout=_AUDIO_MONITOR_SAFETY_TIMEOUT_SEC)` (30 s) — no fixed-period polling. Runs one synchronous initial tick on `start()` so the process always syncs to the current best device on launch. **Idle branch** (when `_recording_active` is clear): calls `resolve_audio_devices(query_fresh=True)`; runs `_restore_output_if_needed` on the first tick and on every change to the resolved `(restore_output_name, mic_name, sys_source_name)` triple. **Recording branch**: never switches dOut (would pause music apps) and never refreshes PortAudio (would terminate live streams); but DOES call `resolve_audio_devices(query_fresh=False)` + `_reconcile_recording_mutes(plan)` when `(multi_output_name, restore_output_name)` changes, so the Multi-Output's inactive physical sub-devices stay silenced mid-recording on hotplug. The recorder's own `_monitor` thread remains the authoritative reconciler for input streams. Replaces the older GUI-only `_idle_dout_watchdog`. |
 | `MultiStreamRecorder` | N simultaneous `sounddevice.InputStream`s; `_monitor` thread (tracked as `self._monitor_thread`) waits on `_hotplug_event` (or 1 s fallback) and on each wake calls `_monitor_iteration()` which: (1) queries the live PortAudio input device set, (2) re-derives `self.wanted` from `resolve_audio_devices(query_fresh=False)` so mic/system-source swaps mid-recording are honoured (USB headset plugged in → `_close_one` built-in mic, `_try_open` USB mic, pre-swap frames are prepended into the new device's frame list to preserve audio continuity), (3) opens newly-appearing wanted devices and closes disappeared / no-longer-wanted ones. `start()` sets the module-level `_recording_active`; `stop()` clears it in a `finally`. `stop()` **joins** `self._monitor_thread` (2 s timeout) BEFORE clearing `self._streams`, eliminating the race where `_monitor_iteration`'s `_try_open` could reset `self._frames` mid-stop and discard captured audio. `_try_open` defensively re-checks `self.recording` inside its lock and discards orphan opens with `[STREAM] discarded post-stop open of device=…`. Emits `mic-not-opened` / `system-audio-not-opened` warnings via `on_warning` and writes `<stem>.warnings.txt` sidecar. |
-| `transcribe()` | Dispatches to `_transcribe_funasr/whisper/openai/gemini` |
-| `polish_transcript()` | Splits transcript into chunks, runs LLM in parallel via `ThreadPoolExecutor` |
-| `generate_notes()` | Single LLM call using `PROMPTS[mode]["notes"]` |
+| `transcribe()` | Dispatches to `_transcribe_funasr/openai/gemini` |
+| `polish_transcript()` | Splits transcript into chunks, runs LLM in parallel via `ThreadPoolExecutor`. Reads the prompt via `_resolve_prompt(cfg, "polish")` (top-level, mode-agnostic). |
+| `generate_notes()` | Runs `_resolve_prompt(cfg, "notes_zh", mode=...)` + `notes_en` in parallel and concatenates the two outputs. |
+| `_resolve_prompt(cfg, key, mode=None)` | Pipeline-prompt lookup. `mode=None` → top-level `cfg["prompts"][key]` (used for `polish`). `mode="meeting"/"interview"` → `cfg["prompts"][mode][key]` (used for `notes_zh`/`notes_en`). Accepts `str` or `list[str]` (joined on `\n`), with fallback to `DEFAULT_CONFIG["prompts"]`. `{transcript}` is substituted via `str.replace` (not `.format`). |
 | `_llm_run()` | Dispatches to `_llm_claude_cli / _llm_openai / _llm_gemini` |
-| `cmd_ui()` | Full Tkinter GUI (~400 lines); uses `queue.Queue` + `root.after(100, _poll)` for thread→UI updates |
+| `cmd_ui()` | PyQt6 + PyQt6-Fluent-Widgets desktop GUI — the project's only UI (lazy import; prints an install hint and exits if PyQt6 isn't available). Base class is `QMainWindow` (not `FluentWindow`) so macOS provides native traffic lights on the LEFT with standard hover icons; the Fluent left navigation is embedded as a `NavigationInterface` widget. Inner classes: `_PipelineWorker` (`QObject` on `QThread` — catches both `Exception` and `SystemExit`), `_RecorderState` (Qt-signal wrapper over `MultiStreamRecorder` + dOut/mute lifecycle), `RecordingInterface` (no mic selector — always system audio + resolver-chosen mic; live substring search + right-click rename / delete on the sidebar history), `HistoryInterface` (four `SegmentedWidget` tabs: 全部 / 已总结 / 已录音转文字 / 待处理, tab-specific body rendering, right-click rename / delete with confirmation, `"未获取相关信息"` placeholder for participants/todos until a `.meta.json` sidecar exists), `ConfigInterface` (SpinBox to bump `polish_max_workers` + `stt.funasr.workers` in one shot, plus a raw JSONC editor with syntax highlighting that validates via `_strip_jsonc_comments` + `json.loads` before writing back), `MainWindow`. Single 中文 / EN toggle in the top bar flips every translatable widget via per-view `apply_language()` + `_LABELS` lookup table. Cross-thread UI updates use `QTimer.singleShot(0, ...)`. Reuses every backend function (`MultiStreamRecorder`, `_reconcile_recording_mutes`, `_restore_all_recording_mutes`, `_restore_output_if_needed`, `_get_audio_monitor`, `transcribe`, `polish_transcript`, `generate_notes`, `save_minutes`, `save_config`, `_rename_meeting_files`, `_delete_meeting_files`). |
+| `_split_meeting_stem(stem)` / `_rename_meeting_files(wav, name)` / `_delete_meeting_files(wav)` | Filename convention is `<timestamp>[.<custom>].<suffix>`. `_split_meeting_stem` parses the timestamp prefix (validated against `YYYYmmdd_HHMMSS`) and optional custom-name segment. `_rename_meeting_files` cascades a rename across every sibling file sharing the same stem (`.wav` + `.raw.txt` + `.polish.txt` + `.meeting.md` + `.interview.md` + …) with collision detection. `_delete_meeting_files` removes the same sibling set, returning `(deleted_count, errors)`. Custom names are sanitised: reserved characters (`/ \\ : * ? " < > |` + C0 controls) are mapped to `_`, leading/trailing dots and whitespace are stripped. |
 
 ## Provider System
 
 Three independently configurable providers (set in `config.jsonc` or via CLI flags):
 
-- `transcribe_provider`: `funasr` (local, default) | `whisper` (local faster-whisper) | `openai` | `gemini`
+- `transcribe_provider`: `funasr` (local, default) | `openai` | `gemini`
 - `polish_provider`: `claude` | `openai` | `gemini`
 - `meeting_notes_provider`: `claude` | `openai` | `gemini`
 
@@ -65,14 +67,14 @@ The `claude` LLM type calls `claude -p <prompt>` via subprocess (Claude Code CLI
 - `load_config()` never auto-writes back; `save_config()` writes plain JSON (comments lost)
 - CLI flags override config at runtime but never persist
 
-## GUI (Tkinter)
+## GUI (PyQt6 + Fluent)
 
-- Dark gray-blue theme; color palette defined at the top of `cmd_ui()`
-- Thread safety: background pipeline runs in a daemon thread, communicates via `log_q: queue.Queue`
-- `_poll()` drains the queue every 100 ms via `root.after(100, _poll)`
-- Queue message types: `("log", str)` | `("progress", int)` | `("done", path)` | `("error", str)`
-- Progress bar is a `tk.Canvas` drawing a percentage fill (not `ttk.Progressbar`)
-- `cancel_flag = [False]` — set by "停止任务"; pipeline thread runs to completion but `_poll` discards its result
+- Light theme (`setTheme(Theme.LIGHT)`); rounded cards via `_style_as_card(...)` + `_CARD_BG = "#f5f7fa"`.
+- Thread safety: each pipeline runs on its own `QThread` via `_PipelineWorker` (a `QObject`). Signals: `progress(int)`, `log(str)`, `done(str)`, `failed(str)`. Cross-thread UI updates use `QTimer.singleShot(0, ...)`.
+- Action buttons toggle between "Generate X" (light gray) and "Open X" (accent blue, `#0a84ff`) based on whether the corresponding artifact exists on disk — see `_apply_open_btn_style(btn, is_open)` and `_refresh_action_buttons()` / `_refresh_h_action_buttons()`.
+- Internationalisation: `_LANG["current"]` holds `"zh"` / `"en"`; every translatable widget either registers a callback in `self._lang_callbacks` (static labels) or is re-rendered from a dynamic refresher inside `apply_language()` (state-dependent labels). The 中文 / EN toggle button (single button in the top bar) flips state and calls `apply_language()` on every view.
+- `_confirm_dialog(parent, title, msg)` — custom Yes/No `QMessageBox` whose button labels go through `_t("ctx.confirm_yes")` / `_t("ctx.confirm_no")` so the EN toggle actually delivers an all-English UI (Qt's built-in `QMessageBox.question` would otherwise label buttons from the system locale).
+- Right-click context menus on both history lists: 重命名 → 删除本次会议所有记录 → 在 Finder 中显示. Delete is gated on `self._pipeline_thread is None` (can't yank files from a running worker).
 
 ## Platform Notes
 
@@ -137,22 +139,26 @@ All output files share the same stem as the recording:
 20260512_090120.wav
 20260512_090120.raw.txt
 20260512_090120.polish.txt
-20260512_090120.md
+20260512_090120.meeting.md       # written when mode=meeting
+20260512_090120.interview.md     # written when mode=interview
 ```
+
+A meeting may have a human-readable suffix as well — `<timestamp>.<custom_name>.<ext>` (e.g. `20260512_090120.客户访谈.wav`). The legacy single-`.md` file (no `.meeting`/`.interview` infix) is still recognised for read / open / delete.
 
 ## Dependencies
 
 ```
-sounddevice    # audio capture (cross-platform, wraps PortAudio)
-funasr         # local FunASR inference (default transcribe provider)
-modelscope     # model downloading for FunASR
-torch          # PyTorch backend for FunASR (install separately via pytorch.org)
-numpy          # audio buffer handling
-faster-whisper # optional: only needed when transcribe_provider=whisper
+sounddevice           # audio capture (cross-platform, wraps PortAudio)
+funasr                # local FunASR inference (default transcribe provider)
+modelscope            # model downloading for FunASR
+torch                 # PyTorch backend for FunASR (install separately via pytorch.org)
+numpy                 # audio buffer handling
+PyQt6                 # required for `ui` (the desktop GUI)
+PyQt6-Fluent-Widgets  # required for `ui`. NOT PyQt-Fluent-Widgets — that one pulls PyQt5 and collides with PyQt6.
 ```
 
-Tkinter, wave, argparse, subprocess, ctypes — all stdlib.  
-Tests: `pytest tests/` (142 unit tests; mocked CoreAudio for cross-platform CI). Manual smoke testing via `python3 meetingscribe.py ui`.
+wave, argparse, subprocess, ctypes — all stdlib.
+Tests: `pytest tests/` (179 unit tests; mocked CoreAudio for cross-platform CI). Manual smoke testing via `python3 meetingscribe.py ui`.
 
 ## Common Edit Patterns
 
@@ -160,6 +166,8 @@ Tests: `pytest tests/` (142 unit tests; mocked CoreAudio for cross-platform CI).
 
 **Add a new STT provider**: add entry to `DEFAULT_CONFIG["stt"]`, add `_transcribe_<name>()`, dispatch in `transcribe()`.
 
-**Change prompts**: edit `PROMPTS` dict — `PROMPTS["meeting"]["polish"]`, `PROMPTS["meeting"]["notes"]`, same for `"interview"`.
+**Change prompts**: edit `cfg["prompts"]` in `config.jsonc` (the user-facing surface, accepts both `str` and `list[str]`). The built-in defaults live in `_PROMPT_DEFAULTS` (above `DEFAULT_CONFIG`). Keys: `polish` is at the top level (mode-agnostic); `notes_zh` / `notes_en` live under `meeting` and `interview` respectively. All call sites read via `_resolve_prompt(cfg, key, mode=None)`.
 
-**Modify GUI layout**: all widgets are in `cmd_ui()`. Cards are created with the `card()` helper. Separators with `sep()`.
+**Modify GUI layout**: widgets live inside `cmd_ui()`'s three interface classes — `RecordingInterface`, `HistoryInterface`, `ConfigInterface` — all wrapped in `MainWindow`. Card surfaces via `_style_as_card(widget, padding=N, name="...")`. Pipeline-button styling via `_apply_open_btn_style(btn, is_open=bool)`.
+
+**Add a translation key**: insert the key into both `_LABELS["zh"]` and `_LABELS["en"]` (top of `cmd_ui()`). Read in widgets via `_t("namespace.key")` or `self._i18n(widget, "namespace.key")` for the static-label callback variant.
