@@ -229,7 +229,7 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | Key | Default | Description |
 |-----|---------|-------------|
 | `mode` | `meeting` | `meeting` or `interview` |
-| `transcribe_provider` | `funasr` | `funasr` (local, default) / `whisper` / `openai` / `gemini` |
+| `transcribe_provider` | `funasr` | `funasr` (local, default) / `openai` / `gemini` |
 | `polish_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `stt.funasr.hotword` | `""` | Space-separated hotwords to boost recognition accuracy |
@@ -244,22 +244,6 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | `hotword` | `""` | Domain-specific terms (space-separated) to improve accuracy |
 | `chunk_secs` | `300` | Split audio into chunks of this length (seconds) for parallel transcription; `0` = always serial |
 | `workers` | `0` | Parallel FunASR instances; `0` = auto (`max(2, cpu_count / 2)`); memory scales with this value |
-
-**Optional: switch back to Whisper**
-
-Install `faster-whisper` and set `transcribe_provider` to `whisper` in `config.jsonc`:
-
-```bash
-pip3 install faster-whisper
-```
-
-| Whisper Model | Size | Speed | Accuracy |
-|---------------|------|-------|----------|
-| `tiny` | ~75 MB | Fastest | Fair |
-| `base` | ~150 MB | Fast | Good |
-| `small` | ~480 MB | Medium | Better |
-| `medium` | ~1.5 GB | Slow | Very good |
-| `large-v3` | ~3 GB | Slowest | Best |
 
 ---
 
@@ -514,7 +498,7 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `mode` | `meeting` | 默认模式：`meeting`（会议）/ `interview`（面试） |
-| `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `whisper` / `openai` / `gemini` |
+| `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `openai` / `gemini` |
 | `polish_provider` | `claude` | 校对模型：`claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | 纪要模型：`claude` / `openai` / `gemini` |
 | `stt.funasr.hotword` | `""` | 热词（空格分隔），提升专有名词识别率 |
@@ -529,22 +513,6 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | `hotword` | `""` | 热词（空格分隔），提升领域专有词识别率 |
 | `chunk_secs` | `300` | 超过此时长自动分块并发转写（秒），`0` = 始终串行 |
 | `workers` | `0` | 并发实例数，`0` = 自动（`max(2, CPU核数/2)`），内存随之线性增长 |
-
-**可选：切换回 Whisper**
-
-安装 `faster-whisper` 并在 `config.jsonc` 中将 `transcribe_provider` 改为 `whisper`：
-
-```bash
-pip3 install faster-whisper
-```
-
-| Whisper 模型 | 大小 | 速度 | 准确度 |
-|--------------|------|------|--------|
-| `tiny` | ~75 MB | 最快 | 一般 |
-| `base` | ~150 MB | 快 | 较好 |
-| `small` | ~480 MB | 中等 | 好 |
-| `medium` | ~1.5 GB | 慢 | 很好 |
-| `large-v3` | ~3 GB | 最慢 | 最佳 |
 
 ---
 

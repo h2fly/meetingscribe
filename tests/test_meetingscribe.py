@@ -50,14 +50,6 @@ def _http_error(code: int, msg: str = "Error") -> urllib.error.HTTPError:
     return urllib.error.HTTPError(None, code, msg, {}, io.BytesIO(msg.encode()))
 
 
-def _whisper_mock(texts=("hello",)) -> MagicMock:
-    model = MagicMock()
-    info = MagicMock(language="zh", language_probability=0.99)
-    segs = [MagicMock(text=t, start=float(i)) for i, t in enumerate(texts)]
-    model.transcribe.return_value = (iter(segs), info)
-    return model
-
-
 def _gemini_body(text: str) -> bytes:
     return json.dumps(
         {"candidates": [{"content": {"parts": [{"text": text}]}}]}
@@ -101,11 +93,11 @@ class TestDeepMerge:
         assert ms._deep_merge({"a": 1}, {"b": 2}) == {"a": 1, "b": 2}
 
     def test_nested_partial_override_preserves_other_keys(self):
-        base = {"stt": {"whisper": {"model": "base", "workers": 2}}}
-        over = {"stt": {"whisper": {"model": "large-v3"}}}
+        base = {"stt": {"funasr": {"model": "paraformer-zh", "workers": 2}}}
+        over = {"stt": {"funasr": {"model": "paraformer-en"}}}
         r = ms._deep_merge(base, over)
-        assert r["stt"]["whisper"]["model"] == "large-v3"
-        assert r["stt"]["whisper"]["workers"] == 2
+        assert r["stt"]["funasr"]["model"] == "paraformer-en"
+        assert r["stt"]["funasr"]["workers"] == 2
 
     def test_does_not_mutate_base(self):
         base = {"a": {"x": 1}}
@@ -137,20 +129,20 @@ class TestLoadConfig:
 
     def test_deep_merges_nested_stt_config(self, tmp_path, monkeypatch):
         (tmp_path / "cfg.jsonc").write_text(
-            '{"stt": {"whisper": {"model": "large-v3"}}}'
+            '{"stt": {"funasr": {"model": "paraformer-en"}}}'
         )
         monkeypatch.setattr(ms, "CONFIG_FILE", tmp_path / "cfg.jsonc")
         monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
         cfg = ms.load_config()
-        assert cfg["stt"]["whisper"]["model"] == "large-v3"
-        assert cfg["stt"]["whisper"]["workers"] == 4  # default preserved
+        assert cfg["stt"]["funasr"]["model"] == "paraformer-en"
+        assert cfg["stt"]["funasr"]["workers"] == 4  # default preserved
 
     def test_no_file_deepcopy_does_not_mutate_default(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ms, "CONFIG_FILE", tmp_path / "missing.jsonc")
         monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
         cfg = ms.load_config()
-        cfg["stt"]["whisper"]["model"] = "MUTATED"
-        assert ms.DEFAULT_CONFIG["stt"]["whisper"]["model"] == "base"
+        cfg["stt"]["funasr"]["model"] = "MUTATED"
+        assert ms.DEFAULT_CONFIG["stt"]["funasr"]["model"] == "paraformer-zh"
 
     def test_jsonc_comments_stripped_before_parse(self, tmp_path, monkeypatch):
         (tmp_path / "cfg.jsonc").write_text('// comment\n{"mode": "interview"}')
@@ -1088,79 +1080,6 @@ class TestTranscribeGemini:
                 ms._transcribe_gemini(wav, self._pcfg)
 
 
-# ── _transcribe_whisper ───────────────────────────────────────────────────────
-
-class TestTranscribeWhisper:
-    _pcfg_serial = {"model": "base", "chunk_secs": 300, "workers": 2, "cpu_threads": 1}
-    _pcfg_parallel = {"model": "base", "chunk_secs": 5, "workers": 2, "cpu_threads": 1}
-
-    @pytest.fixture(autouse=True)
-    def _fw(self):
-        # WhisperModel is imported inside _transcribe_whisper, so mock via sys.modules
-        mock_fw = MagicMock()
-        with patch.dict(sys.modules, {"faster_whisper": mock_fw}):
-            yield mock_fw
-
-    def test_serial_path_includes_timestamps(self, tmp_path, _fw):
-        wav = _make_wav(tmp_path / "a.wav", duration_secs=5)
-        _fw.WhisperModel.return_value = _whisper_mock(["hello"])
-        result = ms._transcribe_whisper(wav, self._pcfg_serial)
-        assert "[000.0s]" in result
-        assert "hello" in result
-
-    def test_serial_path_empty_segments_returns_empty_string(self, tmp_path, _fw):
-        wav = _make_wav(tmp_path / "a.wav", duration_secs=5)
-        _fw.WhisperModel.return_value = _whisper_mock([])
-        assert ms._transcribe_whisper(wav, self._pcfg_serial) == ""
-
-    def test_chunk_secs_zero_forces_serial_even_for_long_file(self, tmp_path, _fw):
-        wav = _make_wav(tmp_path / "a.wav", duration_secs=600, sample_rate=8000)
-        pcfg = {**self._pcfg_serial, "chunk_secs": 0}
-        _fw.WhisperModel.return_value = _whisper_mock(["full"])
-        result = ms._transcribe_whisper(wav, pcfg)
-        assert "full" in result
-
-    def test_parallel_path_creates_one_model_per_chunk(self, tmp_path, _fw):
-        wav = _make_wav(tmp_path / "a.wav", duration_secs=10, sample_rate=8000)
-        call_count = [0]
-
-        def make_model(*a, **kw):
-            call_count[0] += 1
-            return _whisper_mock([f"seg{call_count[0]}"])
-
-        _fw.WhisperModel.side_effect = make_model
-        result = ms._transcribe_whisper(wav, self._pcfg_parallel)
-
-        assert call_count[0] == 2
-        assert "seg1" in result and "seg2" in result
-
-    def test_parallel_path_results_are_in_time_order(self, tmp_path, _fw):
-        wav = _make_wav(tmp_path / "a.wav", duration_secs=10, sample_rate=8000)
-        call_count = [0]
-
-        def make_model(*a, **kw):
-            call_count[0] += 1
-            n = call_count[0]
-            return _whisper_mock([f"chunk{n}"])
-
-        _fw.WhisperModel.side_effect = make_model
-        result = ms._transcribe_whisper(wav, self._pcfg_parallel)
-
-        lines = result.splitlines()
-        assert len(lines) == 2
-        ts0 = float(lines[0].split("s]")[0].lstrip("["))
-        ts1 = float(lines[1].split("s]")[0].lstrip("["))
-        assert ts0 < ts1
-
-    def test_on_progress_called_once_per_chunk(self, tmp_path, _fw):
-        wav = _make_wav(tmp_path / "a.wav", duration_secs=10, sample_rate=8000)
-        calls = []
-        _fw.WhisperModel.return_value = _whisper_mock(["t"])
-        ms._transcribe_whisper(wav, self._pcfg_parallel, on_progress=calls.append)
-        assert len(calls) == 2
-        assert all(5 <= v <= 40 for v in calls)
-
-
 # ── polish_transcript ────────────────────────────────────────────────────────
 
 class TestPolishTranscript:
@@ -1699,7 +1618,7 @@ class TestNoSilentExcepts:
         #     raise from module import)
         #   • config _set value-cast fallback loop
         #   • _poll _q.Empty sentinel
-        #   • cmd_ui_qt _start_recording dOut-failure mute-rollback (best-effort;
+        #   • cmd_ui _start_recording dOut-failure mute-rollback (best-effort;
         #     we're already in an error path, don't shadow the original failure)
         # If you add a new silent pass, document it here AND in the design doc.
         assert len(matches) <= 12, (
@@ -2062,9 +1981,6 @@ class TestSaveConfigPreservesComments:
         "      \"workers\": 0,        // 0 = auto\n"
         "      \"chunk_secs\": 300,\n"
         "      \"model\": \"paraformer-zh\"\n"
-        "    },\n"
-        "    \"whisper\": {\n"
-        "      \"model\": \"base\"\n"
         "    }\n"
         "  }\n"
         "}\n"
@@ -2123,21 +2039,42 @@ class TestSaveConfigPreservesComments:
             text = ms.CONFIG_FILE.read_text(encoding="utf-8")
         assert text == self.SAMPLE_JSONC
 
-    def test_new_key_falls_back_to_plain_json(self, tmp_path):
-        """A key in `cfg` that is not in the existing file can't be patched
-        line-locally; the save MUST cleanly fall back to json.dump (which
-        is allowed to drop comments rather than corrupting the file)."""
+    def test_new_top_level_key_splices_in_preserving_comments(self, tmp_path):
+        """A NEW top-level key gets spliced in before the root closing
+        brace — existing comments are preserved. Regression test for
+        the schema-bump case (e.g. introducing a ``prompts`` section
+        into a user config that predated it)."""
         with self._patch_paths(tmp_path):
             cfg = self._parsed_cfg()
             cfg["brand_new_setting"] = "hello"
+            cfg["another_new_key"] = {"nested": True}
+            ms.save_config(cfg)
+            text = ms.CONFIG_FILE.read_text(encoding="utf-8")
+        reloaded = json.loads(ms._strip_jsonc_comments(text))
+        # Round-trip preserves data
+        assert reloaded["brand_new_setting"] == "hello"
+        assert reloaded["another_new_key"] == {"nested": True}
+        assert reloaded["polish_max_workers"] == 0
+        # Existing comments are preserved (no json.dump fallback)
+        assert "//" in text
+
+    def test_new_nested_key_still_falls_back_to_plain_json(self, tmp_path):
+        """Nested missing-key inserts can't be done line-locally without
+        knowing which scope's closing brace to splice into — those still
+        fall back to json.dump (the comment-losing rewrite is preferable
+        to a corrupted file)."""
+        with self._patch_paths(tmp_path):
+            cfg = self._parsed_cfg()
+            # Inject a missing NESTED key (top-level "stt" exists but
+            # "stt.brand_new_subkey" does not).
+            cfg.setdefault("stt", {})["brand_new_subkey"] = "x"
             ms.save_config(cfg)
             text = ms.CONFIG_FILE.read_text(encoding="utf-8")
         reloaded = json.loads(text)
-        # Round-trip preserves data
-        assert reloaded["brand_new_setting"] == "hello"
-        # Comments are dropped (expected fallback behavior)
+        assert reloaded["stt"]["brand_new_subkey"] == "x"
+        # Fallback path discards comments — confirms we did NOT try to
+        # splice line-locally for nested inserts.
         assert "//" not in text
-        assert reloaded["polish_max_workers"] == 0
 
     def test_missing_file_falls_back_to_plain_json(self, tmp_path):
         cfg_dir = tmp_path
@@ -2157,3 +2094,190 @@ class TestSaveConfigPreservesComments:
             ms.save_config({"polish_max_workers": 4})
             text = cfg_file.read_text(encoding="utf-8")
         assert json.loads(text) == {"polish_max_workers": 4}
+
+
+# ── Meeting filename parsing + rename ───────────────────────────────────────
+
+
+class TestSplitMeetingStem:
+    """`_split_meeting_stem` extracts the timestamp prefix (always required)
+    and an optional custom-name segment from a recording stem."""
+
+    def test_timestamp_only(self):
+        assert ms._split_meeting_stem("20260518_174926") == ("20260518_174926", None)
+
+    def test_with_custom_name(self):
+        assert ms._split_meeting_stem("20260518_174926.客户访谈") == (
+            "20260518_174926", "客户访谈"
+        )
+
+    def test_with_custom_name_containing_dots(self):
+        # Once we've matched a timestamp prefix, every dot afterwards is part
+        # of the custom name — we capture greedily so a multi-dot custom
+        # label like "weekly.standup" survives intact.
+        assert ms._split_meeting_stem("20260518_174926.weekly.standup") == (
+            "20260518_174926", "weekly.standup"
+        )
+
+    def test_unmatched_stem_returns_none(self):
+        assert ms._split_meeting_stem("randomname") == (None, None)
+        assert ms._split_meeting_stem("not_a_timestamp.foo") == (None, None)
+        assert ms._split_meeting_stem("") == (None, None)
+
+
+class TestSanitizeMeetingCustomName:
+    def test_strips_filesystem_reserved_chars(self):
+        # /, \, :, *, ?, ", <, >, |, plus C0 control chars are mapped to _.
+        out = ms._sanitize_meeting_custom_name('a/b\\c:d*e?f"g<h>i|j')
+        assert out == "a_b_c_d_e_f_g_h_i_j"
+
+    def test_strips_leading_trailing_dots_and_whitespace(self):
+        assert ms._sanitize_meeting_custom_name("  .foo.  ") == "foo"
+
+    def test_empty_input_returns_empty(self):
+        assert ms._sanitize_meeting_custom_name("") == ""
+        assert ms._sanitize_meeting_custom_name(None) == ""  # type: ignore[arg-type]
+
+
+class TestRenameMeetingFiles:
+    def _seed(self, dir_: Path, stem: str, suffixes: list[str]) -> Path:
+        wav = dir_ / f"{stem}.wav"
+        wav.write_bytes(b"")
+        for s in suffixes:
+            (dir_ / f"{stem}{s}").write_text(f"{s} content", encoding="utf-8")
+        return wav
+
+    def test_renames_wav_and_all_companions(self, tmp_path):
+        wav = self._seed(tmp_path, "20260518_174926",
+                         [".raw.txt", ".polish.txt", ".meeting.md"])
+        new_wav = ms._rename_meeting_files(wav, "客户访谈")
+        assert new_wav == tmp_path / "20260518_174926.客户访谈.wav"
+        assert new_wav.exists()
+        assert (tmp_path / "20260518_174926.客户访谈.raw.txt").exists()
+        assert (tmp_path / "20260518_174926.客户访谈.polish.txt").exists()
+        assert (tmp_path / "20260518_174926.客户访谈.meeting.md").exists()
+        # Old files are gone
+        assert not wav.exists()
+        assert not (tmp_path / "20260518_174926.raw.txt").exists()
+
+    def test_can_strip_custom_name_back_to_bare_timestamp(self, tmp_path):
+        wav = self._seed(tmp_path, "20260518_174926.客户访谈",
+                         [".raw.txt", ".meeting.md"])
+        new_wav = ms._rename_meeting_files(wav, "")
+        assert new_wav == tmp_path / "20260518_174926.wav"
+        assert (tmp_path / "20260518_174926.raw.txt").exists()
+        assert (tmp_path / "20260518_174926.meeting.md").exists()
+        assert not wav.exists()
+
+    def test_collision_aborts_without_renaming(self, tmp_path):
+        wav = self._seed(tmp_path, "20260518_174926", [".raw.txt"])
+        # Pre-existing target with the new stem
+        (tmp_path / "20260518_174926.客户访谈.wav").write_bytes(b"taken")
+        result = ms._rename_meeting_files(wav, "客户访谈")
+        assert result is None
+        # Original files untouched
+        assert wav.exists()
+        assert (tmp_path / "20260518_174926.raw.txt").exists()
+
+    def test_no_change_is_noop_and_returns_path(self, tmp_path):
+        wav = self._seed(tmp_path, "20260518_174926.客户访谈", [".raw.txt"])
+        result = ms._rename_meeting_files(wav, "客户访谈")
+        assert result == wav  # no-op short-circuit
+        assert wav.exists()
+        assert (tmp_path / "20260518_174926.客户访谈.raw.txt").exists()
+
+    def test_bad_stem_refuses_rename(self, tmp_path):
+        wav = tmp_path / "not_a_timestamp.wav"
+        wav.write_bytes(b"")
+        assert ms._rename_meeting_files(wav, "anything") is None
+        assert wav.exists()
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert ms._rename_meeting_files(tmp_path / "nope.wav", "x") is None
+
+    def test_sanitises_filesystem_hostile_chars(self, tmp_path):
+        wav = self._seed(tmp_path, "20260518_174926", [".raw.txt"])
+        new_wav = ms._rename_meeting_files(wav, "a/b:c*d")
+        # Reserved chars → _
+        assert new_wav == tmp_path / "20260518_174926.a_b_c_d.wav"
+        assert new_wav.exists()
+
+
+# ── _resolve_prompt ──────────────────────────────────────────────────────────
+
+
+class TestResolvePrompt:
+    """Pipeline prompts are externalised in ``cfg["prompts"]`` with a
+    fallback to ``DEFAULT_CONFIG["prompts"]``. ``polish`` lives at the top
+    level (mode-agnostic); ``notes_zh`` / ``notes_en`` live under each
+    mode (``meeting`` / ``interview``). Each value may be a string used
+    verbatim, or a list of strings joined with ``\\n``."""
+
+    def test_default_polish_top_level(self):
+        # Empty user cfg + mode=None → top-level default polish.
+        result = ms._resolve_prompt({}, "polish")
+        assert "校对助手" in result
+        assert "{transcript}" in result
+
+    def test_default_notes_mode_scoped(self):
+        # mode-scoped keys require the mode arg.
+        meeting_zh = ms._resolve_prompt({}, "notes_zh", mode="meeting")
+        assert "会议纪要助手" in meeting_zh
+        interview_zh = ms._resolve_prompt({}, "notes_zh", mode="interview")
+        assert "面试评估助手" in interview_zh
+
+    def test_string_override_polish(self):
+        cfg = {"prompts": {"polish": "custom polish {transcript}"}}
+        assert ms._resolve_prompt(cfg, "polish") == "custom polish {transcript}"
+
+    def test_list_override_joined_with_newline(self):
+        cfg = {"prompts": {"polish": ["line A", "", "line C"]}}
+        assert ms._resolve_prompt(cfg, "polish") == "line A\n\nline C"
+
+    def test_partial_override_keeps_other_defaults(self):
+        # Override only polish — notes for both modes still default.
+        cfg = {"prompts": {"polish": "X"}}
+        assert ms._resolve_prompt(cfg, "polish") == "X"
+        assert "会议纪要助手" in ms._resolve_prompt(cfg, "notes_zh", mode="meeting")
+        assert "面试评估助手" in ms._resolve_prompt(cfg, "notes_zh", mode="interview")
+
+    def test_partial_override_in_mode_block(self):
+        cfg = {"prompts": {"meeting": {"notes_zh": "Y"}}}
+        assert ms._resolve_prompt(cfg, "notes_zh", mode="meeting") == "Y"
+        # interview side unaffected.
+        assert "面试评估助手" in ms._resolve_prompt(cfg, "notes_zh", mode="interview")
+
+    def test_invalid_type_raises_typeerror(self):
+        cfg = {"prompts": {"polish": 42}}
+        with pytest.raises(TypeError, match="must be str or list"):
+            ms._resolve_prompt(cfg, "polish")
+
+    def test_unknown_key_raises_keyerror(self):
+        # Programming bug, not a user one — surface it loudly.
+        with pytest.raises(KeyError):
+            ms._resolve_prompt({}, "no_such_key")
+        with pytest.raises(KeyError):
+            ms._resolve_prompt({}, "no_such_key", mode="meeting")
+
+    def test_transcript_token_preserved(self):
+        # _resolve_prompt does NOT substitute — callers do via .replace().
+        cfg: dict = {}
+        assert "{transcript}" in ms._resolve_prompt(cfg, "polish")
+        for mode in ("meeting", "interview"):
+            for key in ("notes_zh", "notes_en"):
+                assert "{transcript}" in ms._resolve_prompt(cfg, key, mode=mode), \
+                    f"{mode}.{key} missing {{transcript}} token"
+
+    def test_non_dict_prompts_falls_back_to_default(self):
+        # A malformed user cfg with prompts as a non-dict should still
+        # return the default, not crash.
+        cfg = {"prompts": "oops not a dict"}
+        assert "{transcript}" in ms._resolve_prompt(cfg, "polish")
+        assert "{transcript}" in ms._resolve_prompt(cfg, "notes_zh", mode="meeting")
+
+    def test_polish_speaker_label_instruction_present(self):
+        # The generalised speaker-labelling rule lives in the unified
+        # polish prompt now; both interviewer/candidate and meeting users
+        # see the same instruction.
+        polish = ms._resolve_prompt({}, "polish")
+        assert "区分不同发言者" in polish
