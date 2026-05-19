@@ -329,11 +329,11 @@ _funasr_model_cache: dict = {}  # (asr_model, vad_model, punc_model) -> AutoMode
 DEFAULT_CONFIG = {
     # ── 并发控制 / 性能 ────────────────────────────────────────────────────
     # LLM 调用超时（秒），长会议建议调大
-    "llm_timeout": 600,
+    "llm_timeout": 1200,
     # 校对时单块最大字符数，超出则分块处理
-    "polish_chunk_size": 12000,
+    "polish_chunk_size": 3000,
     # 校对并发数（同时调用 LLM 的块数），0 = 自动(max(4, cpu核数/2))
-    "polish_max_workers": 0,
+    "polish_max_workers": 4,
     # ── 运行模式 ──────────────────────────────────────────────────────────
     # meeting（会议纪要）| interview（面试总结）
     "mode": "meeting",
@@ -351,7 +351,7 @@ DEFAULT_CONFIG = {
     # ── 语音转文字 provider 配置（含并发参数）─────────────────────────────
     "stt": {
         "funasr": {
-            "workers": 0,               # 并发实例数；0 = 自动（max(2, CPU核数/2)）
+            "workers": 4,               # 并发实例数；0 = 自动（max(2, CPU核数/2)）
             "chunk_secs": 300,          # 超过此时长自动分块并发（秒），0 = 始终串行
             "model": "paraformer-zh",   # ASR 模型（首次运行自动下载）
             "vad_model": "fsmn-vad",    # VAD 分句模型，支持长音频
@@ -359,10 +359,14 @@ DEFAULT_CONFIG = {
             "hotword": "",              # 热词（空格分隔），提升专有名词识别率
         },
         "whisper": {
-            "workers": 2,           # 并行实例数；内存占用 = workers × 模型大小
-            "chunk_secs": 300,      # 超过此时长自动分块并行（秒），0 = 始终串行
-            "cpu_threads": 0,       # 每个实例的内部线程数；0 = 自动（CPU 核数 / 2）
-            "model": "base",        # tiny / base / small / medium / large-v3
+            "workers": 4,               # 并行实例数；内存占用 = workers × 模型大小
+            "chunk_secs": 300,          # 超过此时长自动分块并行（秒），0 = 始终串行
+            "cpu_threads": 0,           # 每个实例的内部线程数；0 = 自动（CPU 核数 / 2）
+            "model": "base",            # tiny / base / small / medium / large-v3
+            "language": "zh",           # 转写语言代码；"" 或 null = 自动检测（zh/en/ja/...）
+            "beam_size": 5,             # 解码 beam 宽度；越大越准越慢，1 最快
+            "compute_type": "int8",     # int8 / int8_float16 / int16 / float16 / float32
+            "vad_filter": True,         # 启用语音活动检测，跳过静音段
         },
         "openai": {
             "api_key": "",
@@ -391,6 +395,18 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "model": "gemini-1.5-pro",
         },
+    },
+    # ── 音频高级选项（一般不需要修改）─────────────────────────────────────
+    "audio": {
+        # AudioDeviceMonitor 的兜底唤醒间隔（秒）。HAL listener 失效时的自愈
+        # 上限——平时不会触发；联调可调小到 5。
+        "monitor_safety_timeout_sec": 30.0,
+        # 自动探测 Multi-Output Device 时匹配的设备名（简中 / 繁中 / 英）。
+        # 若你在 Audio MIDI Setup 里把 Multi-Output 设备重命名了，
+        # 把那个名字加进来即可恢复自动探测。
+        "multi_output_device_names": [
+            "Multi-Output Device", "多输出设备", "多重輸出裝置",
+        ],
     },
 }
 
@@ -422,6 +438,7 @@ def load_config() -> dict:
         cfg = _deep_merge(DEFAULT_CONFIG, on_disk)
     else:
         cfg = copy.deepcopy(DEFAULT_CONFIG)
+    _apply_audio_overrides(cfg)
     return cfg
 
 
@@ -1169,7 +1186,9 @@ def _get_multi_output_physical_subs(multi_output_name: str | None) -> list[str]:
 # ── 音频设备解析（统一入口）& 热插拔 ─────────────────────────────────────────
 
 # Names that identify the user's pre-configured Multi-Output Device across macOS locales.
-_MULTI_OUT_NAMES = ("Multi-Output Device", "多输出设备", "多重輸出裝置")
+# Mutable list (not tuple) so _apply_audio_overrides() can replace its contents in place
+# from cfg["audio"]["multi_output_device_names"] without touching the many reference sites.
+_MULTI_OUT_NAMES = ["Multi-Output Device", "多输出设备", "多重輸出裝置"]
 
 # Transport-type tags returned by _coreaudio_device_info():
 #   external → preferred for mic / output  ('usb ', 'blue', 'blea', 'hdmi', 'thnd', ...)
@@ -1230,8 +1249,28 @@ _recording_did_switch = threading.Event()
 # _hotplug_event) — this timeout is the maximum interval between forced
 # self-heal ticks if the HAL listener ever silently stops firing. Long enough
 # to keep the log quiet in normal operation; short enough that a lost event
-# resyncs within half a minute.
+# resyncs within half a minute. Overridable via cfg["audio"]["monitor_safety_timeout_sec"].
 _AUDIO_MONITOR_SAFETY_TIMEOUT_SEC = 30.0
+
+
+def _apply_audio_overrides(cfg: dict) -> None:
+    """Push user-configurable audio knobs from cfg into module-level globals.
+
+    Called from load_config() so AudioDeviceMonitor and the device-resolver
+    helpers can keep reading simple globals without cfg threaded through every
+    callsite. Idempotent: safe to call on every load. Silently ignores invalid
+    values (keeps the built-in defaults).
+    """
+    global _AUDIO_MONITOR_SAFETY_TIMEOUT_SEC
+    audio_cfg = cfg.get("audio") or {}
+
+    timeout = audio_cfg.get("monitor_safety_timeout_sec")
+    if isinstance(timeout, (int, float)) and timeout > 0:
+        _AUDIO_MONITOR_SAFETY_TIMEOUT_SEC = float(timeout)
+
+    names = audio_cfg.get("multi_output_device_names")
+    if isinstance(names, list) and names:
+        _MULTI_OUT_NAMES[:] = [str(n) for n in names if isinstance(n, str) and n]
 
 # Process-wide singleton for the audio-device monitor thread. Constructed
 # lazily by _get_audio_monitor(); used by cmd_ui and cmd_record.
@@ -2569,6 +2608,12 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     max_workers     = max(1, int(pcfg.get("workers", 2)))
     _cpu_threads_cfg = int(pcfg.get("cpu_threads", 0))
     cpu_threads      = _cpu_threads_cfg if _cpu_threads_cfg > 0 else max(1, (os.cpu_count() or 2) // 2)
+    # faster-whisper transcribe knobs (empty language → auto-detect)
+    _lang_cfg    = pcfg.get("language", "zh")
+    language     = _lang_cfg if _lang_cfg else None
+    beam_size    = max(1, int(pcfg.get("beam_size", 5)))
+    compute_type = str(pcfg.get("compute_type", "int8"))
+    vad_filter   = bool(pcfg.get("vad_filter", True))
 
     # 读取 WAV 元数据
     with wave.open(str(audio_path), "rb") as wf:
@@ -2581,10 +2626,10 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
     # ── 短录音：直接串行转写 ──────────────────────────────────────────────────
     if chunk_secs <= 0 or total_secs <= chunk_secs:
         print(f"[转写] 加载 Whisper {model_size}（首次运行会下载模型）...")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8",
+        model = WhisperModel(model_size, device="cpu", compute_type=compute_type,
                              cpu_threads=cpu_threads)
         segments, info = model.transcribe(
-            str(audio_path), language="zh", beam_size=5, vad_filter=True
+            str(audio_path), language=language, beam_size=beam_size, vad_filter=vad_filter
         )
         print(f"[转写] 语言: {info.language}（置信度 {info.language_probability:.0%}）")
         lines = []
@@ -2625,10 +2670,10 @@ def _transcribe_whisper(audio_path: Path, pcfg: dict, on_progress=None) -> str:
         # 各线程独立加载模型实例，CTranslate2 推理期间释放 GIL，实现真正并行
         def _run_chunk(args):
             chunk_path_str, offset, idx = args
-            m = WhisperModel(model_size, device="cpu", compute_type="int8",
+            m = WhisperModel(model_size, device="cpu", compute_type=compute_type,
                              cpu_threads=cpu_threads)
             segs, _ = m.transcribe(
-                chunk_path_str, language="zh", beam_size=5, vad_filter=True
+                chunk_path_str, language=language, beam_size=beam_size, vad_filter=vad_filter
             )
             lines = [
                 f"[{seg.start + offset:05.1f}s] {seg.text.strip()}"

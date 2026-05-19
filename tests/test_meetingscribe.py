@@ -143,7 +143,7 @@ class TestLoadConfig:
         monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
         cfg = ms.load_config()
         assert cfg["stt"]["whisper"]["model"] == "large-v3"
-        assert cfg["stt"]["whisper"]["workers"] == 2  # default preserved
+        assert cfg["stt"]["whisper"]["workers"] == 4  # default preserved
 
     def test_no_file_deepcopy_does_not_mutate_default(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ms, "CONFIG_FILE", tmp_path / "missing.jsonc")

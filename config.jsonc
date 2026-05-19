@@ -4,8 +4,8 @@
   "llm_timeout": 1200,
   // 校对分块大小（字符数），超出则拆分为多块并行处理
   "polish_chunk_size": 3000,
-  // 校对并发 worker 数（同时调用 LLM 的块数），0 = 不限
-  "polish_max_workers": 3,
+  // 校对并发 worker 数（同时调用 LLM 的块数），0 = 自动(max(4, cpu核数/2))
+  "polish_max_workers": 4,
 
   // ── 运行模式 ─────────────────────────────────────────────────────────────────
   // meeting（会议纪要，默认）| interview（面试总结）
@@ -38,7 +38,7 @@
   "stt": {
     "funasr": {
       // 并发实例数：0 = 自动（max(2, CPU 核数 / 2)），>0 = 指定数量；内存随之线性增长
-      "workers": 3,
+      "workers": 4,
       // 超过此时长（秒）自动分块并行转写；0 = 始终串行
       "chunk_secs": 300,
       // ASR 模型，首次运行自动下载（约 400 MB）
@@ -52,13 +52,21 @@
     },
     "whisper": {
       // 并发实例数（每实例独立加载模型，注意内存占用）
-      "workers": 3,
+      "workers": 4,
       // 超过此时长（秒）自动分块并行转写
       "chunk_secs": 300,
       // 每个 whisper 实例使用的 CPU 线程数；0 = faster-whisper 默认
       "cpu_threads": 0,
       // tiny / base / small / medium / large-v3，越大越准但越慢
-      "model": "base"
+      "model": "base",
+      // 转写语言代码（"" 或 null = 自动检测）；常用 zh / en / ja / ko
+      "language": "zh",
+      // 解码 beam 宽度；越大越准越慢，1 最快
+      "beam_size": 5,
+      // 计算精度：int8 / int8_float16 / int16 / float16 / float32
+      "compute_type": "int8",
+      // 启用语音活动检测，跳过静音段（演示/纯音乐场景可设 false）
+      "vad_filter": true
     },
     "openai": {
       "api_key": "",
@@ -90,5 +98,18 @@
       "api_key": "",
       "model": "gemini-1.5-pro"
     }
+  },
+
+  // ── 音频高级选项（一般不需要修改）────────────────────────────────────────────
+  "audio": {
+    // AudioDeviceMonitor 兜底唤醒间隔（秒）。HAL listener 失效时的自愈上限——
+    // 平时由热插拔事件驱动，不会触发；联调可调小到 5
+    "monitor_safety_timeout_sec": 30.0,
+    // 自动探测 Multi-Output Device 时匹配的设备名（简中 / 繁中 / 英）。
+    // 若你在 Audio MIDI Setup 里把 Multi-Output 设备重命名了，
+    // 把那个名字加进来即可恢复自动探测
+    "multi_output_device_names": [
+      "Multi-Output Device", "多输出设备", "多重輸出裝置"
+    ]
   }
 }
