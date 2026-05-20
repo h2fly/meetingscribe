@@ -4024,6 +4024,7 @@ def _cmd_ui_body(args, cfg):
             "rec.subtitle.idle": "默认录制（内外）扬声器和（内外）麦克风",
             "rec.subtitle.recording": "再次点击中间按钮停止录音",
             "rec.volume": "输出音量：",
+            "rec.volume_hint": "💡 录音期间用此滑块调音量（F11/F12 在录音中会失效）",
             "rec.btn.transcribe": "语音转文字",
             "rec.btn.notes": "生成会议纪要",
             "rec.btn.interview": "生成面试报告",
@@ -4137,6 +4138,7 @@ def _cmd_ui_body(args, cfg):
             "rec.subtitle.idle": "Captures both system audio (speakers) and microphone by default.",
             "rec.subtitle.recording": "Click the centre button again to stop.",
             "rec.volume": "Output volume:",
+            "rec.volume_hint": "💡 Use this slider during recording — F11/F12 are disabled while recording.",
             "rec.btn.transcribe": "Transcribe",
             "rec.btn.notes": "Generate meeting notes",
             "rec.btn.interview": "Generate interview report",
@@ -4595,6 +4597,27 @@ def _cmd_ui_body(args, cfg):
             # (BlackHole) + the resolver-chosen mic (external > built-in).
             # The active devices appear in the post-recording log instead.
 
+            # Plain-text hint just above the volume row. Reason: during
+            # recording dOut is the Multi-Output Device, which is an
+            # aggregate without master volume — so macOS disables F11/F12
+            # / Touch Bar / menu-bar slider with the 🚫 cursor. The user
+            # CAN still adjust playback level via this in-app slider,
+            # which writes directly to the physical sub-device. We
+            # surface the affordance here so users don't think the app
+            # is broken when their hardware keys stop responding.
+            self._vol_hint = BodyLabel("", self)
+            self._i18n(self._vol_hint, "rec.volume_hint")
+            self._vol_hint.setWordWrap(True)
+            self._vol_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Slightly eye-catching but consistent with the app's accent
+            # palette: the same Fluent blue used by the idle mic button
+            # (#0a84ff hover variant #0066d6, which reads better as text
+            # on a white background) + a touch of weight to lift it off
+            # the surrounding plain body text without screaming.
+            self._vol_hint.setStyleSheet(
+                "BodyLabel { color: #0066d6; font-weight: 500; }"
+            )
+
             # Volume row
             vol_row = QHBoxLayout()
             vol_row.addStretch(1)
@@ -4662,6 +4685,8 @@ def _cmd_ui_body(args, cfg):
             lv.addLayout(mic_row)
             lv.addWidget(self.timer_label)
             lv.addSpacing(8)
+            lv.addWidget(self._vol_hint)
+            lv.addSpacing(6)
             lv.addLayout(vol_row)
             lv.addSpacing(8)
             lv.addLayout(actions)
