@@ -2,30 +2,45 @@
 
 ## Project Overview
 
-Single-file Python tool: record audio → FunASR transcribe → LLM polish → meeting notes / interview summary.
+Single-file Python tool: record audio → FunASR transcribe → LLM polish → meeting notes / interview summary / sharing summary.
 
 - **Entry point**: `meetingscribe.py` (everything in one file)
 - **Config**: `config.jsonc` (JSONC with `//` comments, sits next to the script)
 - **Output dir**: `~/Documents/meetingscribe/recordings/` (created at runtime)
 
+## Project Rules
+
+These are non-negotiable conventions for this codebase. Violations are bugs even if tests pass.
+
+- **All prompts must live in `config.jsonc`.** Every prompt the pipeline sends to any LLM (currently `polish`, and `notes_zh` / `notes_en` for each mode) is shipped as an editable block in `config.jsonc`. The `_PROMPT_DEFAULTS` dict in `meetingscribe.py` is **fallback only** — never the sole source. Rationale: prompts are the main lever for tuning product behaviour, and operations / business / non-Python contributors must be able to read and adjust them without touching code. When you add a new mode or a new prompt slot, you MUST:
+  1. Add the default to `_PROMPT_DEFAULTS` (so the tool still works if the user deletes `config.jsonc`), AND
+  2. Add the exact same prompt as an editable block in `config.jsonc` with a `//` comment explaining what the prompt is for, AND
+  3. Verify with `python3 -c "from meetingscribe import load_config, _resolve_prompt, _PROMPT_DEFAULTS; ..."` that `_resolve_prompt` on the fresh config returns text identical to the `_PROMPT_DEFAULTS` entry — i.e. the jsonc override is a faithful copy, not a drifted variant.
+
 ## Running the Tool
 
 ```bash
-python3 meetingscribe.py ui                  # GUI — PyQt6 + Fluent (needs `python3 -m pip install PyQt6 PyQt6-Fluent-Widgets`)
-python3 meetingscribe.py record              # CLI recording
-python3 meetingscribe.py transcribe foo.wav  # process existing file
-python3 meetingscribe.py devices             # list audio devices
-python3 meetingscribe.py config              # view/edit config
+python3 meetingscribe.py ui                              # GUI — PyQt6 + Fluent (needs `python3 -m pip install PyQt6 PyQt6-Fluent-Widgets`)
+python3 meetingscribe.py record                          # CLI recording (mode defaults to `meeting`)
+python3 meetingscribe.py record --mode interview         # interview mode
+python3 meetingscribe.py record --mode sharing           # knowledge-sharing / tech-talk mode
+python3 meetingscribe.py transcribe foo.wav --mode sharing  # process existing file as a sharing session
+python3 meetingscribe.py devices                         # list audio devices
+python3 meetingscribe.py config                          # view/edit config
 ```
+
+Pipeline modes (`--mode`): `meeting` (default, 会议纪要) | `interview` (面试总结) | `sharing` (分享总结, knowledge-sharing / tech talks with audience Q&A). The set of valid modes is exported as `MODES` in `meetingscribe.py` and enforced by argparse.
 
 ## Architecture
 
 The pipeline has four steps, each resumable independently:
 
 ```
-.wav  →  .raw.txt  →  .polish.txt  →  .md
-        (FunASR)      (LLM polish)      (LLM notes)
+.wav  →  .raw.txt  →  .polish.txt  →  .<mode>.md
+        (FunASR)      (LLM polish)       (LLM notes)
 ```
+
+`<mode>` is one of `meeting` / `interview` / `sharing` (see "Pipeline modes" above). Each mode lives at a distinct suffix (`.meeting.md` / `.interview.md` / `.sharing.md`) so the same recording can carry summaries for multiple modes side by side.
 
 Each step checks whether its output file already exists and skips if so. This means re-running after a crash resumes from where it stopped.
 
@@ -45,10 +60,10 @@ Each step checks whether its output file already exists and skips if so. This me
 | `transcribe()` | Dispatches to `_transcribe_funasr/openai/gemini` |
 | `polish_transcript()` | Splits transcript into chunks, runs LLM in parallel via `ThreadPoolExecutor`. Reads the prompt via `_resolve_prompt(cfg, "polish")` (top-level, mode-agnostic). |
 | `generate_notes()` | Runs `_resolve_prompt(cfg, "notes_zh", mode=...)` + `notes_en` in parallel and concatenates the two outputs. |
-| `_resolve_prompt(cfg, key, mode=None)` | Pipeline-prompt lookup. `mode=None` → top-level `cfg["prompts"][key]` (used for `polish`). `mode="meeting"/"interview"` → `cfg["prompts"][mode][key]` (used for `notes_zh`/`notes_en`). Accepts `str` or `list[str]` (joined on `\n`), with fallback to `DEFAULT_CONFIG["prompts"]`. `{transcript}` is substituted via `str.replace` (not `.format`). |
+| `_resolve_prompt(cfg, key, mode=None)` | Pipeline-prompt lookup. `mode=None` → top-level `cfg["prompts"][key]` (used for `polish`). `mode="meeting"/"interview"/"sharing"` → `cfg["prompts"][mode][key]` (used for `notes_zh`/`notes_en`). Accepts `str` or `list[str]` (joined on `\n`), with fallback to `DEFAULT_CONFIG["prompts"]`. `{transcript}` is substituted via `str.replace` (not `.format`). |
 | `_llm_run()` | Dispatches to `_llm_claude_cli / _llm_openai / _llm_gemini` |
 | `cmd_ui()` | PyQt6 + PyQt6-Fluent-Widgets desktop GUI — the project's only UI (lazy import; prints an install hint and exits if PyQt6 isn't available). Base class is `QMainWindow` (not `FluentWindow`) so macOS provides native traffic lights on the LEFT with standard hover icons; the Fluent left navigation is embedded as a `NavigationInterface` widget. Inner classes: `_PipelineWorker` (`QObject` on `QThread` — catches both `Exception` and `SystemExit`), `_RecorderState` (Qt-signal wrapper over `MultiStreamRecorder` + dOut/mute lifecycle), `RecordingInterface` (no mic selector — always system audio + resolver-chosen mic; live substring search + right-click rename / delete on the sidebar history), `HistoryInterface` (four `SegmentedWidget` tabs: 全部 / 已总结 / 已录音转文字 / 待处理, tab-specific body rendering, right-click rename / delete with confirmation, `"未获取相关信息"` placeholder for participants/todos until a `.meta.json` sidecar exists), `ConfigInterface` (SpinBox to bump `polish_max_workers` + `stt.funasr.workers` in one shot, plus a raw JSONC editor with syntax highlighting that validates via `_strip_jsonc_comments` + `json.loads` before writing back), `MainWindow`. Single 中文 / EN toggle in the top bar flips every translatable widget via per-view `apply_language()` + `_LABELS` lookup table. Cross-thread UI updates use `QTimer.singleShot(0, ...)`. Reuses every backend function (`MultiStreamRecorder`, `_reconcile_recording_mutes`, `_restore_all_recording_mutes`, `_restore_output_if_needed`, `_get_audio_monitor`, `transcribe`, `polish_transcript`, `generate_notes`, `save_minutes`, `save_config`, `_rename_meeting_files`, `_delete_meeting_files`). |
-| `_split_meeting_stem(stem)` / `_rename_meeting_files(wav, name)` / `_delete_meeting_files(wav)` | Filename convention is `<timestamp>[.<custom>].<suffix>`. `_split_meeting_stem` parses the timestamp prefix (validated against `YYYYmmdd_HHMMSS`) and optional custom-name segment. `_rename_meeting_files` cascades a rename across every sibling file sharing the same stem (`.wav` + `.raw.txt` + `.polish.txt` + `.meeting.md` + `.interview.md` + …) with collision detection. `_delete_meeting_files` removes the same sibling set, returning `(deleted_count, errors)`. Custom names are sanitised: reserved characters (`/ \\ : * ? " < > |` + C0 controls) are mapped to `_`, leading/trailing dots and whitespace are stripped. |
+| `_split_meeting_stem(stem)` / `_rename_meeting_files(wav, name)` / `_delete_meeting_files(wav)` | Filename convention is `<timestamp>[.<custom>].<suffix>`. `_split_meeting_stem` parses the timestamp prefix (validated against `YYYYmmdd_HHMMSS`) and optional custom-name segment. `_rename_meeting_files` cascades a rename across every sibling file sharing the same stem (`.wav` + `.raw.txt` + `.polish.txt` + `.meeting.md` + `.interview.md` + `.sharing.md` + …) with collision detection. `_delete_meeting_files` removes the same sibling set, returning `(deleted_count, errors)`. Custom names are sanitised: reserved characters (`/ \\ : * ? " < > |` + C0 controls) are mapped to `_`, leading/trailing dots and whitespace are stripped. |
 
 ## Provider System
 
@@ -141,9 +156,12 @@ All output files share the same stem as the recording:
 20260512_090120.polish.txt
 20260512_090120.meeting.md       # written when mode=meeting
 20260512_090120.interview.md     # written when mode=interview
+20260512_090120.sharing.md       # written when mode=sharing
 ```
 
-A meeting may have a human-readable suffix as well — `<timestamp>.<custom_name>.<ext>` (e.g. `20260512_090120.客户访谈.wav`). The legacy single-`.md` file (no `.meeting`/`.interview` infix) is still recognised for read / open / delete.
+A meeting may have a human-readable suffix as well — `<timestamp>.<custom_name>.<ext>` (e.g. `20260512_090120.客户访谈.wav`). The legacy single-`.md` file (no `.meeting`/`.interview`/`.sharing` infix) is still recognised for read / open / delete.
+
+Suffix routing lives in `_NOTES_SUFFIX` (`meeting` → `.meeting.md`, `interview` → `.interview.md`, `sharing` → `.sharing.md`); `MODES = tuple(_NOTES_SUFFIX.keys())` is the single source of truth driving argparse `choices=`, the mode→label dict in `generate_notes`, and the GUI scanner.
 
 ## Dependencies
 
@@ -158,7 +176,7 @@ PyQt6-Fluent-Widgets  # required for `ui`. NOT PyQt-Fluent-Widgets — that one 
 ```
 
 wave, argparse, subprocess, ctypes — all stdlib.
-Tests: `pytest tests/` (179 unit tests; mocked CoreAudio for cross-platform CI). Manual smoke testing via `python3 meetingscribe.py ui`.
+Tests: `pytest tests/` (185 unit tests; mocked CoreAudio for cross-platform CI). Manual smoke testing via `python3 meetingscribe.py ui`.
 
 ## Common Edit Patterns
 
@@ -166,7 +184,32 @@ Tests: `pytest tests/` (179 unit tests; mocked CoreAudio for cross-platform CI).
 
 **Add a new STT provider**: add entry to `DEFAULT_CONFIG["stt"]`, add `_transcribe_<name>()`, dispatch in `transcribe()`.
 
-**Change prompts**: edit `cfg["prompts"]` in `config.jsonc` (the user-facing surface, accepts both `str` and `list[str]`). The built-in defaults live in `_PROMPT_DEFAULTS` (above `DEFAULT_CONFIG`). Keys: `polish` is at the top level (mode-agnostic); `notes_zh` / `notes_en` live under `meeting` and `interview` respectively. All call sites read via `_resolve_prompt(cfg, key, mode=None)`.
+**Change prompts**: edit `cfg["prompts"]` in `config.jsonc` (the user-facing surface, accepts both `str` and `list[str]`). The built-in defaults live in `_PROMPT_DEFAULTS` (above `DEFAULT_CONFIG`) but per the [Project Rules](#project-rules) section, `_PROMPT_DEFAULTS` is fallback only — every prompt also ships as an editable block in `config.jsonc`, and the two must stay byte-identical. Keys: `polish` is at the top level (mode-agnostic); `notes_zh` / `notes_en` live under `meeting`, `interview`, and `sharing` respectively. All call sites read via `_resolve_prompt(cfg, key, mode=None)`.
+
+To customise just one mode without copy-pasting every default, drop the override into `config.jsonc` — `_deep_merge` keeps the other keys defaulted. For example, to ask the sharing-summary prompt to emphasise code snippets:
+
+```jsonc
+{
+  "prompts": {
+    "sharing": {
+      // The literal "{transcript}" token is substituted via str.replace,
+      // so other braces in your prompt do NOT need to be escaped.
+      "notes_zh": [
+        "你是一位技术分享整理助手。请在保留原有结构（分享概览 / 分享正文 / 核心要点 / 最佳实践 / 关键洞察 / 适用边界 / 风险与权衡 / 问答 / 行动建议）的基础上：",
+        "- 在「分享正文」中**逐字保留代码片段、命令行、链接**，并用 ``` 围栏标注语言；",
+        "- 「最佳实践」按「Do / Don't」两列罗列；",
+        "- 「问答」若某问主讲人未直接回答，标注「（未直接回答 / 待跟进）」。",
+        "",
+        "---",
+        "【分享转写】",
+        "{transcript}"
+      ]
+    }
+  }
+}
+```
+
+The `notes_en` side falls back to the default — partial overrides are fine. Both `str` (literal) and `list[str]` (joined on `\n`) are accepted at every prompt slot.
 
 **Modify GUI layout**: widgets live inside `cmd_ui()`'s three interface classes — `RecordingInterface`, `HistoryInterface`, `ConfigInterface` — all wrapped in `MainWindow`. Card surfaces via `_style_as_card(widget, padding=N, name="...")`. Pipeline-button styling via `_apply_open_btn_style(btn, is_open=bool)`.
 

@@ -928,29 +928,78 @@ class TestMultiStreamRecorderWarnings:
 # ── _llm_claude_cli ───────────────────────────────────────────────────────────
 
 class TestLlmClaudeCli:
+    # `_llm_claude_cli` was switched from `subprocess.run` to
+    # `subprocess.Popen` so that `_pipeline_kill_popens()` can SIGKILL the
+    # in-flight `claude -p …` child when the user clicks 停止任务. These
+    # tests now mock Popen + the proc's `.communicate()` accordingly.
+
+    @staticmethod
+    def _popen_mock(stdout="", stderr="", returncode=0):
+        proc = MagicMock()
+        proc.communicate.return_value = (stdout, stderr)
+        proc.returncode = returncode
+        return proc
+
+    def setup_method(self):
+        # Ensure no leftover cancel state from a previous test triggers
+        # `_PipelineCancelled` inside `_llm_claude_cli`.
+        ms._PIPELINE_CANCEL.clear()
+
     def test_success_strips_whitespace(self):
-        result = MagicMock(returncode=0, stdout="  result\n  ")
-        with patch("meetingscribe.subprocess.run", return_value=result):
+        proc = self._popen_mock(stdout="  result\n  ", returncode=0)
+        with patch("meetingscribe.subprocess.Popen", return_value=proc):
             assert ms._llm_claude_cli("p", "lbl", 60) == "result"
 
     def test_command_not_found_exits(self):
-        with patch("meetingscribe.subprocess.run", side_effect=FileNotFoundError()):
+        with patch("meetingscribe.subprocess.Popen", side_effect=FileNotFoundError()):
             with pytest.raises(SystemExit):
                 ms._llm_claude_cli("p", "lbl", 60)
 
     def test_timeout_exits(self):
-        with patch(
-            "meetingscribe.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(["claude"], 60),
-        ):
+        # On timeout the helper kills the proc and calls communicate() a
+        # second time to drain pipes — that second call must return
+        # normally, so use an iterable side_effect.
+        proc = MagicMock()
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(["claude"], 60),
+            ("", ""),
+        ]
+        with patch("meetingscribe.subprocess.Popen", return_value=proc):
             with pytest.raises(SystemExit):
                 ms._llm_claude_cli("p", "lbl", 60)
 
     def test_nonzero_returncode_exits(self):
-        result = MagicMock(returncode=1, stderr="error")
-        with patch("meetingscribe.subprocess.run", return_value=result):
+        proc = self._popen_mock(stderr="error", returncode=1)
+        with patch("meetingscribe.subprocess.Popen", return_value=proc):
             with pytest.raises(SystemExit):
                 ms._llm_claude_cli("p", "lbl", 60)
+
+    def test_cancel_after_kill_raises_pipeline_cancelled(self):
+        # Simulate the cancellation path: `_pipeline_kill_popens()` SIGKILLs
+        # the child, communicate returns a negative returncode, and the
+        # cancel event is set → `_llm_claude_cli` must surface a
+        # `_PipelineCancelled` instead of `SystemExit` so the worker emits
+        # the `cancelled` signal (not `failed`).
+        proc = self._popen_mock(stderr="", returncode=-9)
+        ms._PIPELINE_CANCEL.set()
+        try:
+            with patch("meetingscribe.subprocess.Popen", return_value=proc):
+                with pytest.raises(ms._PipelineCancelled):
+                    ms._llm_claude_cli("p", "lbl", 60)
+        finally:
+            ms._PIPELINE_CANCEL.clear()
+
+    def test_pre_check_short_circuits_when_cancelled(self):
+        # If cancel was already requested before the helper runs, we should
+        # not spawn a subprocess at all.
+        ms._PIPELINE_CANCEL.set()
+        try:
+            with patch("meetingscribe.subprocess.Popen") as popen:
+                with pytest.raises(ms._PipelineCancelled):
+                    ms._llm_claude_cli("p", "lbl", 60)
+                popen.assert_not_called()
+        finally:
+            ms._PIPELINE_CANCEL.clear()
 
 
 # ── _llm_openai ───────────────────────────────────────────────────────────────
@@ -2281,3 +2330,124 @@ class TestResolvePrompt:
         # see the same instruction.
         polish = ms._resolve_prompt({}, "polish")
         assert "区分不同发言者" in polish
+
+
+# ── Sharing-summary mode ────────────────────────────────────────────────────
+
+
+class TestSharingMode:
+    """The `sharing` mode is a first-class peer to `meeting` / `interview`:
+    own prompt block, own artifact suffix, own UI button. These tests pin
+    the invariants that make that wiring work; the GUI surface is covered
+    by the manual smoke test plan."""
+
+    def test_modes_registry_contains_sharing(self):
+        assert "sharing" in ms.MODES
+        assert ms._NOTES_SUFFIX["sharing"] == ".sharing.md"
+
+    def test_default_sharing_notes_zh_resolves(self):
+        zh = ms._resolve_prompt({}, "notes_zh", mode="sharing")
+        assert "{transcript}" in zh
+        assert "分享正文" in zh
+        assert "问答" in zh
+
+    def test_default_sharing_notes_en_resolves(self):
+        en = ms._resolve_prompt({}, "notes_en", mode="sharing")
+        assert "{transcript}" in en
+        assert "Detailed Walkthrough" in en
+        assert "Q&A" in en
+
+    def test_user_override_preferred_over_default(self):
+        cfg = {"prompts": {"sharing": {"notes_en": "custom {transcript}"}}}
+        assert ms._resolve_prompt(cfg, "notes_en", mode="sharing") == "custom {transcript}"
+        # The zh side still falls back to the default.
+        assert "分享正文" in ms._resolve_prompt(cfg, "notes_zh", mode="sharing")
+
+    def test_list_of_strings_joins_on_newline(self):
+        cfg = {"prompts": {"sharing": {"notes_zh": ["A", "", "C", "{transcript}"]}}}
+        out = ms._resolve_prompt(cfg, "notes_zh", mode="sharing")
+        assert out == "A\n\nC\n{transcript}"
+
+    def test_mode_label_dispatch(self):
+        # `generate_notes` reads this dict; pinning the value here keeps the
+        # print-prefix consistent with the user-facing CLAUDE.md docs.
+        assert ms._MODE_LABELS_ZH["sharing"] == "分享总结"
+
+    def test_save_minutes_writes_sharing_md(self, tmp_path):
+        wav = tmp_path / "20260521_140000.wav"
+        out = ms.save_minutes("# Sharing recap", wav, mode="sharing")
+        assert out == tmp_path / "20260521_140000.sharing.md"
+        assert out.read_text(encoding="utf-8") == "# Sharing recap"
+
+    def test_save_minutes_sharing_preserves_custom_name(self, tmp_path):
+        # `<timestamp>.<custom_name>.wav` -> the sharing artifact carries the
+        # same custom-name segment so the sibling-cascade rename / delete
+        # logic keeps the files together.
+        wav = tmp_path / "20260521_140000.内部分享.wav"
+        out = ms.save_minutes("body", wav, mode="sharing")
+        assert out == tmp_path / "20260521_140000.内部分享.sharing.md"
+
+    def test_rename_cascades_sharing_md(self, tmp_path):
+        # _rename_meeting_files is glob-based — it picks up every sibling that
+        # shares the stem prefix. This test pins the .sharing.md behaviour
+        # so a future suffix-enumeration refactor doesn't regress it.
+        wav = tmp_path / "20260518_174926.wav"
+        wav.write_bytes(b"")
+        for suf in (".raw.txt", ".polish.txt", ".sharing.md"):
+            (tmp_path / f"20260518_174926{suf}").write_text(
+                f"{suf} content", encoding="utf-8"
+            )
+        new_wav = ms._rename_meeting_files(wav, "技术分享")
+        assert new_wav == tmp_path / "20260518_174926.技术分享.wav"
+        assert (tmp_path / "20260518_174926.技术分享.sharing.md").exists()
+        assert (tmp_path / "20260518_174926.技术分享.sharing.md").read_text(
+            encoding="utf-8"
+        ) == ".sharing.md content"
+        assert not (tmp_path / "20260518_174926.sharing.md").exists()
+
+    def test_rename_aborts_on_sharing_md_collision(self, tmp_path):
+        wav = tmp_path / "20260518_174926.wav"
+        wav.write_bytes(b"")
+        (tmp_path / "20260518_174926.sharing.md").write_text("a", encoding="utf-8")
+        # Pre-existing target on the .sharing.md side blocks the cascade
+        # the same way a .wav collision would.
+        (tmp_path / "20260518_174926.客户分享.sharing.md").write_text(
+            "taken", encoding="utf-8"
+        )
+        result = ms._rename_meeting_files(wav, "客户分享")
+        assert result is None
+        # Original files untouched.
+        assert wav.exists()
+        assert (tmp_path / "20260518_174926.sharing.md").read_text(
+            encoding="utf-8"
+        ) == "a"
+        assert (tmp_path / "20260518_174926.客户分享.sharing.md").read_text(
+            encoding="utf-8"
+        ) == "taken"
+
+    def test_delete_cascades_sharing_md(self, tmp_path):
+        wav = tmp_path / "20260518_174926.wav"
+        wav.write_bytes(b"")
+        (tmp_path / "20260518_174926.raw.txt").write_text("r", encoding="utf-8")
+        (tmp_path / "20260518_174926.sharing.md").write_text("s", encoding="utf-8")
+        deleted, errors = ms._delete_meeting_files(wav)
+        assert errors == []
+        # .wav + .raw.txt + .sharing.md
+        assert deleted == 3
+        assert not wav.exists()
+        assert not (tmp_path / "20260518_174926.sharing.md").exists()
+
+    def test_cli_rejects_unknown_mode(self):
+        # argparse should reject any --mode value not in MODES with a
+        # non-zero exit and a message that lists the valid choices.
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).parent.parent / "meetingscribe.py"),
+             "record", "--mode", "bogus"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+        # argparse writes the error to stderr.
+        err = result.stderr.lower()
+        assert "bogus" in err or "invalid choice" in err
+        # The valid choices should be mentioned somewhere in the message.
+        assert "sharing" in err or "meeting" in err

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
+meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结/分享总结
 
 ━━━ 模式 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   meeting   会议纪要模式（默认）
   interview 面试总结模式
+  sharing   分享总结模式（知识分享 / 技术 talk / 最佳实践讲座）
 
 ━━━ 录音 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   # 默认模式录音（Ctrl+C 停止），自动完成转写 → 校对 → 纪要
@@ -13,6 +14,9 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
   # 面试模式
   python3 meetingscribe.py record --mode interview
   python3 meetingscribe.py record --mode interview --title "后端工程师面试"
+
+  # 分享总结模式（多主讲人 + 问答）
+  python3 meetingscribe.py record --mode sharing
 
   # 指定各环节 provider（临时覆盖，优先级高于 config）
   python3 meetingscribe.py record --transcribe-provider openai
@@ -25,6 +29,7 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
   # 传 .wav：若同目录已有 .raw.txt 则自动跳过转写，直接校对 + 纪要
   python3 meetingscribe.py transcribe audio.wav
   python3 meetingscribe.py transcribe audio.wav --mode interview
+  python3 meetingscribe.py transcribe audio.wav --mode sharing
   python3 meetingscribe.py transcribe audio.wav --transcribe-provider openai
   python3 meetingscribe.py transcribe audio.wav --polish-provider gemini
   python3 meetingscribe.py transcribe audio.wav --meeting-notes-provider openai
@@ -63,8 +68,10 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结
 ━━━ 输出文件（与录音 / 输入文件同目录）━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   <stem>.wav            录音文件
   <stem>.raw.txt        原始转写
-  <stem>.polish.txt     校对后转写（会议纪要/面试总结的输入）
-  <stem>.md             会议纪要 / 面试总结
+  <stem>.polish.txt     校对后转写（会议纪要/面试总结/分享总结的输入）
+  <stem>.meeting.md     会议纪要（mode=meeting）
+  <stem>.interview.md   面试报告（mode=interview）
+  <stem>.sharing.md     分享总结（mode=sharing）
 """
 
 import argparse
@@ -73,6 +80,7 @@ import copy
 import json
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -399,6 +407,76 @@ Output in English, Markdown format, concise and clear. If the content is short o
 
 ---
 [Meeting Transcript]
+{transcript}
+""",
+    },
+    "sharing": {
+        "notes_zh": """\
+你是一位专业的分享/讲座整理助手。以下转写文本来自一次知识分享 / 技术分享 / 最佳实践讲座，可能有一位或多位主讲人详细分享内容，过程中或结尾通常会有听众提问、主讲人答疑。请生成一份既忠实记录分享内容、又便于事后查阅的整理稿。
+
+要求（请按以下结构输出，使用 Markdown）：
+
+1. **分享概览** — 2~4 句，说明本次分享的主题、主讲人（如可识别）、整体定位（介绍 / 经验复盘 / 教程 / 案例剖析等）。
+2. **分享正文** — **这是本输出最重要的部分**。请按主讲人的讲述顺序，分小节（## 二级标题）忠实重述分享内容：
+   - 保留主讲人提到的具体案例、数字、命令、代码片段、链接、人名、产品名、方法论名称等关键事实，不要为了"简洁"而抹掉。
+   - 保留逻辑层次：主讲人怎么展开论点的（背景 → 问题 → 方案 → 验证 → 总结），就按那个顺序写。
+   - 用通顺的书面中文重写口语化的表达，但**不要做主观加工或评价**；这是"详细文字版本"，不是"摘要"。
+   - 如果分享内容较长，可以拆为多个小节，每节都用 `##` 二级标题。
+3. **核心要点** — 用 3~7 条要点列出分享中最重要的结论 / 主张，每条 1~2 句。
+4. **最佳实践 / 可复用经验** — 列出主讲人明确推荐的做法、踩过的坑、避免的陷阱。无则写"未明确提及"。
+5. **关键洞察** — 主讲人独到的观点或反直觉的结论；与行业常见做法的差异。无则写"无"。
+6. **适用边界 / 前提条件** — 这些经验在什么场景下成立？依赖哪些技术 / 团队规模 / 业务特征？主讲人有没有明确说"不适用于 X"？
+7. **风险与权衡** — 主讲人提到的限制、副作用、tradeoff。无则写"未明确提及"。
+8. **问答（Q&A）** — 把听众提问和主讲人回答配对列出。格式：
+   - **问 [提问者，如已知]**：……
+   - **答 [主讲人，如已知]**：……
+   - 如果某个问题主讲人没有正面回答或当场承认不知道，明确标注"（未直接回答 / 待跟进）"。
+   - 若没有问答环节，写"本次分享未包含问答环节"。
+9. **行动建议 / 后续动作** — 听众可立即落地的 2~5 条建议；如果分享中提到了延伸阅读 / 工具 / 文档链接，整理在此处。
+
+发言者标注规则：
+- 如果上一步校对结果里已经标注了角色或姓名（如「主讲人：」「提问者 A：」「张三：」），请在「分享正文」「问答」中**保留这些标注**。
+- 如果转写没有可靠区分发言者，**不要凭空捏造身份**；用"主讲人"、"听众"这样的通用称呼即可。
+- 多位主讲人时分别标注，不要混为一谈。
+
+输出语言：中文。Markdown 格式，专业、客观。若转写较短、不完整或没有问答，如实在对应小节里说明。
+
+---
+【分享转写】
+{transcript}
+""",
+        "notes_en": """\
+You are a professional knowledge-sharing / tech-talk summarisation assistant. The transcript below is from a sharing session, tech talk, or best-practices walkthrough delivered by one or more presenters. Audience members may have asked questions during or at the end of the talk. Produce a faithful, structured rendering of the talk that readers can use as a substitute for having attended.
+
+Output structure (Markdown):
+
+1. **Session Overview** — 2–4 sentences naming the topic, presenter(s) where identifiable, and the talk's positioning (introduction / experience report / tutorial / case study).
+2. **Detailed Walkthrough** — **the most important section.** Following the presenter's own narrative order, retell the content in numbered or `##`-headed subsections:
+   - Preserve every concrete fact mentioned: examples, numbers, commands, code snippets, links, names of people / products / methodologies. Do **not** drop them for the sake of brevity.
+   - Preserve the logical structure (background → problem → approach → validation → takeaway), in the same order the presenter used.
+   - Rewrite spoken English into clean written English, but do **not** add your own interpretation or evaluation. This section is a *long-form retelling*, not a summary.
+   - Break the walkthrough into multiple subsections (`##` headings) if the talk is long.
+3. **Key Points** — 3–7 bullets capturing the most important claims / conclusions, 1–2 sentences each.
+4. **Best Practices / Reusable Lessons** — list practices the presenter explicitly recommended, plus pitfalls they called out. Write "Not explicitly mentioned" if absent.
+5. **Insights** — non-obvious takeaways, contrarian observations, points of divergence from common industry practice. Write "None" if absent.
+6. **Applicability & Preconditions** — the contexts in which these practices hold (technology stack, team size, business shape). Did the presenter call out anything as **not** applicable?
+7. **Risks & Trade-offs** — limitations, side effects, and trade-offs the presenter acknowledged. Write "Not explicitly mentioned" if absent.
+8. **Q&A** — pair audience questions with the presenter's answers. Format:
+   - **Q [asker, if known]:** …
+   - **A [presenter, if known]:** …
+   - If the presenter deflected, deferred, or acknowledged not knowing, mark "(not directly answered / follow-up needed)".
+   - If there was no Q&A segment, write "This session had no Q&A segment."
+9. **Action Items / Next Steps** — 2–5 actionable suggestions for the audience; collect any extended-reading links / tools / docs the presenter mentioned.
+
+Speaker-attribution rules:
+- If the polish step already labelled segments (e.g. "Presenter:", "Audience member A:", a specific name), **preserve those labels** in both the Walkthrough and the Q&A.
+- If the transcript does not reliably distinguish speakers, do **not** invent identities. Use generic terms like "presenter" and "audience member".
+- For multi-presenter talks, attribute each segment to the correct presenter; do not blend their voices.
+
+Output language: English. Markdown format, professional and objective. If the transcript is short, incomplete, or has no Q&A, say so honestly in the relevant section.
+
+---
+[Sharing Transcript]
 {transcript}
 """,
     },
@@ -1566,6 +1644,14 @@ _active_mutes: dict[str, bool] = {}
 _mutes_lock = threading.RLock()
 _MUTE_STATE_FILE = CONFIG_DIR / ".active_mutes.json"
 
+# Devices the user has explicitly muted via the in-app slider (dragged to 0%).
+# `_reconcile_recording_mutes` reads this to distinguish "user intent" from
+# "stale leftover" when deciding whether to clear the mute on the active
+# listening target. Protected by `_mutes_lock`. Not persisted on purpose —
+# slider state is transient UI; a crash resets the user's mute intent and the
+# device-level mute itself is recovered via `_recover_persisted_mutes`.
+_slider_intent_muted: set[str] = set()
+
 
 def _persist_mutes() -> None:
     """Atomically write _active_mutes to disk (or delete the file when empty).
@@ -1638,6 +1724,17 @@ def _reconcile_recording_mutes(plan: "AudioPlan") -> None:
                 continue
             if current == desired:
                 continue
+            # Honour explicit user intent: if the user has parked the in-app
+            # slider at 0% for this device, they want it muted right now.
+            # The "active listener mute" branch below would normally treat
+            # this as a stale leftover and clear it; skip that here so the
+            # slider's mute survives every periodic reconcile.
+            if not desired and sub in _slider_intent_muted:
+                _log(
+                    "MUTE",
+                    f"device={sub!r} mute kept (slider intent); reconcile skipped",
+                )
+                continue
             ok = _ca_set_device_mute(sub, desired)
             if desired:
                 # False → True: we silenced the device. Track for restore.
@@ -1660,7 +1757,9 @@ def _reconcile_recording_mutes(plan: "AudioPlan") -> None:
                 _log("MUTE", f"device={sub!r} unmuted ({reason}; not restoring at stop) ok={ok}")
         _log(
             "MUTE",
-            f"reconcile: active={active!r} multi_subs={physical_subs} tracked={list(_active_mutes.keys())}",
+            f"reconcile: active={active!r} multi_subs={physical_subs} "
+            f"tracked={list(_active_mutes.keys())} "
+            f"slider_intent={sorted(_slider_intent_muted)}",
         )
         _persist_mutes()
 
@@ -2084,12 +2183,19 @@ class AudioDeviceMonitor(threading.Thread):
         # reconciliation so we only call _reconcile_recording_mutes when those
         # inputs actually change (e.g. user plugs/unplugs a physical output).
         self._prev_mute_triple: tuple | None = None
+        # Memoizes the last `plan.restore_output_name` we fired
+        # `on_recording_plan_change` for. Tracks idle AND recording branches
+        # so the callback fires exactly once per real change of the active
+        # output device, regardless of which branch detects it first.
+        self._prev_active_device: "str | None" = None
         # Optional callback fired (from this monitor thread) every time the
-        # recording-branch observes a plan change. GUI code sets this to keep
-        # widgets like the volume slider bound to the current physical output
-        # when the user hotplugs mid-recording. None outside the GUI (CLI).
-        # The callback is responsible for its own thread-safety — it MUST NOT
-        # block; common pattern is to schedule a Tk update via root.after(0).
+        # resolver's active output device changes — covers BOTH the idle
+        # branch (user plugs headphones with no recording in progress) and
+        # the recording branch (mid-recording hotplug). GUI code sets this
+        # to keep widgets like the volume slider bound to the current
+        # physical output. None outside the GUI (CLI). The callback is
+        # responsible for its own thread-safety — it MUST NOT block; common
+        # pattern is to schedule a Qt update via QTimer.singleShot(0, ...).
         self.on_recording_plan_change: "Callable[[AudioPlan], None] | None" = None
 
     def start(self):
@@ -2151,6 +2257,23 @@ class AudioDeviceMonitor(threading.Thread):
             _log("MONITOR", f"restoring; restored={restored!r}; triple={triple!r}")
         else:
             _log("MONITOR", "idle no-change")
+        # Fire the active-output-changed callback for hotplugs that happen
+        # while not recording (e.g. user pairs AirPods after launching the
+        # GUI but before starting a recording). Independent of `_prev_triple`
+        # so a mic-only change doesn't also trigger a slider transfer.
+        new_active = plan.restore_output_name
+        if new_active and new_active != self._prev_active_device:
+            self._prev_active_device = new_active
+            cb = self.on_recording_plan_change
+            if cb is not None:
+                try:
+                    cb(plan)
+                except Exception as e:
+                    _log(
+                        "ERR",
+                        f"idle-branch plan-change callback: "
+                        f"{type(e).__name__}: {e}",
+                    )
 
     def _recording_branch(self):
         # The recorder's _monitor thread is the authoritative reconciler for
@@ -2175,6 +2298,7 @@ class AudioDeviceMonitor(threading.Thread):
             _reconcile_recording_mutes(plan)
         except Exception as e:
             _log("ERR", f"recording-branch reconcile_mutes: {type(e).__name__}: {e}")
+        self._prev_active_device = plan.restore_output_name
         cb = self.on_recording_plan_change
         if cb is not None:
             try:
@@ -2962,6 +3086,94 @@ def _transcribe_gemini(audio_path: Path, pcfg: dict) -> str:
 # Resolution happens via `_resolve_prompt(cfg, mode, key)` — see top of file.
 
 
+# ── Pipeline cancellation primitives ─────────────────────────────────────────
+#
+# The GUI's "停止任务" button needs to truly interrupt the active pipeline (not
+# just hide the front-end progress). Cancellation is cooperative:
+#
+#   * `_PIPELINE_CANCEL` — a module-wide ``threading.Event``. Stage boundaries
+#     in `_PipelineWorker.run` plus every LLM helper call `_pipeline_check_
+#     cancelled` before doing work; if the event is set they raise
+#     `_PipelineCancelled`, which `_PipelineWorker.run` catches and turns into
+#     a `cancelled` Qt signal.
+#   * `_PIPELINE_POPENS` — every long-running ``subprocess.Popen`` the
+#     pipeline spawns (currently just `claude -p …`) is registered here.
+#     `_pipeline_kill_popens()` calls ``.kill()`` on each so the subprocess
+#     dies immediately instead of waiting for its natural completion.
+#
+# Only one pipeline runs at a time (the UI disables the action buttons during
+# a run), so module-level state is safe. The event is cleared in
+# `_PipelineWorker.__init__` so a fresh worker always starts uncancelled.
+#
+# HTTP-backed providers (`_llm_openai`, `_llm_gemini`) and FunASR's
+# `m.generate(...)` are uninterruptible mid-call — the in-flight call has to
+# return naturally — but `_pipeline_check_cancelled()` at the next stage
+# boundary still short-circuits the rest of the pipeline.
+
+class _PipelineCancelled(RuntimeError):
+    """Raised inside `_PipelineWorker.run` when the user clicks 停止任务."""
+
+
+_PIPELINE_CANCEL = threading.Event()
+_PIPELINE_POPENS_LOCK = threading.Lock()
+_PIPELINE_POPENS: "list[subprocess.Popen]" = []
+
+
+def _pipeline_register_popen(p: "subprocess.Popen") -> None:
+    with _PIPELINE_POPENS_LOCK:
+        _PIPELINE_POPENS.append(p)
+
+
+def _pipeline_unregister_popen(p: "subprocess.Popen") -> None:
+    with _PIPELINE_POPENS_LOCK:
+        try:
+            _PIPELINE_POPENS.remove(p)
+        except ValueError:
+            pass
+
+
+def _pipeline_kill_popens() -> None:
+    with _PIPELINE_POPENS_LOCK:
+        victims = list(_PIPELINE_POPENS)
+    _log("PIPELINE", f"kill_popens: terminating {len(victims)} subprocess(es)")
+    for p in victims:
+        pid = getattr(p, "pid", None)
+        try:
+            if sys.platform == "win32":
+                # Best-effort: kill the immediate child. Killing the
+                # process tree on Windows would need taskkill /T /F /PID,
+                # which adds platform-specific complexity we'll defer
+                # until a Windows user reports a leak.
+                p.kill()
+                _log("PIPELINE", f"kill_popens: killed pid={pid} (win)")
+            else:
+                # SIGKILL the whole process group — `claude` (Node.js) and
+                # other CLI wrappers typically fork child processes that
+                # do the actual API call; SIGKILL on the immediate child
+                # leaves those children orphaned-but-alive (reparented to
+                # init), so the "background task" appears to keep running.
+                # Requires `start_new_session=True` on the Popen so the
+                # child became a new process-group leader.
+                try:
+                    pgid = os.getpgid(p.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                    _log("PIPELINE", f"kill_popens: SIGKILL pgid={pgid} pid={pid}")
+                except ProcessLookupError:
+                    _log("PIPELINE", f"kill_popens: pid={pid} already exited")
+                except PermissionError as e:
+                    # killpg can fail if the child re-pgrouped itself
+                    # (rare); fall back to a plain kill of the leader.
+                    _log("PIPELINE", f"kill_popens: killpg pid={pid} denied ({e}); falling back to plain kill")
+                    p.kill()
+        except Exception as e:
+            _log("PIPELINE", f"kill_popens: error killing pid={pid}: {type(e).__name__}: {e}")
+
+
+def _pipeline_check_cancelled() -> None:
+    if _PIPELINE_CANCEL.is_set():
+        raise _PipelineCancelled()
+
+
 def _llm_run(prompt: str, provider_name: str, cfg: dict, label: str) -> str:
     llm_cfgs = {**DEFAULT_CONFIG["llm"], **cfg.get("llm", {})}
     pcfg = llm_cfgs.get(provider_name)
@@ -2984,29 +3196,67 @@ def _llm_run(prompt: str, provider_name: str, cfg: dict, label: str) -> str:
 
 
 def _llm_claude_cli(prompt: str, label: str, timeout: int, model: str = "") -> str:
+    # Pre-check before spawning so a cancel that already happened doesn't
+    # waste a subprocess startup.
+    _pipeline_check_cancelled()
     cmd = ["claude", "-p", prompt]
     if model:
         cmd += ["--model", model]
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform != "win32":
+        # Put the child in its own process group so we can SIGKILL the
+        # ENTIRE tree (claude wrapper + Node + any spawned helpers) on
+        # cancel. Without this, `proc.kill()` only kills the immediate
+        # child, leaving orphan grandchildren that keep talking to the
+        # API and produce the "cancel didn't terminate" UX.
+        popen_kwargs["start_new_session"] = True
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True, timeout=timeout,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except FileNotFoundError:
         print("[错误] 找不到 claude 命令，请确认 Claude Code CLI 已安装且在 PATH 中")
         sys.exit(1)
-    except subprocess.TimeoutExpired:
-        print(f"[错误] claude-cli 超时（{label}，{timeout}s）；可通过 config --set llm_timeout=900 调大")
+    # Register so `_pipeline_kill_popens()` can SIGKILL this process when
+    # the user clicks "停止任务" — that's what actually terminates the
+    # background task instead of letting it run to completion.
+    _pipeline_register_popen(proc)
+    # Race guard: if cancel fired in the tiny window between Popen and
+    # register, the previous kill_popens pass missed this proc. Kill it
+    # now so `communicate()` returns immediately instead of blocking
+    # forever on a live child.
+    if _PIPELINE_CANCEL.is_set():
+        _pipeline_kill_popens()
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            print(f"[错误] claude-cli 超时（{label}，{timeout}s）；可通过 config --set llm_timeout=900 调大")
+            sys.exit(1)
+    finally:
+        _pipeline_unregister_popen(proc)
+    # If we got here because cancel killed the subprocess, returncode will
+    # be negative (signal); short-circuit before sys.exit so the worker
+    # sees a clean `_PipelineCancelled` instead of a generic failure.
+    if _PIPELINE_CANCEL.is_set():
+        raise _PipelineCancelled()
+    if proc.returncode != 0:
+        print(f"[错误] claude-cli 非零退出（{label}）:\n{stderr}")
         sys.exit(1)
-    if result.returncode != 0:
-        print(f"[错误] claude-cli 非零退出（{label}）:\n{result.stderr}")
-        sys.exit(1)
-    return result.stdout.strip()
+    return stdout.strip()
 
 
 def _llm_openai(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     import json as _json
     import urllib.request, urllib.error
+
+    # HTTP calls aren't killable mid-request, but checking here at least
+    # prevents new calls from being made after the user has cancelled.
+    _pipeline_check_cancelled()
 
     url = pcfg.get("base_url", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
     api_key = pcfg.get("api_key", "")
@@ -3041,6 +3291,10 @@ def _llm_openai(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
 def _llm_gemini(prompt: str, pcfg: dict, label: str, timeout: int) -> str:
     import json as _json
     import urllib.request, urllib.error
+
+    # HTTP calls aren't killable mid-request, but checking here at least
+    # prevents new calls from being made after the user has cancelled.
+    _pipeline_check_cancelled()
 
     api_key = pcfg.get("api_key", "")
     model = pcfg.get("model", "gemini-1.5-pro")
@@ -3113,9 +3367,16 @@ def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "me
     return "\n\n".join(results)
 
 
+_MODE_LABELS_ZH = {
+    "meeting": "会议纪要",
+    "interview": "面试总结",
+    "sharing": "分享总结",
+}
+
+
 def generate_notes(transcript: str, provider: str, cfg: dict, mode: str = "meeting") -> str:
     import concurrent.futures
-    label = "面试总结" if mode == "interview" else "会议纪要"
+    label = _MODE_LABELS_ZH.get(mode, _MODE_LABELS_ZH["meeting"])
     print(f"[{label}] 并行生成中英文版本（{provider}）...")
     prompt_zh = _resolve_prompt(cfg, "notes_zh", mode=mode).replace("{transcript}", transcript)
     prompt_en = _resolve_prompt(cfg, "notes_en", mode=mode).replace("{transcript}", transcript)
@@ -3195,7 +3456,17 @@ def transcribe_and_polish(
 
 # ── 保存纪要 ──────────────────────────────────────────────────────────────────
 
-_NOTES_SUFFIX = {"meeting": ".meeting.md", "interview": ".interview.md"}
+_NOTES_SUFFIX = {
+    "meeting": ".meeting.md",
+    "interview": ".interview.md",
+    "sharing": ".sharing.md",
+}
+# Single source of truth for the supported pipeline modes. Drives argparse
+# validation (`choices=MODES`), the mode→label lookup in `generate_notes`,
+# and the `_list_recordings` artifact-detection logic. Adding a fourth
+# mode is: extend `_NOTES_SUFFIX` + add a `<mode>` block to
+# `_PROMPT_DEFAULTS` + wire UI labels — no other call sites to touch.
+MODES = tuple(_NOTES_SUFFIX.keys())
 
 
 def save_minutes(minutes: str, audio_path: Path, mode: str = "meeting") -> Path:
@@ -3343,6 +3614,120 @@ def _delete_meeting_files(wav_path: Path) -> tuple[int, list[str]]:
             errors.append(f"{f.name}: {type(e).__name__}: {e}")
             _log("ERR", f"delete failed {f.name}: {type(e).__name__}: {e}")
     return deleted, errors
+
+
+# ── 外部音频导入（iPhone .m4a / .mp3 / 等 → 16k mono PCM WAV）─────────────────
+
+# Extensions we attempt to transcode via ffmpeg. The list is intentionally
+# permissive — ffmpeg recognises far more, but these cover the common sources
+# (iPhone voice memos, Zoom recordings, downloaded podcasts, etc.).
+_IMPORTABLE_AUDIO_EXTS = frozenset({
+    ".m4a", ".mp4", ".aac",
+    ".mp3", ".mpga", ".mpeg",
+    ".flac", ".ogg", ".opus",
+    ".aif", ".aiff", ".aifc",
+    ".wma", ".amr", ".caf",
+    ".webm",
+})
+
+
+def _ffmpeg_path() -> "str | None":
+    """Return the absolute path to `ffmpeg` if available, else None.
+
+    Cached implicitly by `shutil.which` (it walks PATH; on macOS that's a few
+    stat calls, fine to call ad-hoc). Returns None when ffmpeg isn't on PATH —
+    callers surface the install hint.
+    """
+    import shutil
+    return shutil.which("ffmpeg")
+
+
+def _transcode_to_wav(src: Path, dst: Path) -> None:
+    """Transcode `src` (any ffmpeg-recognised container) into a 16 kHz mono
+    16-bit PCM WAV at `dst`. Format matches FunASR's expected input so the
+    downstream pipeline doesn't need any special-case branch.
+
+    Raises `RuntimeError` on ffmpeg failure with stderr included for
+    debugging. Caller is responsible for choosing `dst` (we don't add
+    suffixes — what's passed is what's written).
+    """
+    ffmpeg = _ffmpeg_path()
+    if ffmpeg is None:
+        raise RuntimeError(
+            "ffmpeg not found on PATH. Install with `brew install ffmpeg` "
+            "(macOS) or your distro's package manager."
+        )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(src),
+        "-ar", "16000",   # 16 kHz sample rate (FunASR canonical input)
+        "-ac", "1",       # mono
+        "-c:a", "pcm_s16le",
+        str(dst),
+    ]
+    _log("AUDIO", f"transcode: src={src.name!r} dst={dst.name!r}")
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(f"ffmpeg invocation failed: {e}") from e
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or "(no stderr)"
+        _log("ERR", f"ffmpeg rc={proc.returncode}: {err[:500]}")
+        raise RuntimeError(
+            f"ffmpeg failed (exit code {proc.returncode}): {err[:500]}"
+        )
+    _log("AUDIO", f"transcode ok: {dst.name}")
+
+
+def _import_audio_to_recordings(src: Path) -> Path:
+    """Copy or transcode an external audio file into `RECORDINGS_DIR`,
+    returning the canonical `.wav` Path it now lives at.
+
+    Naming follows the existing `<timestamp>[.<custom>].wav` convention so
+    every downstream helper (`_split_meeting_stem`, `_list_recordings`,
+    `_rename_meeting_files`, `_delete_meeting_files`) keeps working without
+    modification. The custom-name segment is the sanitised source stem, so
+    `客户访谈.m4a` becomes `20260521_141500.客户访谈.wav`.
+
+    Behavioural matrix:
+      - .wav  → file is hard-copied (no transcode; format may already be
+        FunASR-compatible PCM, and re-encoding would be wasteful).
+      - other recognised audio extension → ffmpeg transcode to 16 kHz mono
+        PCM WAV.
+      - unrecognised extension → still attempted via ffmpeg (it might work);
+        if ffmpeg fails the user gets the underlying error message.
+    """
+    import shutil
+    if not src.exists():
+        raise FileNotFoundError(f"audio file not found: {src}")
+    if not src.is_file():
+        raise ValueError(f"not a regular file: {src}")
+
+    # `RECORDINGS_DIR` is a local in cmd_ui() / cmd_record(); this helper is
+    # module-level so we recompute from CONFIG_DIR. Same path, same naming.
+    recordings_dir = CONFIG_DIR / "recordings"
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    custom = _sanitize_meeting_custom_name(src.stem)
+    stem = f"{ts}.{custom}" if custom else ts
+    dst = recordings_dir / f"{stem}.wav"
+    # Disambiguate same-second collisions (rapid imports) by appending a
+    # numeric suffix. Almost never happens in practice but cheap to handle.
+    n = 2
+    while dst.exists():
+        dst = recordings_dir / f"{stem}_{n}.wav"
+        n += 1
+
+    if src.suffix.lower() == ".wav":
+        shutil.copy2(src, dst)
+        _log("AUDIO", f"import (wav copy): src={src.name!r} → {dst.name!r}")
+        return dst
+
+    _transcode_to_wav(src, dst)
+    return dst
 
 
 # ── 子命令 ────────────────────────────────────────────────────────────────────
@@ -3593,8 +3978,8 @@ def _cmd_record_body(args, cfg):
         _remove_device_listeners()
 
     mode = getattr(args, "mode", None) or cfg.get("mode", "meeting")
-    if mode not in PROMPTS:
-        print(f"[错误] 未知模式 '{mode}'，可选：{list(PROMPTS)}")
+    if mode not in MODES:
+        print(f"[错误] 未知模式 '{mode}'，可选：{list(MODES)}")
         sys.exit(1)
 
     transcribe_provider  = getattr(args, "transcribe_provider", None)  or cfg.get("transcribe_provider", "funasr")
@@ -3633,7 +4018,7 @@ def _cmd_record_body(args, cfg):
     print(transcript_polished)
     print("─" * 60)
 
-    notes_label = "面试总结" if mode == "interview" else "会议纪要"
+    notes_label = _MODE_LABELS_ZH.get(mode, _MODE_LABELS_ZH["meeting"])
     notes = generate_notes(transcript_polished, notes_provider, cfg, mode)
     print(f"\n── {notes_label} " + "─" * (58 - len(notes_label)))
     print(notes)
@@ -3657,8 +4042,8 @@ def _cmd_transcribe_body(args, cfg):
         sys.exit(1)
 
     mode = getattr(args, "mode", None) or cfg.get("mode", "meeting")
-    if mode not in PROMPTS:
-        print(f"[错误] 未知模式 '{mode}'，可选：{list(PROMPTS)}")
+    if mode not in MODES:
+        print(f"[错误] 未知模式 '{mode}'，可选：{list(MODES)}")
         sys.exit(1)
 
     transcribe_provider  = getattr(args, "transcribe_provider", None)   or cfg.get("transcribe_provider", "funasr")
@@ -3683,6 +4068,18 @@ def _cmd_transcribe_body(args, cfg):
         transcript_polished = None
     else:
         audio_path = input_path
+        # Non-WAV input → transcode into RECORDINGS_DIR first so the
+        # downstream pipeline (FunASR's `wave.open`, OpenAI/Gemini binary
+        # upload) gets a clean PCM container. iPhone .m4a, Zoom .m4a,
+        # downloaded .mp3, etc. all flow through here.
+        if audio_path.suffix.lower() != ".wav":
+            print(f"[导入] 检测到非 WAV 输入，转码到 16k mono PCM WAV…")
+            try:
+                audio_path = _import_audio_to_recordings(audio_path)
+                print(f"[导入] 完成：{audio_path}")
+            except Exception as e:
+                print(f"[错误] 音频导入失败：{type(e).__name__}: {e}")
+                sys.exit(1)
         raw_txt_path = audio_path.with_name(audio_path.stem + ".raw.txt")
         polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
         need_transcribe = not raw_txt_path.exists()
@@ -3710,7 +4107,7 @@ def _cmd_transcribe_body(args, cfg):
             transcript_polished = polish_transcript(transcript_raw, polish_provider, cfg, mode)
             polish_path.write_text(transcript_polished, encoding="utf-8")
 
-    notes_label = "面试总结" if mode == "interview" else "会议纪要"
+    notes_label = _MODE_LABELS_ZH.get(mode, _MODE_LABELS_ZH["meeting"])
     print(f"\n[校对] 已保存: {polish_path}")
     print("\n── 校对后转写 " + "─" * 46)
     print(transcript_polished)
@@ -3838,16 +4235,23 @@ def _cmd_ui_body(args, cfg):
         for p in sorted(RECORDINGS_DIR.glob("*.wav"),
                         key=lambda x: x.stat().st_mtime, reverse=True):
             stem = p.stem
-            # New format: <stem>.meeting.md / <stem>.interview.md
-            # Legacy format: <stem>.md (still detected for backward compat)
+            # New format: <stem>.meeting.md / <stem>.interview.md /
+            # <stem>.sharing.md. Legacy format: <stem>.md (still detected
+            # for backward compat).
             meeting_md = p.with_name(stem + ".meeting.md")
             interview_md = p.with_name(stem + ".interview.md")
+            sharing_md = p.with_name(stem + ".sharing.md")
             legacy_md = p.with_name(stem + ".md")
-            # Pick the first existing artifact; meeting > interview > legacy
+            # Pick the first existing artifact; preference order is meeting
+            # > interview > sharing > legacy. `md_path` / `md_mode` exist
+            # mainly for backward compat with code paths that haven't been
+            # taught about the mode-specific path fields yet.
             if meeting_md.exists():
                 md_path, md_mode = meeting_md, "meeting"
             elif interview_md.exists():
                 md_path, md_mode = interview_md, "interview"
+            elif sharing_md.exists():
+                md_path, md_mode = sharing_md, "sharing"
             elif legacy_md.exists():
                 md_path, md_mode = legacy_md, "meeting"  # legacy assumed meeting
             else:
@@ -3865,6 +4269,7 @@ def _cmd_ui_body(args, cfg):
                 "md_mode": md_mode,
                 "meeting_md_path": meeting_md if meeting_md.exists() else None,
                 "interview_md_path": interview_md if interview_md.exists() else None,
+                "sharing_md_path": sharing_md if sharing_md.exists() else None,
                 "polish_path": polish if polish.exists() else None,
                 "raw_path": raw if raw.exists() else None,
             })
@@ -4028,10 +4433,20 @@ def _cmd_ui_body(args, cfg):
             "rec.btn.transcribe": "语音转文字",
             "rec.btn.notes": "生成会议纪要",
             "rec.btn.interview": "生成面试报告",
+            "rec.btn.sharing": "生成分享总结",
             "rec.btn.open_transcribe": "打开语音转文字结果",
             "rec.btn.open_notes": "打开会议纪要",
             "rec.btn.open_interview": "打开面试报告",
+            "rec.btn.open_sharing": "打开分享总结",
             "rec.btn.cancel": "停止任务",
+            "rec.btn.import": "导入外部音频…",
+            "rec.import.dialog_title": "选择要导入的音频文件",
+            "rec.import.filter": "音频文件 (*.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus *.aif *.aiff *.aifc *.wma *.amr *.caf *.webm);;所有文件 (*)",
+            "rec.import.progress": "正在导入并转码…",
+            "rec.import.done_fmt": "已导入：{name}",
+            "rec.import.failed_title": "导入失败",
+            "rec.import.failed_msg_fmt": "{err}",
+            "rec.import.no_ffmpeg_msg": "未在 PATH 中找到 ffmpeg。\n在 macOS 上可执行：brew install ffmpeg",
             "rec.no_file": "未选择录音文件",
             "rec.selected_prefix": "已选择：",
             "rec.history_title": "会议历史",
@@ -4051,16 +4466,18 @@ def _cmd_ui_body(args, cfg):
             "hist.btn.transcribe": "语音转文字",
             "hist.btn.notes": "生成会议纪要",
             "hist.btn.interview": "生成面试报告",
+            "hist.btn.sharing": "生成分享总结",
             "hist.btn.open_transcribe": "打开语音转文字结果",
             "hist.btn.open_notes": "打开会议纪要",
             "hist.btn.open_interview": "打开面试报告",
+            "hist.btn.open_sharing": "打开分享总结",
             "hist.btn.cancel": "停止任务",
             # ── Right-click context menus + delete confirmation
             "ctx.rename": "重命名…",
             "ctx.reveal": "在 Finder/资源管理器中显示",
             "ctx.delete": "删除本次会议所有记录…",
             "ctx.delete_title": "确认删除",
-            "ctx.delete_confirm": "确认删除 “{name}” 及其所有相关文件（.wav / .raw.txt / .polish.txt / .meeting.md / .interview.md 等）？\n此操作不可恢复。",
+            "ctx.delete_confirm": "确认删除 “{name}” 及其所有相关文件（.wav / .raw.txt / .polish.txt / .meeting.md / .interview.md / .sharing.md 等）？\n此操作不可恢复。",
             "ctx.delete_failed_title": "删除失败",
             "ctx.delete_failed_msg": "{err}",
             "ctx.confirm_yes": "确认",
@@ -4075,7 +4492,8 @@ def _cmd_ui_body(args, cfg):
             # ── Pipeline log lines + warnings (shown in the in-UI log_view)
             "pipe.log.done": "✓ 完成 → {path}",
             "pipe.log.failed": "✗ 失败：{err}",
-            "pipe.log.cancel_hint": "[提示] 已停止前台显示；后台任务仍会跑完",
+            "pipe.log.cancelling": "[提示] 正在终止后台任务…",
+            "pipe.log.cancelled": "[已停止] 后台任务已终止",
             "pipe.warn.no_wav": "请先录音或选择 .wav 文件",
             "pipe.warn.prefix": "[警告] {msg}",
             "pipe.warn.file_missing_title": "文件不存在",
@@ -4092,16 +4510,18 @@ def _cmd_ui_body(args, cfg):
             "dur.second": "{s} 秒",
             "hist.body.notes_meeting": "会议纪要",
             "hist.body.notes_interview": "面试报告",
+            "hist.body.notes_sharing": "分享总结",
             "hist.body.notes_both": "会议纪要 + 面试报告",
             "hist.body.notes_meeting_md": "会议纪要 (.meeting.md)",
             "hist.body.notes_interview_md": "面试报告 (.interview.md)",
+            "hist.body.notes_sharing_md": "分享总结 (.sharing.md)",
             "hist.body.notes_legacy_md": "会议纪要 (.md 旧格式)",
             "hist.body.polish_only": "语音转文字（已校对，.polish.txt）",
             "hist.body.raw_only": "原始转写 (.raw.txt)",
             "hist.body.no_notes": "（无总结文件）",
             "hist.body.no_polish": "（无 .polish.txt 文件）",
             "hist.body.raw_pending": "原始转写 (.raw.txt) — 等待后续校对 / 总结",
-            "hist.body.pending_placeholder": "尚未生成任何转写 / 纪要文件。\n在「录音」页选择此 .wav 然后点「语音转文字」或「生成会议纪要 / 面试报告」启动流水线。",
+            "hist.body.pending_placeholder": "尚未生成任何转写 / 纪要文件。\n在「录音」页选择此 .wav 然后点「语音转文字」或「生成会议纪要 / 面试报告 / 分享总结」启动流水线。",
             "hist.body.none": "（尚未生成转写 / 纪要文件）",
             "hist.body.default": "会议内容",
             "hist.body.read_error": "（无法读取 {name}: {err}）",
@@ -4142,10 +4562,20 @@ def _cmd_ui_body(args, cfg):
             "rec.btn.transcribe": "Transcribe",
             "rec.btn.notes": "Generate meeting notes",
             "rec.btn.interview": "Generate interview report",
+            "rec.btn.sharing": "Generate sharing summary",
             "rec.btn.open_transcribe": "Open transcript",
             "rec.btn.open_notes": "Open meeting notes",
             "rec.btn.open_interview": "Open interview report",
+            "rec.btn.open_sharing": "Open sharing summary",
             "rec.btn.cancel": "Stop task",
+            "rec.btn.import": "Import audio file…",
+            "rec.import.dialog_title": "Select an audio file to import",
+            "rec.import.filter": "Audio files (*.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus *.aif *.aiff *.aifc *.wma *.amr *.caf *.webm);;All files (*)",
+            "rec.import.progress": "Importing & transcoding…",
+            "rec.import.done_fmt": "Imported: {name}",
+            "rec.import.failed_title": "Import failed",
+            "rec.import.failed_msg_fmt": "{err}",
+            "rec.import.no_ffmpeg_msg": "ffmpeg not found on PATH.\nOn macOS: brew install ffmpeg",
             "rec.no_file": "No recording selected",
             "rec.selected_prefix": "Selected: ",
             "rec.history_title": "Meeting history",
@@ -4164,15 +4594,17 @@ def _cmd_ui_body(args, cfg):
             "hist.btn.transcribe": "Transcribe",
             "hist.btn.notes": "Generate meeting notes",
             "hist.btn.interview": "Generate interview report",
+            "hist.btn.sharing": "Generate sharing summary",
             "hist.btn.open_transcribe": "Open transcript",
             "hist.btn.open_notes": "Open meeting notes",
             "hist.btn.open_interview": "Open interview report",
+            "hist.btn.open_sharing": "Open sharing summary",
             "hist.btn.cancel": "Stop task",
             "ctx.rename": "Rename…",
             "ctx.reveal": "Show in Finder / Explorer",
             "ctx.delete": "Delete this meeting…",
             "ctx.delete_title": "Confirm delete",
-            "ctx.delete_confirm": "Delete \"{name}\" and all related files (.wav / .raw.txt / .polish.txt / .meeting.md / .interview.md etc.)?\nThis cannot be undone.",
+            "ctx.delete_confirm": "Delete \"{name}\" and all related files (.wav / .raw.txt / .polish.txt / .meeting.md / .interview.md / .sharing.md etc.)?\nThis cannot be undone.",
             "ctx.delete_failed_title": "Delete failed",
             "ctx.delete_failed_msg": "{err}",
             "ctx.confirm_yes": "Confirm",
@@ -4186,7 +4618,8 @@ def _cmd_ui_body(args, cfg):
             "ctx.rename_dialog_prompt": "Pick a readable name for {ts} (leave blank to drop the custom name):",
             "pipe.log.done": "✓ Done → {path}",
             "pipe.log.failed": "✗ Failed: {err}",
-            "pipe.log.cancel_hint": "[info] UI detached; the background task still runs to completion.",
+            "pipe.log.cancelling": "[info] Cancelling background task…",
+            "pipe.log.cancelled": "[stopped] Background task cancelled",
             "pipe.warn.no_wav": "Record first or pick a .wav file.",
             "pipe.warn.prefix": "[warn] {msg}",
             "pipe.warn.file_missing_title": "File not found",
@@ -4202,16 +4635,18 @@ def _cmd_ui_body(args, cfg):
             "dur.second": "{s} sec",
             "hist.body.notes_meeting": "Meeting Notes",
             "hist.body.notes_interview": "Interview Report",
+            "hist.body.notes_sharing": "Sharing Summary",
             "hist.body.notes_both": "Meeting Notes + Interview Report",
             "hist.body.notes_meeting_md": "Meeting Notes (.meeting.md)",
             "hist.body.notes_interview_md": "Interview Report (.interview.md)",
+            "hist.body.notes_sharing_md": "Sharing Summary (.sharing.md)",
             "hist.body.notes_legacy_md": "Meeting Notes (.md, legacy)",
             "hist.body.polish_only": "Transcript (polished, .polish.txt)",
             "hist.body.raw_only": "Raw transcript (.raw.txt)",
             "hist.body.no_notes": "(no summary file)",
             "hist.body.no_polish": "(no .polish.txt file)",
             "hist.body.raw_pending": "Raw transcript (.raw.txt) — awaiting polish / notes",
-            "hist.body.pending_placeholder": "No transcript / notes file yet.\nGo to Recording, pick this .wav, then click Transcribe / Generate notes / Generate interview report.",
+            "hist.body.pending_placeholder": "No transcript / notes file yet.\nGo to Recording, pick this .wav, then click Transcribe / Generate notes / Generate interview report / Generate sharing summary.",
             "hist.body.none": "(no transcript / notes file yet)",
             "hist.body.default": "Content",
             "hist.body.read_error": "(failed to read {name}: {err})",
@@ -4318,12 +4753,22 @@ def _cmd_ui_body(args, cfg):
 
     class _PipelineWorker(QObject):
         """Runs transcribe → polish → notes on a background QThread, emitting
-        Qt signals (``progress`` / ``log`` / ``done`` / ``failed``) for the
-        UI to consume."""
+        Qt signals (``progress`` / ``log`` / ``done`` / ``failed`` /
+        ``cancelled``) for the UI to consume.
+
+        ``cancel()`` is the public hook the UI calls when the user clicks
+        "停止任务"; it sets the module-level ``_PIPELINE_CANCEL`` event AND
+        SIGKILLs every registered subprocess (currently `claude -p …`), so
+        the background task actually terminates instead of running to
+        completion. Stage boundaries inside `run()` call
+        ``_pipeline_check_cancelled()`` to translate the event into a clean
+        ``_PipelineCancelled`` exception, which we then surface as the
+        ``cancelled`` signal."""
         progress = pyqtSignal(int)
         log = pyqtSignal(str)
         done = pyqtSignal(str)   # result md path
         failed = pyqtSignal(str)  # error message
+        cancelled = pyqtSignal()  # user-initiated stop
 
         def __init__(self, audio_path: Path, mode: str, cfg_: dict,
                      transcribe_only: bool = False, parent=None):
@@ -4332,12 +4777,23 @@ def _cmd_ui_body(args, cfg):
             self.mode = mode
             self.cfg = cfg_
             self.transcribe_only = transcribe_only
+            # Always start uncancelled — clear leftover state from a
+            # previous (cancelled / completed) run.
+            _PIPELINE_CANCEL.clear()
+
+        def cancel(self):
+            """Request termination from any thread. Safe to call multiple
+            times. Does not block — the actual termination is observed
+            inside ``run()`` and reported via the ``cancelled`` signal."""
+            _PIPELINE_CANCEL.set()
+            _pipeline_kill_popens()
 
         def run(self):
             tp = self.cfg.get("transcribe_provider", "funasr")
             pp = self.cfg.get("polish_provider", "claude")
             np_ = self.cfg.get("meeting_notes_provider", "claude")
             try:
+                _pipeline_check_cancelled()
                 audio_path = self.audio_path
                 raw_txt = audio_path.with_name(audio_path.stem + ".raw.txt")
                 polish_path = audio_path.with_name(audio_path.stem + ".polish.txt")
@@ -4358,16 +4814,19 @@ def _cmd_ui_body(args, cfg):
                     if need_transcribe and need_polish:
                         raw, polished = transcribe_and_polish(
                             audio_path, tp, pp, self.cfg, self.mode, on_progress=_on_pct)
+                        _pipeline_check_cancelled()
                         raw_txt.write_text(raw, encoding="utf-8")
                         polish_path.write_text(polished, encoding="utf-8")
                     elif need_transcribe:
                         self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
                         raw = transcribe(audio_path, tp, self.cfg, on_progress=_on_pct)
+                        _pipeline_check_cancelled()
                         raw_txt.write_text(raw, encoding="utf-8")
                     elif need_polish:
                         self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
                         raw = raw_txt.read_text(encoding="utf-8")
                         polished = polish_transcript(raw, pp, self.cfg, self.mode)
+                        _pipeline_check_cancelled()
                         polish_path.write_text(polished, encoding="utf-8")
                     else:
                         self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
@@ -4379,29 +4838,37 @@ def _cmd_ui_body(args, cfg):
                 if need_transcribe and need_polish:
                     raw, polished = transcribe_and_polish(
                         audio_path, tp, pp, self.cfg, self.mode, on_progress=_on_pct)
+                    _pipeline_check_cancelled()
                     raw_txt.write_text(raw, encoding="utf-8")
                     polish_path.write_text(polished, encoding="utf-8")
                 elif need_transcribe:
                     self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
                     raw = transcribe(audio_path, tp, self.cfg, on_progress=_on_pct)
+                    _pipeline_check_cancelled()
                     raw_txt.write_text(raw, encoding="utf-8")
                     polished = polish_path.read_text(encoding="utf-8")
                 elif need_polish:
                     self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
                     raw = raw_txt.read_text(encoding="utf-8")
                     polished = polish_transcript(raw, pp, self.cfg, self.mode)
+                    _pipeline_check_cancelled()
                     polish_path.write_text(polished, encoding="utf-8")
                 else:
                     self.log.emit(f"[转写] 检测到 {raw_txt.name}，跳过转写")
                     self.log.emit(f"[校对] 检测到 {polish_path.name}，跳过校对")
                     polished = polish_path.read_text(encoding="utf-8")
 
+                _pipeline_check_cancelled()
                 self.progress.emit(85)
                 self.log.emit("[纪要] 生成中...")
                 notes = generate_notes(polished, np_, self.cfg, self.mode)
+                _pipeline_check_cancelled()
                 note_path = save_minutes(notes, audio_path, self.mode)
                 self.progress.emit(100)
                 self.done.emit(str(note_path))
+            except _PipelineCancelled:
+                _log("PIPELINE", "cancelled by user")
+                self.cancelled.emit()
             except SystemExit as e:
                 # Downstream library code (some provider error paths) may
                 # call sys.exit(); without this guard the QThread dies
@@ -4409,8 +4876,16 @@ def _cmd_ui_body(args, cfg):
                 # disabled buttons frozen forever. Mirror cmd_record's
                 # behaviour and route the exit code into the failure
                 # signal so the UI resets cleanly.
-                _log("ERR", f"Qt pipeline SystemExit({e.code})")
-                self.failed.emit(f"SystemExit: {e.code}")
+                if _PIPELINE_CANCEL.is_set():
+                    # A SystemExit raised by a provider that was killed
+                    # mid-call (e.g. Claude CLI receiving SIGKILL → non-zero
+                    # returncode → sys.exit) is really a cancellation, not
+                    # a failure. Report it as such.
+                    _log("PIPELINE", f"cancelled mid-call (SystemExit {e.code})")
+                    self.cancelled.emit()
+                else:
+                    _log("ERR", f"Qt pipeline SystemExit({e.code})")
+                    self.failed.emit(f"SystemExit: {e.code}")
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
@@ -4510,6 +4985,14 @@ def _cmd_ui_body(args, cfg):
             self._last_recorded: "Path | None" = None
             self._result_path: "Path | None" = None
             self._vol_device: "str | None" = None
+            # True iff the slider-driven device-level mute is currently engaged
+            # (i.e. user parked the slider at 0%). Used to log only on boundary
+            # crossings, not on every dragged value-change event.
+            self._slider_mute_active: bool = False
+            # One-shot guard for the startup-mute default: set to True after the
+            # first successful application so the 300 ms retry (and any future
+            # accidental re-entry) becomes a no-op once the user is in control.
+            self._startup_mute_applied: bool = False
             self._pipeline_thread: "QThread | None" = None
             self._pipeline_worker: "_PipelineWorker | None" = None
             # i18n: each callback re-applies its widget's text on lang switch.
@@ -4519,15 +5002,17 @@ def _cmd_ui_body(args, cfg):
             self._wire()
             self._refresh_history()
             self._refresh_action_buttons()
-            # Try to align the slider + label with the real device volume
-            # immediately so the first paint is already in sync. If the audio
-            # monitor hasn't resolved the device yet, this is a silent no-op
-            # and the 300 ms retry picks it up.
+            # Startup default: mute the active output device and park the
+            # slider at 0%. Forces the user to deliberately drag the slider
+            # up before any system audio plays through them — a conservative
+            # default for a recording app. One-shot, gated by
+            # `_startup_mute_applied`; the 300 ms retry covers the case
+            # where the audio monitor hasn't resolved `_vol_device` yet.
             try:
-                self._sync_vol_slider()
+                self._apply_startup_mute()
             except Exception as e:
-                _log("ERR", f"Qt initial vol sync: {type(e).__name__}: {e}")
-            QTimer.singleShot(300, self._sync_vol_slider)
+                _log("ERR", f"Qt startup mute: {type(e).__name__}: {e}")
+            QTimer.singleShot(300, self._apply_startup_mute)
 
         def _i18n(self, widget, key, attr="setText"):
             """Track a translatable label so `apply_language()` can re-set it."""
@@ -4585,13 +5070,37 @@ def _cmd_ui_body(args, cfg):
             self.rec_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self._apply_rec_btn_style("idle")
 
+            self.timer_label = TitleLabel("00:00:00", self)
+            self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            # Mic + timer block — packed into a single fixed-height
+            # container so they're always stacked correctly. Putting the
+            # timer directly into `lv` was fragile: when 停止任务 /
+            # progress bar / log view become visible, `lv`'s total
+            # content overflows the column height; Qt then proportionally
+            # violates every child's min/fixed height, including the mic
+            # button's `setFixedSize(132, 132)`, and the timer ends up
+            # painted on top of the mic disc. Wrapping them here means
+            # any squish from `lv` is applied to the BLOCK as a whole,
+            # while the inner QVBoxLayout preserves the mic-above-timer
+            # ordering with explicit spacing. Heights: mic 132 + 8
+            # spacing + timer ~36 → 176; rounded up to 180 for breathing
+            # room around the TitleLabel.
+            mic_block = QWidget(self)
+            mic_block.setFixedHeight(180)
+            mic_block_v = QVBoxLayout(mic_block)
+            mic_block_v.setContentsMargins(0, 0, 0, 0)
+            mic_block_v.setSpacing(8)
             mic_row = QHBoxLayout()
+            mic_row.setContentsMargins(0, 0, 0, 0)
             mic_row.addStretch(1)
             mic_row.addWidget(self.rec_btn)
             mic_row.addStretch(1)
-
-            self.timer_label = TitleLabel("00:00:00", self)
-            self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            mic_block_v.addLayout(mic_row)
+            mic_block_v.addWidget(
+                self.timer_label,
+                alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+            )
 
             # No mic-selector row — the app always captures system audio
             # (BlackHole) + the resolver-chosen mic (external > built-in).
@@ -4651,13 +5160,36 @@ def _cmd_ui_body(args, cfg):
             self.transcribe_btn = PushButton("", self)
             self.notes_btn = PushButton("", self)
             self.interview_btn = PushButton("", self)
+            self.sharing_btn = PushButton("", self)
 
-            actions = QHBoxLayout()
-            actions.addStretch(1)
-            actions.addWidget(self.transcribe_btn)
-            actions.addWidget(self.notes_btn)
-            actions.addWidget(self.interview_btn)
-            actions.addStretch(1)
+            # Import button: lets the user bring in an external audio file
+            # (iPhone .m4a, .mp3 download, Zoom .m4a, etc.). Opens a file
+            # dialog, transcodes via ffmpeg to 16k mono PCM WAV in
+            # RECORDINGS_DIR, then selects the imported recording so the
+            # user can immediately run transcribe / notes on it.
+            self.import_btn = PushButton("", self)
+            self._i18n(self.import_btn, "rec.btn.import")
+            # Match the visual treatment of the four "generate" buttons.
+            # `_refresh_action_buttons` only restyles the transcribe / notes
+            # / interview / sharing buttons, so the import button gets a
+            # one-shot light-gray fill here at construction time and keeps
+            # it for the widget's lifetime.
+            _apply_open_btn_style(self.import_btn, is_open=False)
+
+            # Row 1: import + transcribe (entry-point actions)
+            actions_row1 = QHBoxLayout()
+            actions_row1.addStretch(1)
+            actions_row1.addWidget(self.import_btn)
+            actions_row1.addWidget(self.transcribe_btn)
+            actions_row1.addStretch(1)
+
+            # Row 2: per-mode notes generation (meeting / interview / sharing)
+            actions_row2 = QHBoxLayout()
+            actions_row2.addStretch(1)
+            actions_row2.addWidget(self.notes_btn)
+            actions_row2.addWidget(self.interview_btn)
+            actions_row2.addWidget(self.sharing_btn)
+            actions_row2.addStretch(1)
 
             # Chosen-recording indicator. The standalone "选择已有音频文件"
             # button was removed — meetings are picked via the right-side
@@ -4677,19 +5209,34 @@ def _cmd_ui_body(args, cfg):
             self.log_view = TextEdit(self)
             self.log_view.setReadOnly(True)
             self.log_view.setMaximumHeight(160)
+            # Let log_view shrink all the way to 0 when vertical space
+            # is tight (e.g. on smaller windows where mic_block + the
+            # action rows + progress + cancel already fill the column).
+            # Without this, log_view's default minimumHeight forces Qt
+            # to squish the mic_block above, and the timer ends up
+            # overlapping the mic disc.
+            self.log_view.setMinimumHeight(0)
             self.log_view.setVisible(False)
 
             lv.addWidget(self.title_label)
             lv.addWidget(self.subtitle_label)
-            lv.addSpacing(12)
-            lv.addLayout(mic_row)
-            lv.addWidget(self.timer_label)
-            lv.addSpacing(8)
+            # No leading spacer before mic_block — under squish pressure
+            # (cancel_btn + progress + log_view all visible) every pixel
+            # of explicit addSpacing competes with the mic_block's
+            # fixed 180 px. Letting the mic ride right up under the
+            # subtitle moves the circle visibly higher in the card.
+            lv.addWidget(mic_block)
+            # Bigger gap below mic_block so the volume hint sits clearly
+            # apart from the timer (which lives at the bottom of
+            # mic_block). Without this the hint visually crowds the
+            # "00:00:00" digits as soon as the log_view expands.
+            lv.addSpacing(20)
             lv.addWidget(self._vol_hint)
             lv.addSpacing(6)
             lv.addLayout(vol_row)
             lv.addSpacing(8)
-            lv.addLayout(actions)
+            lv.addLayout(actions_row1)
+            lv.addLayout(actions_row2)
             lv.addLayout(choose_row)
             lv.addWidget(self.progress_bar)
             lv.addWidget(self.cancel_btn)
@@ -4727,9 +5274,11 @@ def _cmd_ui_body(args, cfg):
         # ── Wiring
         def _wire(self):
             self.rec_btn.clicked.connect(self._on_record_clicked)
+            self.import_btn.clicked.connect(self._on_import_clicked)
             self.transcribe_btn.clicked.connect(self._on_transcribe_clicked)
             self.notes_btn.clicked.connect(self._on_meeting_clicked)
             self.interview_btn.clicked.connect(self._on_interview_clicked)
+            self.sharing_btn.clicked.connect(self._on_sharing_clicked)
             self.cancel_btn.clicked.connect(self._on_cancel_pipeline)
             self.vol_slider.valueChanged.connect(self._on_vol_changed)
 
@@ -4858,6 +5407,35 @@ def _cmd_ui_body(args, cfg):
                     set_device_volume(self._vol_device, val / 100.0)
                 except Exception as e:
                     _log("ERR", f"Qt set_volume: {type(e).__name__}: {e}")
+                # Mirror macOS F11/F12 behaviour: vmvc=0.0 on Apple built-in
+                # audio is "minimum", not silence. Toggle the device-level mute
+                # in lockstep with the slider so 0% is truly silent and any
+                # non-zero value clears the mute. Bypasses _active_mutes on
+                # purpose — this is an explicit user action, not part of the
+                # recording-lifecycle reconcile state machine. We log only on
+                # boundary crossings (0 ↔ non-0) so dragging through the range
+                # doesn't flood the log.
+                desired = (val == 0)
+                if desired != self._slider_mute_active:
+                    try:
+                        # Record the user's intent BEFORE writing mute so any
+                        # concurrent reconcile (AudioDeviceMonitor recording
+                        # branch wakes on hotplug / safety timeout) already
+                        # sees the slider intent and won't undo our mute.
+                        with _mutes_lock:
+                            if desired:
+                                _slider_intent_muted.add(self._vol_device)
+                            else:
+                                _slider_intent_muted.discard(self._vol_device)
+                        ok = _ca_set_device_mute(self._vol_device, desired)
+                        _log(
+                            "MUTE",
+                            f"slider {'muted' if desired else 'unmuted'} "
+                            f"device={self._vol_device!r} val={val}% ok={ok}",
+                        )
+                        self._slider_mute_active = desired
+                    except Exception as e:
+                        _log("ERR", f"Qt slider mute: {type(e).__name__}: {e}")
 
         def _sync_vol_slider(self):
             if not self._vol_device:
@@ -4880,6 +5458,46 @@ def _cmd_ui_body(args, cfg):
             finally:
                 self.vol_slider.blockSignals(False)
             self.vol_pct.setText(f"{pct}%")
+
+        def _apply_startup_mute(self):
+            """Force the slider to 0% and engage device-level mute on the
+            active output device. One-shot, gated by `_startup_mute_applied`
+            so the 300 ms retry / any future re-entry is a no-op once the
+            user has taken control.
+
+            Writes the same property pair the regular slider-→-0 path writes
+            (vmvc=0 + kAudioDevicePropertyMute=True) and registers the
+            device in `_slider_intent_muted` so the recording-lifecycle
+            reconcile honours the mute from the very first tick.
+            """
+            if self._startup_mute_applied:
+                return
+            if not self._vol_device:
+                try:
+                    self._vol_device = _get_current_output_device()
+                except Exception:
+                    return
+            if not self._vol_device:
+                return
+            try:
+                set_device_volume(self._vol_device, 0.0)
+            except Exception as e:
+                _log("ERR", f"Qt startup mute (vol): {type(e).__name__}: {e}")
+            try:
+                with _mutes_lock:
+                    _slider_intent_muted.add(self._vol_device)
+                ok = _ca_set_device_mute(self._vol_device, True)
+                _log("MUTE", f"startup mute device={self._vol_device!r} ok={ok}")
+            except Exception as e:
+                _log("ERR", f"Qt startup mute (mute): {type(e).__name__}: {e}")
+            self._slider_mute_active = True
+            self.vol_slider.blockSignals(True)
+            try:
+                self.vol_slider.setValue(0)
+            finally:
+                self.vol_slider.blockSignals(False)
+            self.vol_pct.setText("0%")
+            self._startup_mute_applied = True
 
         # ── Recording lifecycle
         def _on_record_clicked(self):
@@ -4934,6 +5552,24 @@ def _cmd_ui_body(args, cfg):
                 _restore_all_recording_mutes()
             except Exception as e:
                 _log("ERR", f"Qt stop restore_mutes: {type(e).__name__}: {e}")
+            # If the user parked the slider at 0% during recording we will
+            # have flipped the device-level mute on; clear it on stop so
+            # F11/F12 / menu-bar slider work normally once recording ends.
+            # Also drop the module-level slider-intent record so the next
+            # recording's reconcile starts from a clean slate.
+            if self._vol_device:
+                try:
+                    with _mutes_lock:
+                        _slider_intent_muted.discard(self._vol_device)
+                    ok = _ca_set_device_mute(self._vol_device, False)
+                    _log(
+                        "MUTE",
+                        f"slider unmute at stop device={self._vol_device!r} "
+                        f"was_muted={self._slider_mute_active} ok={ok}",
+                    )
+                except Exception as e:
+                    _log("ERR", f"Qt stop slider unmute: {type(e).__name__}: {e}")
+                self._slider_mute_active = False
             try:
                 _restore_output_if_needed(
                     resolve_audio_devices(query_fresh=True),
@@ -5006,11 +5642,80 @@ def _cmd_ui_body(args, cfg):
         # AudioDeviceMonitor → vol_device rebind on mid-recording hotplug.
         # Runs on the monitor thread; schedule UI work via QTimer.singleShot.
         def _on_plan_change(self, plan: "AudioPlan"):
+            """Called from the AudioDeviceMonitor thread when the resolver's
+            active output device changes (idle OR mid-recording hotplug).
+            Marshals to the GUI thread for the actual slider transfer.
+            """
             new_dev = plan.restore_output_name
             if not new_dev or new_dev == self._vol_device:
                 return
-            self._vol_device = new_dev
-            QTimer.singleShot(0, self._sync_vol_slider)
+            QTimer.singleShot(
+                0, lambda nd=new_dev: self._transfer_slider_to_device(nd))
+
+        def _transfer_slider_to_device(self, new_device: str):
+            """Re-target the slider's volume + mute intent at `new_device`.
+
+            Runs on the GUI thread. Splits cleanup of the old device based
+            on lifecycle:
+
+              • Idle: unmute the old device so the user isn't trapped in
+                silence when they switch back (no recording-state
+                reconcile to fix it for them).
+
+              • Recording: leave the old device muted (reconcile wants
+                inactive Multi-Output subs muted anyway), but register it
+                in `_active_mutes` with original=False so
+                `_restore_all_recording_mutes` brings it back at stop.
+                Reconcile's `current == desired` skip would otherwise leave
+                it untracked and permanently muted post-stop.
+
+            On the new device: write the current slider value's volume +
+            mute state, and add to `_slider_intent_muted` if at 0% so any
+            subsequent reconcile honours the user's intent.
+            """
+            if not new_device or new_device == self._vol_device:
+                return
+            old_device = self._vol_device
+            val = self.vol_slider.value()
+            desired_mute = (val == 0)
+            is_recording = _recording_active.is_set()
+
+            with _mutes_lock:
+                if old_device:
+                    _slider_intent_muted.discard(old_device)
+                    if is_recording and old_device not in _active_mutes:
+                        _active_mutes[old_device] = False
+                        _persist_mutes()
+                self._vol_device = new_device
+                if desired_mute:
+                    _slider_intent_muted.add(new_device)
+                else:
+                    _slider_intent_muted.discard(new_device)
+            self._slider_mute_active = desired_mute
+
+            try:
+                set_device_volume(new_device, val / 100.0)
+            except Exception as e:
+                _log("ERR", f"transfer set_vol new: {type(e).__name__}: {e}")
+            try:
+                ok = _ca_set_device_mute(new_device, desired_mute)
+                _log(
+                    "MUTE",
+                    f"slider transfer from={old_device!r} to={new_device!r} "
+                    f"val={val}% mute={desired_mute} ok={ok} "
+                    f"recording={is_recording}",
+                )
+            except Exception as e:
+                _log("ERR", f"transfer mute new: {type(e).__name__}: {e}")
+
+            if old_device and not is_recording:
+                try:
+                    ok = _ca_set_device_mute(old_device, False)
+                    _log("MUTE",
+                         f"transfer: idle unmute old={old_device!r} ok={ok}")
+                except Exception as e:
+                    _log("ERR",
+                         f"transfer idle unmute: {type(e).__name__}: {e}")
 
         # ── Pipeline
         def _start_pipeline(self, transcribe_only: bool = False,
@@ -5040,8 +5745,10 @@ def _cmd_ui_body(args, cfg):
             worker.log.connect(self._ui_log)
             worker.done.connect(self._on_pipeline_done)
             worker.failed.connect(self._on_pipeline_failed)
+            worker.cancelled.connect(self._on_pipeline_cancelled)
             worker.done.connect(thread.quit)
             worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
             thread.finished.connect(worker.deleteLater)
             thread.finished.connect(thread.deleteLater)
             self._pipeline_worker = worker
@@ -5059,21 +5766,38 @@ def _cmd_ui_body(args, cfg):
             self._reset_after_pipeline()
             self._ui_log(_t("pipe.log.failed", err=msg))
 
+        def _on_pipeline_cancelled(self):
+            self._reset_after_pipeline()
+            self._ui_log(_t("pipe.log.cancelled"))
+
         def _reset_after_pipeline(self):
             self.progress_bar.setVisible(False)
             self.cancel_btn.setVisible(False)
+            # Re-arm the cancel button in case `_on_cancel_pipeline` had
+            # disabled it during the wrap-up window.
+            self.cancel_btn.setEnabled(True)
             for b in (self.rec_btn, self.transcribe_btn, self.notes_btn,
-                      self.interview_btn):
+                      self.interview_btn, self.sharing_btn):
                 b.setEnabled(True)
             self.state.set_status("idle")
 
         def _on_cancel_pipeline(self):
-            # transcribe/polish/generate don't have built-in cancel hooks;
-            # we simply detach the UI. The thread keeps running until natural
-            # completion (and any partial writes are kept on disk so a re-run
-            # resumes from the checkpoint).
-            self._ui_log(_t("pipe.log.cancel_hint"))
-            self._reset_after_pipeline()
+            # Truly terminate the background pipeline: set the cancel event
+            # and SIGKILL any registered subprocess (claude -p …) so the
+            # worker thread escapes its blocking call and emits the
+            # `cancelled` signal. We keep the cancel button visible but
+            # disabled during the wrap-up window so the user sees that
+            # termination is in progress; full UI reset happens in
+            # `_on_pipeline_cancelled` when the worker confirms.
+            worker = self._pipeline_worker
+            if worker is None:
+                # Worker may have already finished between the click and
+                # this handler — fall back to a plain UI reset.
+                self._reset_after_pipeline()
+                return
+            self._ui_log(_t("pipe.log.cancelling"))
+            self.cancel_btn.setEnabled(False)
+            worker.cancel()
 
         def _on_history_pick(self, item: QListWidgetItem):
             data = item.data(Qt.ItemDataRole.UserRole)
@@ -5082,6 +5806,69 @@ def _cmd_ui_body(args, cfg):
             self._last_recorded = data["wav_path"]
             self.chosen_label.setText(f"{_t('rec.selected_prefix')}" + data['wav_path'].name)
             self._result_path = data.get("md_path")
+            self._refresh_action_buttons()
+
+        def _on_import_clicked(self):
+            """Pick an external audio file (iPhone .m4a, .mp3, etc.) and
+            transcode it into RECORDINGS_DIR. On success the imported file
+            becomes the currently-selected recording so the user can run
+            transcribe / notes / interview on it immediately.
+
+            ffmpeg is invoked synchronously — typical iPhone Voice Memos
+            transcode in <2 s on Apple Silicon, so blocking the UI thread
+            with a busy cursor is acceptable. A pipeline already running
+            disables the button via `_refresh_action_buttons` semantics,
+            but we double-check here to be safe.
+            """
+            if self._pipeline_thread is not None:
+                self._on_warning(_t("ctx.delete_blocked_msg"))
+                return
+            path_str, _filter = QFileDialog.getOpenFileName(
+                self,
+                _t("rec.import.dialog_title"),
+                "",
+                _t("rec.import.filter"),
+            )
+            if not path_str:
+                return
+            src = Path(path_str)
+            # ffmpeg sanity check up-front so we show the install hint
+            # before the user waits on a long transcode that's going to
+            # fail anyway.
+            if src.suffix.lower() != ".wav" and _ffmpeg_path() is None:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle(_t("rec.import.failed_title"))
+                box.setText(_t("rec.import.no_ffmpeg_msg"))
+                box.addButton(_t("ctx.confirm_yes"),
+                              QMessageBox.ButtonRole.AcceptRole)
+                box.exec()
+                return
+
+            self.chosen_label.setText(_t("rec.import.progress"))
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                dst = _import_audio_to_recordings(src)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                _log("ERR", f"import: {type(e).__name__}: {e}")
+                self.chosen_label.setText(_t("rec.no_file"))
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Critical)
+                box.setWindowTitle(_t("rec.import.failed_title"))
+                box.setText(_t("rec.import.failed_msg_fmt").format(
+                    err=f"{type(e).__name__}: {e}"))
+                box.addButton(_t("ctx.confirm_yes"),
+                              QMessageBox.ButtonRole.AcceptRole)
+                box.exec()
+                return
+            QApplication.restoreOverrideCursor()
+
+            self._last_recorded = dst
+            self._result_path = None
+            self.chosen_label.setText(
+                _t("rec.import.done_fmt").format(name=dst.name))
+            self._refresh_history()
             self._refresh_action_buttons()
 
         # ── Action buttons — toggle between "generate" and "open" based on
@@ -5095,13 +5882,15 @@ def _cmd_ui_body(args, cfg):
                 self.transcribe_btn.setText(_t("rec.btn.transcribe"))
                 self.notes_btn.setText(_t("rec.btn.notes"))
                 self.interview_btn.setText(_t("rec.btn.interview"))
+                self.sharing_btn.setText(_t("rec.btn.sharing"))
                 for b in (self.transcribe_btn, self.notes_btn,
-                          self.interview_btn):
+                          self.interview_btn, self.sharing_btn):
                     _apply_open_btn_style(b, is_open=False)
                 return
             polish = audio.with_name(audio.stem + ".polish.txt")
             meeting_md = audio.with_name(audio.stem + ".meeting.md")
             interview_md = audio.with_name(audio.stem + ".interview.md")
+            sharing_md = audio.with_name(audio.stem + ".sharing.md")
             # Legacy single-`.md` artefact (pre-`.meeting.md`/`.interview.md`
             # split). When it exists and the new-format artefacts don't, the
             # notes button still flips to "open" mode so the user can read
@@ -5114,6 +5903,8 @@ def _cmd_ui_body(args, cfg):
                  "rec.btn.notes", "rec.btn.open_notes"),
                 (self.interview_btn, interview_md.exists(),
                  "rec.btn.interview", "rec.btn.open_interview"),
+                (self.sharing_btn, sharing_md.exists(),
+                 "rec.btn.sharing", "rec.btn.open_sharing"),
             ):
                 btn.setText(_t(open_key if exists else gen_key))
                 _apply_open_btn_style(btn, is_open=exists)
@@ -5153,6 +5944,17 @@ def _cmd_ui_body(args, cfg):
                 _open_path(interview_md)
             else:
                 self._start_pipeline(mode="interview")
+
+        def _on_sharing_clicked(self):
+            audio = self._last_recorded
+            if not audio:
+                self._on_warning(_t("pipe.warn.no_wav"))
+                return
+            sharing_md = audio.with_name(audio.stem + ".sharing.md")
+            if sharing_md.exists():
+                _open_path(sharing_md)
+            else:
+                self._start_pipeline(mode="sharing")
 
         # ── Log helper — prefix every UI log line with a wall-clock timestamp
         # so the log_view and the file log share the same time reference.
@@ -5315,7 +6117,9 @@ def _cmd_ui_body(args, cfg):
             self.h_transcribe_btn = PushButton("", self)
             self.h_notes_btn = PushButton("", self)
             self.h_interview_btn = PushButton("", self)
-            for b in (self.h_transcribe_btn, self.h_notes_btn, self.h_interview_btn):
+            self.h_sharing_btn = PushButton("", self)
+            for b in (self.h_transcribe_btn, self.h_notes_btn,
+                      self.h_interview_btn, self.h_sharing_btn):
                 b.setEnabled(False)  # no meeting selected at startup
             self._refresh_h_action_buttons()
             actions_row = QHBoxLayout()
@@ -5323,6 +6127,7 @@ def _cmd_ui_body(args, cfg):
             actions_row.addWidget(self.h_transcribe_btn)
             actions_row.addWidget(self.h_notes_btn)
             actions_row.addWidget(self.h_interview_btn)
+            actions_row.addWidget(self.h_sharing_btn)
             actions_row.addStretch(1)
             dv.addLayout(actions_row)
 
@@ -5420,6 +6225,7 @@ def _cmd_ui_body(args, cfg):
             self.h_transcribe_btn.clicked.connect(self._on_h_transcribe_clicked)
             self.h_notes_btn.clicked.connect(self._on_h_meeting_clicked)
             self.h_interview_btn.clicked.connect(self._on_h_interview_clicked)
+            self.h_sharing_btn.clicked.connect(self._on_h_sharing_clicked)
             self.h_cancel_btn.clicked.connect(self._on_cancel_pipeline)
 
         # ── Action buttons — mirror RecordingInterface: each toggles
@@ -5433,19 +6239,22 @@ def _cmd_ui_body(args, cfg):
                 self.h_transcribe_btn.setText(_t("hist.btn.transcribe"))
                 self.h_notes_btn.setText(_t("hist.btn.notes"))
                 self.h_interview_btn.setText(_t("hist.btn.interview"))
+                self.h_sharing_btn.setText(_t("hist.btn.sharing"))
                 for b in (self.h_transcribe_btn, self.h_notes_btn,
-                          self.h_interview_btn):
+                          self.h_interview_btn, self.h_sharing_btn):
                     _apply_open_btn_style(b, is_open=False)
                 return
             polish_p = m.get("polish_path")
             meeting_p = m.get("meeting_md_path")
             interview_p = m.get("interview_md_path")
+            sharing_p = m.get("sharing_md_path")
             # Legacy single-`.md` artefact (`md_path` is set + `md_mode` is
             # None means a pre-split `.md` file). Counts as "meeting notes
             # exist" for the open-toggle so the user can read the existing
             # summary without re-running the pipeline.
             legacy_p = (
                 m.get("md_path") if (meeting_p is None and interview_p is None
+                                     and sharing_p is None
                                      and m.get("has_md")) else None
             )
             for btn, exists, gen_key, open_key in (
@@ -5455,6 +6264,8 @@ def _cmd_ui_body(args, cfg):
                  "hist.btn.notes", "hist.btn.open_notes"),
                 (self.h_interview_btn, interview_p is not None,
                  "hist.btn.interview", "hist.btn.open_interview"),
+                (self.h_sharing_btn, sharing_p is not None,
+                 "hist.btn.sharing", "hist.btn.open_sharing"),
             ):
                 btn.setText(_t(open_key if exists else gen_key))
                 _apply_open_btn_style(btn, is_open=exists)
@@ -5498,6 +6309,16 @@ def _cmd_ui_body(args, cfg):
                 _open_path(interview_p)
             else:
                 self._start_pipeline(mode="interview")
+
+        def _on_h_sharing_clicked(self):
+            m = self._current
+            if not m:
+                return
+            sharing_p = m.get("sharing_md_path")
+            if sharing_p:
+                _open_path(sharing_p)
+            else:
+                self._start_pipeline(mode="sharing")
 
         def refresh(self):
             self.list_w.clear()
@@ -5568,7 +6389,7 @@ def _cmd_ui_body(args, cfg):
             # actionable (unless one is already running).
             running = self._pipeline_thread is not None
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn):
+                      self.h_interview_btn, self.h_sharing_btn):
                 b.setEnabled(not running)
             # Refresh "generate / open" label + style for the new selection.
             self._refresh_h_action_buttons()
@@ -5576,9 +6397,16 @@ def _cmd_ui_body(args, cfg):
         def _render_body_for_mode(self, m: dict, mode: str):
             meeting_p = m.get("meeting_md_path")
             interview_p = m.get("interview_md_path")
+            sharing_p = m.get("sharing_md_path")
             polish_p = m.get("polish_path")
             raw_p = m.get("raw_path")
-            legacy_p = m.get("md_path") if (m.get("md_mode") is None and m.get("has_md")) else None
+            # Legacy pre-split `.md` only fires when none of the new-format
+            # artefacts exist; without this guard, a sharing-only recording
+            # would render the legacy fallback alongside its real sharing.
+            legacy_p = (
+                m.get("md_path") if (m.get("md_mode") is None and m.get("has_md"))
+                else None
+            )
 
             def _read(p):
                 try:
@@ -5592,15 +6420,29 @@ def _cmd_ui_body(args, cfg):
                     parts.append(f"# 📝 {_t('hist.body.notes_meeting')}\n\n{_read(meeting_p)}")
                 if interview_p:
                     parts.append(f"# 🎤 {_t('hist.body.notes_interview')}\n\n{_read(interview_p)}")
-                if legacy_p and not (meeting_p or interview_p):
+                if sharing_p:
+                    parts.append(f"# 🎓 {_t('hist.body.notes_sharing')}\n\n{_read(sharing_p)}")
+                if legacy_p and not (meeting_p or interview_p or sharing_p):
                     parts.append(_read(legacy_p))
                 if parts:
                     self.body_browser.setMarkdown("\n\n---\n\n".join(parts))
-                    self.body_title.setText(
-                        _t("hist.body.notes_meeting") if not interview_p else
-                        _t("hist.body.notes_interview") if not meeting_p else
-                        _t("hist.body.notes_both")
-                    )
+                    # Title: name the single artifact if there's only one, else
+                    # "Multiple summaries". (Don't try to enumerate every
+                    # combination — the body itself shows the contents.)
+                    present = [p for p in (meeting_p, interview_p, sharing_p) if p]
+                    if len(present) == 1:
+                        if meeting_p:
+                            self.body_title.setText(_t("hist.body.notes_meeting"))
+                        elif interview_p:
+                            self.body_title.setText(_t("hist.body.notes_interview"))
+                        else:
+                            self.body_title.setText(_t("hist.body.notes_sharing"))
+                    else:
+                        # Pre-existing "notes_both" label still reads sensibly
+                        # for any multi-artifact combination ("Meeting Notes +
+                        # Interview Report"-style listing); the body content
+                        # is unambiguous regardless.
+                        self.body_title.setText(_t("hist.body.notes_both"))
                 else:
                     self.body_browser.setPlainText(_t("hist.body.no_notes"))
                     self.body_title.setText(_t("hist.body.default"))
@@ -5627,12 +6469,26 @@ def _cmd_ui_body(args, cfg):
                     self.body_title.setText(_t("hist.body.default"))
                 return
 
-            # mode == "all" (default): show the richest available artifact
-            if meeting_p and interview_p:
-                self.body_browser.setMarkdown(
-                    f"# 📝 {_t('hist.body.notes_meeting')}\n\n{_read(meeting_p)}\n\n---\n\n"
+            # mode == "all" (default): show the richest available artifact.
+            # If multiple summary artifacts exist on the same recording,
+            # concatenate them so the user doesn't have to flip tabs to see
+            # "I have both a meeting summary AND a sharing summary on this
+            # recording".
+            summary_parts: list[str] = []
+            if meeting_p:
+                summary_parts.append(
+                    f"# 📝 {_t('hist.body.notes_meeting')}\n\n{_read(meeting_p)}"
+                )
+            if interview_p:
+                summary_parts.append(
                     f"# 🎤 {_t('hist.body.notes_interview')}\n\n{_read(interview_p)}"
                 )
+            if sharing_p:
+                summary_parts.append(
+                    f"# 🎓 {_t('hist.body.notes_sharing')}\n\n{_read(sharing_p)}"
+                )
+            if len(summary_parts) >= 2:
+                self.body_browser.setMarkdown("\n\n---\n\n".join(summary_parts))
                 self.body_title.setText(_t("hist.body.notes_both"))
             elif meeting_p:
                 self.body_browser.setMarkdown(_read(meeting_p))
@@ -5640,6 +6496,9 @@ def _cmd_ui_body(args, cfg):
             elif interview_p:
                 self.body_browser.setMarkdown(_read(interview_p))
                 self.body_title.setText(_t("hist.body.notes_interview_md"))
+            elif sharing_p:
+                self.body_browser.setMarkdown(_read(sharing_p))
+                self.body_title.setText(_t("hist.body.notes_sharing_md"))
             elif legacy_p:
                 self.body_browser.setMarkdown(_read(legacy_p))
                 self.body_title.setText(_t("hist.body.notes_legacy_md"))
@@ -5741,7 +6600,7 @@ def _cmd_ui_body(args, cfg):
                     self.detail_title.setText(_t("hist.default_title"))
                     self.body_browser.setPlainText("")
                     for b in (self.h_transcribe_btn, self.h_notes_btn,
-                              self.h_interview_btn):
+                              self.h_interview_btn, self.h_sharing_btn):
                         b.setEnabled(False)
                 self.refresh()
 
@@ -5775,7 +6634,7 @@ def _cmd_ui_body(args, cfg):
             self.h_progress.setValue(0)
             self.h_cancel_btn.setVisible(True)
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn):
+                      self.h_interview_btn, self.h_sharing_btn):
                 b.setEnabled(False)
 
             thread = QThread(self)
@@ -5787,8 +6646,10 @@ def _cmd_ui_body(args, cfg):
             worker.log.connect(self.h_log_view.append)
             worker.done.connect(self._on_pipeline_done)
             worker.failed.connect(self._on_pipeline_failed)
+            worker.cancelled.connect(self._on_pipeline_cancelled)
             worker.done.connect(thread.quit)
             worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
             thread.finished.connect(worker.deleteLater)
             thread.finished.connect(thread.deleteLater)
             self._pipeline_worker = worker
@@ -5816,27 +6677,42 @@ def _cmd_ui_body(args, cfg):
             self._reset_after_pipeline()
             self.h_log_view.append(_t("pipe.log.failed", err=msg))
 
+        def _on_pipeline_cancelled(self):
+            self._reset_after_pipeline()
+            self.h_log_view.append(_t("pipe.log.cancelled"))
+
         def _reset_after_pipeline(self):
             self.h_progress.setVisible(False)
             self.h_cancel_btn.setVisible(False)
+            # Re-arm the cancel button in case `_on_cancel_pipeline` had
+            # disabled it during the wrap-up window.
+            self.h_cancel_btn.setEnabled(True)
             self._pipeline_worker = None
             self._pipeline_thread = None
             # Re-enable action buttons iff a meeting is currently selected.
             has_selection = self._current is not None
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn):
+                      self.h_interview_btn, self.h_sharing_btn):
                 b.setEnabled(has_selection)
             # A just-completed pipeline may have produced new artifacts —
             # re-render the "generate / open" toggle.
             self._refresh_h_action_buttons()
 
         def _on_cancel_pipeline(self):
-            # transcribe/polish/generate don't have built-in cancel hooks;
-            # we detach the UI. The thread keeps running until natural
-            # completion (any partial writes stay on disk so a re-run
-            # resumes from the checkpoint).
-            self.h_log_view.append(_t("pipe.log.cancel_hint"))
-            self._reset_after_pipeline()
+            # Truly terminate the background pipeline: set the cancel event
+            # and SIGKILL any registered subprocess (claude -p …) so the
+            # worker thread escapes its blocking call and emits the
+            # `cancelled` signal. We keep the cancel button visible but
+            # disabled during the wrap-up window so the user sees that
+            # termination is in progress; full UI reset happens in
+            # `_on_pipeline_cancelled` when the worker confirms.
+            worker = self._pipeline_worker
+            if worker is None:
+                self._reset_after_pipeline()
+                return
+            self.h_log_view.append(_t("pipe.log.cancelling"))
+            self.h_cancel_btn.setEnabled(False)
+            worker.cancel()
 
     # ── Config view ───────────────────────────────────────────────────────
 
@@ -6277,21 +7153,21 @@ def main():
     stt_help = "可选：funasr（默认）/ openai / gemini，或 stt 配置中的任意 key"
     llm_help = "可选：claude / openai / gemini，或 llm 配置中的任意 key"
 
-    mode_help = "运行模式：meeting（会议纪要，默认）| interview（面试总结）"
+    mode_help = "运行模式：meeting（会议纪要，默认）| interview（面试总结）| sharing（分享总结）"
 
     # --mode / --debug 可放在子命令之前（全局）或之后（子命令级），两种写法均有效
-    parser.add_argument("--mode", metavar="MODE", help=mode_help)
+    parser.add_argument("--mode", metavar="MODE", choices=MODES, help=mode_help)
     parser.add_argument("--debug", action="store_true", help="启用调试日志（每秒打印各路音频电平到 stderr）")
 
     p_rec = sub.add_parser("record", help="开始录音（Ctrl+C 停止）")
-    p_rec.add_argument("--mode", metavar="MODE", help=mode_help, default=argparse.SUPPRESS)
+    p_rec.add_argument("--mode", metavar="MODE", choices=MODES, help=mode_help, default=argparse.SUPPRESS)
     p_rec.add_argument("--transcribe-provider", metavar="PROVIDER", help=f"语音转文字模型，{stt_help}")
     p_rec.add_argument("--polish-provider", metavar="PROVIDER", help=f"转写校对模型，{llm_help}")
     p_rec.add_argument("--meeting-notes-provider", metavar="PROVIDER", help=f"纪要/总结模型，{llm_help}")
 
     p_tr = sub.add_parser("transcribe", help="转写已有音频文件")
     p_tr.add_argument("file", help="音频文件路径")
-    p_tr.add_argument("--mode", metavar="MODE", help=mode_help, default=argparse.SUPPRESS)
+    p_tr.add_argument("--mode", metavar="MODE", choices=MODES, help=mode_help, default=argparse.SUPPRESS)
     p_tr.add_argument("--transcribe-provider", metavar="PROVIDER", help=f"语音转文字模型，{stt_help}")
     p_tr.add_argument("--polish-provider", metavar="PROVIDER", help=f"转写校对模型，{llm_help}")
     p_tr.add_argument("--meeting-notes-provider", metavar="PROVIDER", help=f"纪要/总结模型，{llm_help}")

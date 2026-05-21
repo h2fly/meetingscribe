@@ -8,7 +8,7 @@
   "polish_max_workers": 3,
 
   // ── 运行模式 ─────────────────────────────────────────────────────────────────
-  // meeting（会议纪要，默认）| interview（面试总结）
+  // meeting（会议纪要，默认）| interview（面试总结）| sharing（分享总结 / 技术 talk / 最佳实践讲座）
   "mode": "meeting",
 
   // ── 各环节 Provider ──────────────────────────────────────────────────────────
@@ -16,7 +16,7 @@
   "transcribe_provider": "funasr",
   // 转写校对：claude | openai | gemini
   "polish_provider": "claude",
-  // 会议纪要 / 面试总结：claude | openai | gemini
+  // 会议纪要 / 面试总结 / 分享总结：claude | openai | gemini
   "meeting_notes_provider": "claude",
 
   // ── 录音设备 ─────────────────────────────────────────────────────────────────
@@ -96,11 +96,17 @@
   },
 
   // ── 流水线 Prompt 模板 ──────────────────────────────────────────────────────
+  // 【项目规则】所有 prompt 都必须以可编辑形式落在本文件里，不允许只在代码里维护。
+  //   理由：prompt 是产品行为的主入口，运营 / 业务 / 研发都应能在不读 Python 的
+  //   前提下调优；代码里的 `_PROMPT_DEFAULTS` 只作为兜底，禁止成为唯一来源。
+  //   新增 mode 时必须**同时**在此 jsonc 中补齐对应 prompt 块。
+  //
   // 你可以直接修改下面任何一条 prompt 来定制 AI 的行为。
   //
   //   • polish    — 校对 / 整理转写文本（按块并行调用），**与 mode 无关**
   //   • meeting   → notes_zh / notes_en：会议纪要中英文
   //   • interview → notes_zh / notes_en：面试报告中英文
+  //   • sharing   → notes_zh / notes_en：分享总结 / 技术 talk / 最佳实践讲座中英文
   //
   // 每条 prompt 是一个 **字符串数组**——加载时会用 "\n" 把数组拼成完整文本。
   // JSON 不允许字符串里包含真正的换行，这是把多行 prompt 写得可读的标准做法。
@@ -202,6 +208,80 @@
         "",
         "---",
         "[Interview Transcript]",
+        "{transcript}"
+      ]
+    },
+    "sharing": {
+      // 分享总结 / 技术 talk / 最佳实践讲座（带听众问答）。
+      // 关键差异：第 2 节「分享正文」是长篇逐节复述，不是摘要——
+      // 要求保留代码片段、命令、链接、人名、数字等具体事实；
+      // 第 8 节「问答」需把听众提问和主讲人回答配对列出，未直接回答需标注。
+      "notes_zh": [
+        "你是一位专业的分享/讲座整理助手。以下转写文本来自一次知识分享 / 技术分享 / 最佳实践讲座，可能有一位或多位主讲人详细分享内容，过程中或结尾通常会有听众提问、主讲人答疑。请生成一份既忠实记录分享内容、又便于事后查阅的整理稿。",
+        "",
+        "要求（请按以下结构输出，使用 Markdown）：",
+        "",
+        "1. **分享概览** — 2~4 句，说明本次分享的主题、主讲人（如可识别）、整体定位（介绍 / 经验复盘 / 教程 / 案例剖析等）。",
+        "2. **分享正文** — **这是本输出最重要的部分**。请按主讲人的讲述顺序，分小节（## 二级标题）忠实重述分享内容：",
+        "   - 保留主讲人提到的具体案例、数字、命令、代码片段、链接、人名、产品名、方法论名称等关键事实，不要为了\"简洁\"而抹掉。",
+        "   - 保留逻辑层次：主讲人怎么展开论点的（背景 → 问题 → 方案 → 验证 → 总结），就按那个顺序写。",
+        "   - 用通顺的书面中文重写口语化的表达，但**不要做主观加工或评价**；这是\"详细文字版本\"，不是\"摘要\"。",
+        "   - 如果分享内容较长，可以拆为多个小节，每节都用 `##` 二级标题。",
+        "3. **核心要点** — 用 3~7 条要点列出分享中最重要的结论 / 主张，每条 1~2 句。",
+        "4. **最佳实践 / 可复用经验** — 列出主讲人明确推荐的做法、踩过的坑、避免的陷阱。无则写\"未明确提及\"。",
+        "5. **关键洞察** — 主讲人独到的观点或反直觉的结论；与行业常见做法的差异。无则写\"无\"。",
+        "6. **适用边界 / 前提条件** — 这些经验在什么场景下成立？依赖哪些技术 / 团队规模 / 业务特征？主讲人有没有明确说\"不适用于 X\"？",
+        "7. **风险与权衡** — 主讲人提到的限制、副作用、tradeoff。无则写\"未明确提及\"。",
+        "8. **问答（Q&A）** — 把听众提问和主讲人回答配对列出。格式：",
+        "   - **问 [提问者，如已知]**：……",
+        "   - **答 [主讲人，如已知]**：……",
+        "   - 如果某个问题主讲人没有正面回答或当场承认不知道，明确标注\"（未直接回答 / 待跟进）\"。",
+        "   - 若没有问答环节，写\"本次分享未包含问答环节\"。",
+        "9. **行动建议 / 后续动作** — 听众可立即落地的 2~5 条建议；如果分享中提到了延伸阅读 / 工具 / 文档链接，整理在此处。",
+        "",
+        "发言者标注规则：",
+        "- 如果上一步校对结果里已经标注了角色或姓名（如「主讲人：」「提问者 A：」「张三：」），请在「分享正文」「问答」中**保留这些标注**。",
+        "- 如果转写没有可靠区分发言者，**不要凭空捏造身份**；用\"主讲人\"、\"听众\"这样的通用称呼即可。",
+        "- 多位主讲人时分别标注，不要混为一谈。",
+        "",
+        "输出语言：中文。Markdown 格式，专业、客观。若转写较短、不完整或没有问答，如实在对应小节里说明。",
+        "",
+        "---",
+        "【分享转写】",
+        "{transcript}"
+      ],
+      "notes_en": [
+        "You are a professional knowledge-sharing / tech-talk summarisation assistant. The transcript below is from a sharing session, tech talk, or best-practices walkthrough delivered by one or more presenters. Audience members may have asked questions during or at the end of the talk. Produce a faithful, structured rendering of the talk that readers can use as a substitute for having attended.",
+        "",
+        "Output structure (Markdown):",
+        "",
+        "1. **Session Overview** — 2–4 sentences naming the topic, presenter(s) where identifiable, and the talk's positioning (introduction / experience report / tutorial / case study).",
+        "2. **Detailed Walkthrough** — **the most important section.** Following the presenter's own narrative order, retell the content in numbered or `##`-headed subsections:",
+        "   - Preserve every concrete fact mentioned: examples, numbers, commands, code snippets, links, names of people / products / methodologies. Do **not** drop them for the sake of brevity.",
+        "   - Preserve the logical structure (background → problem → approach → validation → takeaway), in the same order the presenter used.",
+        "   - Rewrite spoken English into clean written English, but do **not** add your own interpretation or evaluation. This section is a *long-form retelling*, not a summary.",
+        "   - Break the walkthrough into multiple subsections (`##` headings) if the talk is long.",
+        "3. **Key Points** — 3–7 bullets capturing the most important claims / conclusions, 1–2 sentences each.",
+        "4. **Best Practices / Reusable Lessons** — list practices the presenter explicitly recommended, plus pitfalls they called out. Write \"Not explicitly mentioned\" if absent.",
+        "5. **Insights** — non-obvious takeaways, contrarian observations, points of divergence from common industry practice. Write \"None\" if absent.",
+        "6. **Applicability & Preconditions** — the contexts in which these practices hold (technology stack, team size, business shape). Did the presenter call out anything as **not** applicable?",
+        "7. **Risks & Trade-offs** — limitations, side effects, and trade-offs the presenter acknowledged. Write \"Not explicitly mentioned\" if absent.",
+        "8. **Q&A** — pair audience questions with the presenter's answers. Format:",
+        "   - **Q [asker, if known]:** …",
+        "   - **A [presenter, if known]:** …",
+        "   - If the presenter deflected, deferred, or acknowledged not knowing, mark \"(not directly answered / follow-up needed)\".",
+        "   - If there was no Q&A segment, write \"This session had no Q&A segment.\"",
+        "9. **Action Items / Next Steps** — 2–5 actionable suggestions for the audience; collect any extended-reading links / tools / docs the presenter mentioned.",
+        "",
+        "Speaker-attribution rules:",
+        "- If the polish step already labelled segments (e.g. \"Presenter:\", \"Audience member A:\", a specific name), **preserve those labels** in both the Walkthrough and the Q&A.",
+        "- If the transcript does not reliably distinguish speakers, do **not** invent identities. Use generic terms like \"presenter\" and \"audience member\".",
+        "- For multi-presenter talks, attribute each segment to the correct presenter; do not blend their voices.",
+        "",
+        "Output language: English. Markdown format, professional and objective. If the transcript is short, incomplete, or has no Q&A, say so honestly in the relevant section.",
+        "",
+        "---",
+        "[Sharing Transcript]",
         "{transcript}"
       ]
     }
