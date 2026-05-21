@@ -1,53 +1,61 @@
 {
-  // ── 并发控制 / 性能 ─────────────────────────────────────────────────────────
-  // 单次 LLM 调用超时（秒），长会议建议设为 1200 以上
+  // ── Concurrency / Performance ───────────────────────────────────────────────
+  // Per-call LLM timeout in seconds; long meetings should use 1200+.
   "llm_timeout": 1200,
-  // 校对分块大小（字符数），超出则拆分为多块并行处理
+  // Polish chunk size in characters; longer transcripts are split into
+  // chunks processed in parallel.
   "polish_chunk_size": 3000,
-  // 校对并发 worker 数（同时调用 LLM 的块数），0 = 自动(max(4, cpu核数/2))
+  // Polish worker concurrency (chunks called against the LLM in
+  // parallel); 0 = auto (max(4, cpu_count/2)).
   "polish_max_workers": 3,
 
-  // ── 运行模式 ─────────────────────────────────────────────────────────────────
-  // meeting（会议纪要，默认）| interview（面试总结）| sharing（分享总结 / 技术 talk / 最佳实践讲座）
+  // ── Pipeline mode ───────────────────────────────────────────────────────────
+  // meeting (default, meeting minutes) | interview (interview summary)
+  // | sharing (sharing summary / tech talk / best-practices walkthrough)
   "mode": "meeting",
 
-  // ── 各环节 Provider ──────────────────────────────────────────────────────────
-  // 语音转文字：funasr（本地，默认）| openai | gemini
+  // ── Per-stage providers ─────────────────────────────────────────────────────
+  // Speech-to-text: funasr (local, default) | openai | gemini
   "transcribe_provider": "funasr",
-  // 转写校对：claude | openai | gemini
+  // Transcript polish: claude | openai | gemini
   "polish_provider": "claude",
-  // 会议纪要 / 面试总结 / 分享总结：claude | openai | gemini
+  // Meeting notes / interview summary / sharing summary: claude | openai | gemini
   "meeting_notes_provider": "claude",
 
-  // ── 录音设备 ─────────────────────────────────────────────────────────────────
-  // 录音采样率（Hz），建议与设备原生采样率一致
+  // ── Recording devices ───────────────────────────────────────────────────────
+  // Recording sample rate (Hz); ideally match the device's native rate.
   "sample_rate": 48000,
-  // 录音声道数（仅 AudioRecorder 使用，DualStreamRecorder 固定双路）
+  // Recording channel count (only AudioRecorder uses this;
+  // DualStreamRecorder is fixed to two streams).
   "channels": 3,
-  // 录音开始时切换到的输出设备（null = 自动探测 Multi-Output Device）
-  // 如需手动指定，运行 `python3 meetingscribe.py devices` 查看可用名称
+  // Output device switched to at recording start
+  // (null = auto-detect Multi-Output Device). To pin a specific name,
+  // run `python3 meetingscribe.py devices` and copy one from the list.
   "output_record": null,
-  // 录音结束后恢复的输出设备（null = 自动探测录音前的默认输出）
+  // Output device restored after recording stops
+  // (null = auto-detect the pre-recording default output).
   "output_restore": null,
-  // 系统音频捕获设备（null = 自动探测 BlackHole 设备）
+  // System-audio capture device (null = auto-detect BlackHole).
   "device_system_audio": null,
-  // 麦克风设备（null = 自动探测，优先外接麦克风）
+  // Microphone device (null = auto-detect, external mics preferred).
   "device_mic": null,
 
-  // ── 语音转文字（STT）Provider 配置 ────────────────────────────────────────────
+  // ── Speech-to-text (STT) provider config ────────────────────────────────────
   "stt": {
     "funasr": {
-      // 并发实例数：0 = 自动（max(2, CPU 核数 / 2)），>0 = 指定数量；内存随之线性增长
+      // Parallel instance count: 0 = auto (max(2, cpu_count/2));
+      // >0 = explicit; memory usage scales linearly.
       "workers": 3,
-      // 超过此时长（秒）自动分块并行转写；0 = 始终串行
+      // Auto-chunk + parallel-transcribe when audio is longer than this
+      // (seconds); 0 = always serial.
       "chunk_secs": 300,
-      // ASR 模型，首次运行自动下载（约 400 MB）
+      // ASR model; downloaded on first run (~400 MB).
       "model": "paraformer-zh",
-      // 语音活动检测（VAD），支持长音频分句
+      // Voice-activity-detection model (sentence splitting on long audio).
       "vad_model": "fsmn-vad",
-      // 标点恢复模型
+      // Punctuation restoration model.
       "punc_model": "ct-punc",
-      // 热词（空格分隔），提升专有名词识别率
+      // Hotwords (space-separated); boosts recognition of proper nouns.
       "hotword": ""
     },
     "openai": {
@@ -61,12 +69,14 @@
     }
   },
 
-  // ── 文本处理（LLM）Provider 配置 ──────────────────────────────────────────────
+  // ── Text-processing (LLM) provider config ───────────────────────────────────
   "llm": {
     "claude": {
-      // claude-cli 使用本地安装的 Claude Code CLI（`claude -p`）
+      // claude-cli shells out to the locally installed Claude Code CLI
+      // (`claude -p <prompt>`).
       "type": "claude-cli",
-      // 可选：指定 claude-cli 的模型（空字符串 = 使用 CLI 默认）
+      // Optional: pin a specific claude-cli model
+      // (empty string = use the CLI's own default).
       "model": ""
     },
     "openai": {
@@ -82,38 +92,49 @@
     }
   },
 
-  // ── 音频高级选项（一般不需要修改）────────────────────────────────────────────
+  // ── Advanced audio options (rarely need to change) ──────────────────────────
   "audio": {
-    // AudioDeviceMonitor 兜底唤醒间隔（秒）。HAL listener 失效时的自愈上限——
-    // 平时由热插拔事件驱动，不会触发；联调可调小到 5
+    // AudioDeviceMonitor safety wakeup interval (seconds). Self-heal
+    // cap for when the HAL listener stops delivering events —
+    // hot-plug events normally drive the monitor and this never fires.
+    // Drop to 5 while debugging hotplug.
     "monitor_safety_timeout_sec": 30.0,
-    // 自动探测 Multi-Output Device 时匹配的设备名（简中 / 繁中 / 英）。
-    // 若你在 Audio MIDI Setup 里把 Multi-Output 设备重命名了，
-    // 把那个名字加进来即可恢复自动探测
+    // Device names matched when auto-detecting the Multi-Output Device
+    // (Simplified Chinese / Traditional Chinese / English). If you
+    // renamed your Multi-Output Device in Audio MIDI Setup, add the new
+    // name here to restore auto-detection.
     "multi_output_device_names": [
       "Multi-Output Device", "多输出设备", "多重輸出裝置"
     ]
   },
 
-  // ── 流水线 Prompt 模板 ──────────────────────────────────────────────────────
-  // 【项目规则】所有 prompt 都必须以可编辑形式落在本文件里，不允许只在代码里维护。
-  //   理由：prompt 是产品行为的主入口，运营 / 业务 / 研发都应能在不读 Python 的
-  //   前提下调优；代码里的 `_PROMPT_DEFAULTS` 只作为兜底，禁止成为唯一来源。
-  //   新增 mode 时必须**同时**在此 jsonc 中补齐对应 prompt 块。
+  // ── Pipeline prompt templates ───────────────────────────────────────────────
+  // [PROJECT RULE] Every prompt MUST live here as an editable block;
+  //   maintaining prompts only in code is forbidden.
+  //   Rationale: prompts are the main lever for product behaviour and
+  //   ops / business / non-Python contributors must be able to tune
+  //   them without reading Python. The `_PROMPT_DEFAULTS` dict in
+  //   meetingscribe.py is fallback only — never the sole source.
+  //   When adding a new mode you MUST also add its prompt block here.
   //
-  // 你可以直接修改下面任何一条 prompt 来定制 AI 的行为。
+  // Edit any prompt below to customise the AI's behaviour.
   //
-  //   • polish    — 校对 / 整理转写文本（按块并行调用），**与 mode 无关**
-  //   • meeting   → notes_zh / notes_en：会议纪要中英文
-  //   • interview → notes_zh / notes_en：面试报告中英文
-  //   • sharing   → notes_zh / notes_en：分享总结 / 技术 talk / 最佳实践讲座中英文
+  //   • polish    — proofread / clean the raw transcript (parallel,
+  //                 chunked). **Mode-independent.**
+  //   • meeting   → notes_zh / notes_en — meeting minutes (Chinese / English)
+  //   • interview → notes_zh / notes_en — interview report (Chinese / English)
+  //   • sharing   → notes_zh / notes_en — sharing summary / tech talk /
+  //                 best-practices walkthrough (Chinese / English)
   //
-  // 每条 prompt 是一个 **字符串数组**——加载时会用 "\n" 把数组拼成完整文本。
-  // JSON 不允许字符串里包含真正的换行，这是把多行 prompt 写得可读的标准做法。
-  // 单一字符串也接受。
+  // Each prompt is a **string array** — joined on "\n" at load time.
+  // JSON forbids literal newlines inside strings, so the array form is
+  // the conventional way to keep multi-line prompts readable. A single
+  // string is also accepted.
   //
-  // 占位符只识别 {transcript}（区分大小写、按字面替换），其他大括号不需要转义。
-  // 删除整段 "prompts" 或某一个 key 即可回退到代码里的内置默认值。
+  // Only `{transcript}` is recognised as a placeholder (case-sensitive,
+  // literal substitution); other curly braces do not need escaping.
+  // Delete the whole "prompts" block or any single key to fall back to
+  // the built-in defaults in the code.
   "prompts": {
     "polish": [
       "你是一位专业的文字校对助手，正在处理一段录音的自动转写文本（可能来自会议、面试或其他场景）。",
@@ -212,10 +233,14 @@
       ]
     },
     "sharing": {
-      // 分享总结 / 技术 talk / 最佳实践讲座（带听众问答）。
-      // 关键差异：第 2 节「分享正文」是长篇逐节复述，不是摘要——
-      // 要求保留代码片段、命令、链接、人名、数字等具体事实；
-      // 第 8 节「问答」需把听众提问和主讲人回答配对列出，未直接回答需标注。
+      // Sharing summary / tech talk / best-practices walkthrough
+      // (with audience Q&A).
+      // Key difference from meeting/interview: section 2 ("Detailed
+      // Walkthrough") is a long-form section-by-section retelling, not
+      // a summary — code snippets, commands, links, names, and numbers
+      // must be preserved verbatim. Section 8 ("Q&A") must pair each
+      // audience question with the presenter's answer; unanswered
+      // questions should be marked explicitly.
       "notes_zh": [
         "你是一位专业的分享/讲座整理助手。以下转写文本来自一次知识分享 / 技术分享 / 最佳实践讲座，可能有一位或多位主讲人详细分享内容，过程中或结尾通常会有听众提问、主讲人答疑。请生成一份既忠实记录分享内容、又便于事后查阅的整理稿。",
         "",
