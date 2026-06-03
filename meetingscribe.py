@@ -334,6 +334,199 @@ def _setup_log_file():
 _funasr_model_cache: dict = {}  # (asr_model, vad_model, punc_model) -> AutoModel instance
 
 
+# ── FunASR jieba dict resilience ─────────────────────────────────────────────
+#
+# FunASR's punctuation model (iic/punc_ct-transformer_*) ships a jieba_usr_dict
+# whose lines are <word> only (no frequency column). jieba 0.42.1's module-level
+# load_userdict (jieba/__init__.py:307) crashes on such lines with
+# `IndexError: list index out of range` because it executes
+# `word, freq = tup[0], tup[1]` after splitting on " ". jieba is already at
+# its latest release, so we cannot fix this by upgrading. Instead we self-heal:
+# when AutoModel(...) raises an IndexError that came through jieba, we append
+# " 1" to every malformed line in every jieba_usr_dict under the modelscope
+# cache, then retry AutoModel once. The repair is idempotent (sentinel file)
+# and crash-safe (atomic tmp + os.replace).
+
+
+def _modelscope_cache_root() -> Path | None:
+    """Honour MODELSCOPE_CACHE env var if set and existing, else ~/.cache/modelscope."""
+    env = os.environ.get("MODELSCOPE_CACHE")
+    if env:
+        p = Path(env).expanduser()
+        if p.is_dir():
+            return p
+    default = Path.home() / ".cache" / "modelscope"
+    if default.is_dir():
+        return default
+    return None
+
+
+def _patch_one_jieba_dict(path: Path) -> tuple[bool, int, int]:
+    """Append ' 1' to every non-empty whitespace-free line in *path*.
+
+    Idempotent (sentinel `.jieba_usr_dict.patched` next to the file) and
+    crash-safe (atomic `tmp + os.replace`). On OSError, removes the partial
+    .tmp and re-raises so the caller can decide whether to continue.
+
+    Returns ``(modified, lines_fixed, lines_total)`` where ``modified`` is
+    True iff the file's contents on disk actually changed.
+    """
+    sentinel = path.parent / ".jieba_usr_dict.patched"
+    try:
+        path_mtime = path.stat().st_mtime
+    except OSError:
+        return (False, 0, 0)
+    if sentinel.exists():
+        try:
+            if sentinel.stat().st_mtime >= path_mtime:
+                return (False, 0, 0)
+        except OSError as e:
+            _log("STT", f"jieba dict sentinel stat failed: {sentinel} err={e!r}; proceeding with re-patch")
+
+    content = path.read_text(encoding="utf-8")
+    lines = content.split("\n")
+    fixed = 0
+    total = 0
+    for i, raw in enumerate(lines):
+        stripped = raw.rstrip()
+        if not stripped:
+            continue
+        total += 1
+        if " " not in stripped and "\t" not in stripped:
+            lines[i] = f"{stripped} 1"
+            fixed += 1
+    new_text = "\n".join(lines)
+
+    if fixed == 0:
+        try:
+            sentinel.write_text("v1\n", encoding="utf-8")
+        except OSError as e:
+            _log("STT", f"jieba dict sentinel write failed: {sentinel} err={e!r}")
+        return (False, 0, total)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except OSError as e:
+        _log("STT", f"jieba dict patch failed: {path} err={e!r}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as cleanup_err:
+            _log("STT", f"jieba dict tmp cleanup failed: {tmp} err={cleanup_err!r}")
+        raise
+    try:
+        sentinel.write_text("v1\n", encoding="utf-8")
+    except OSError as e:
+        _log("STT", f"jieba dict sentinel write failed: {sentinel} err={e!r}")
+    return (True, fixed, total)
+
+
+def _patch_funasr_jieba_dicts() -> int:
+    """Discover and repair every malformed jieba_usr_dict under the modelscope cache.
+
+    Discovery is bounded to ``<cache>/hub/models/**/jieba_usr_dict`` and skips
+    symlinks plus any file whose resolved path escapes the cache root.
+    Returns the number of files actually modified (0 if cache is missing,
+    nothing was malformed, or every per-file patch failed).
+    """
+    root = _modelscope_cache_root()
+    if root is None:
+        _log("STT", "jieba dict patch: no modelscope cache found; nothing to do")
+        return 0
+    models_root = root / "hub" / "models"
+    if not models_root.is_dir():
+        _log("STT", f"jieba dict patch: {models_root} does not exist; nothing to do")
+        return 0
+
+    try:
+        cache_resolved = root.resolve()
+    except OSError:
+        cache_resolved = root
+
+    candidates: list[Path] = []
+    for p in models_root.glob("**/jieba_usr_dict"):
+        if not p.is_file():
+            continue
+        if p.is_symlink():
+            continue
+        try:
+            real = p.resolve()
+        except OSError:
+            continue
+        try:
+            real.relative_to(cache_resolved)
+        except ValueError:
+            continue
+        candidates.append(p)
+
+    _log(
+        "STT",
+        f"FunASR AutoModel raised IndexError from jieba; attempting "
+        f"jieba_usr_dict repair on {len(candidates)} candidate(s) under {root}",
+    )
+    modified_count = 0
+    already_count = 0
+    for p in candidates:
+        try:
+            modified, fixed, total = _patch_one_jieba_dict(p)
+        except OSError:
+            continue
+        if modified:
+            _log("STT", f"jieba dict patch: {p} (added freq=1 to {fixed}/{total} lines)")
+            modified_count += 1
+        else:
+            _log("STT", f"jieba dict already patched: {p}")
+            already_count += 1
+    _log(
+        "STT",
+        f"jieba dict patch complete: {modified_count} file(s) modified, "
+        f"{already_count} already up to date",
+    )
+    return modified_count
+
+
+def _indexerror_came_from_jieba(exc: BaseException) -> bool:
+    """True iff *exc*'s traceback contains a frame from ``jieba/__init__.py``."""
+    needle = os.sep + "jieba" + os.sep + "__init__.py"
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = tb.tb_frame.f_code.co_filename or ""
+        if filename.endswith(needle):
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def _load_funasr_automodel(asr_model: str, vad_model: str, punc_model: str):
+    """Construct ``funasr.AutoModel`` with self-healing for the jieba dict bug.
+
+    On the first ``IndexError`` whose traceback originates in jieba, patch
+    malformed ``jieba_usr_dict`` files under the modelscope cache and retry
+    once with identical kwargs. If the retry fails, raise the *original*
+    IndexError with the new failure chained via ``raise … from …``.
+    """
+    from funasr import AutoModel
+    kwargs = dict(
+        model=asr_model, vad_model=vad_model, punc_model=punc_model,
+        disable_update=True,
+    )
+    try:
+        return AutoModel(**kwargs)
+    except IndexError as original_err:
+        if not _indexerror_came_from_jieba(original_err):
+            raise
+        n_patched = _patch_funasr_jieba_dicts()
+        if n_patched == 0:
+            _log("STT", "jieba dict patch produced 0 changes; re-raising original IndexError")
+            raise
+        _log("STT", f"Retrying FunASR AutoModel after patching {n_patched} jieba dict(s)")
+        try:
+            return AutoModel(**kwargs)
+        except Exception as retry_err:
+            raise original_err from retry_err
+
+
 # ── Prompt defaults ──────────────────────────────────────────────────────────
 #
 # These are the built-in pipeline prompts used by `polish_transcript` and
@@ -2875,10 +3068,8 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
     def _load_model():
         key = (asr_model, vad_model, punc_model)
         if key not in _funasr_model_cache:
-            from funasr import AutoModel
-            _funasr_model_cache[key] = AutoModel(
-                model=asr_model, vad_model=vad_model, punc_model=punc_model,
-                disable_update=True,
+            _funasr_model_cache[key] = _load_funasr_automodel(
+                asr_model, vad_model, punc_model,
             )
         return _funasr_model_cache[key]
 
