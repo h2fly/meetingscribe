@@ -3428,7 +3428,19 @@ def _llm_claude_cli(prompt: str, label: str, timeout: int, model: str = "") -> s
     if _PIPELINE_CANCEL.is_set():
         raise _PipelineCancelled()
     if proc.returncode != 0:
-        print(f"[错误] claude-cli 非零退出（{label}）:\n{stderr}")
+        out = (stdout or "").strip()
+        err = (stderr or "").strip()
+        parts = [f"[错误] claude-cli 非零退出（{label}，returncode={proc.returncode}）"]
+        if err:
+            parts.append(f"stderr: {err}")
+        if out:
+            parts.append(f"stdout: {out}")
+        if not err and not out:
+            parts.append(
+                "stdout/stderr 均为空 — 可能是认证/限额/网络问题。"
+                "请在终端直接执行 `claude -p 'hi'` 复现，并检查 `claude --version` 与登录态。"
+            )
+        print("\n".join(parts))
         sys.exit(1)
     return stdout.strip()
 
