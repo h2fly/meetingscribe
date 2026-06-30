@@ -2651,7 +2651,7 @@ class MultiStreamRecorder:
         self._lock = threading.Lock()        # protects _streams / _frames dict ops
         self.recording = False
         self.skipped: list[str] = []
-        self.warnings: list[str] = []        # de-duped warning codes for sidecar
+        self.warnings: list[str] = []        # de-duped warning codes (logged via _emit_warning)
         # Tracked so stop() can join the monitor thread before clearing
         # _streams — eliminates the race where _monitor_iteration's _try_open
         # resets _frames mid-stop, discarding captured audio.
@@ -2669,7 +2669,7 @@ class MultiStreamRecorder:
                 _log("ERR", f"on_warning callback: {type(e).__name__}: {e}")
 
     def _role_warning_code(self, device: str, kind: str) -> str | None:
-        """Map (device, 'not-opened'|'disappeared') to a stable sidecar code, or None
+        """Map (device, 'not-opened'|'disappeared') to a stable warning code, or None
         if the role is generic and shouldn't produce a labelled warning."""
         try:
             role = self.role_labels[self.wanted.index(device)]
@@ -3003,14 +3003,6 @@ class MultiStreamRecorder:
             wf.setframerate(self.sample_rate)
             wf.writeframes(audio_int16.tobytes())
 
-        # Sidecar warnings file — only created when warnings exist; one code per line.
-        if self.warnings:
-            sidecar = path.with_name(path.stem + ".warnings.txt")
-            try:
-                sidecar.write_text("\n".join(self.warnings) + "\n", encoding="utf-8")
-                _log("REC", f"sidecar written: {sidecar} ({len(self.warnings)} warnings)")
-            except Exception as e:
-                _log("ERR", f"sidecar write {sidecar}: {type(e).__name__}: {e}")
         _log(
             "REC",
             f"save: path={path.name} channels={2} frames={mixed.shape[0]} "
@@ -3775,7 +3767,7 @@ def _rename_meeting_files(wav_path: Path, new_custom_name: str | None) -> Path |
 def _delete_meeting_files(wav_path: Path) -> tuple[int, list[str]]:
     """Delete a meeting's ``.wav`` and every companion file sharing the
     same stem prefix (``.raw.txt``, ``.polish.txt``, ``.meeting.md``,
-    ``.interview.md``, ``.warnings.txt``, ``.meta.json``, legacy ``.md``,
+    ``.interview.md``, ``.sharing.md``, ``.meta.json``, legacy ``.md``,
     …).
 
     Returns ``(deleted_count, errors)`` where ``errors`` is a list of

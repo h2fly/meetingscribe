@@ -878,10 +878,10 @@ class TestRestoreOutputGate:
         rec.stop()
 
 
-# ── MultiStreamRecorder warnings + sidecar ────────────────────────────────────
+# ── MultiStreamRecorder warnings (log-only; no sidecar files) ─────────────────
 
 class TestMultiStreamRecorderWarnings:
-    def test_emits_mic_warning_on_failure_and_writes_sidecar(self, tmp_path):
+    def test_emits_mic_warning_on_failure(self, tmp_path):
         rec = ms.MultiStreamRecorder(["sys", "mic"], 48000, role_labels=["system", "mic"])
         seen: list[str] = []
         rec.on_warning = seen.append
@@ -891,9 +891,8 @@ class TestMultiStreamRecorderWarnings:
         assert rec.save(path) is True
         assert "mic-not-opened" in seen
         assert "mic-not-opened" in rec.warnings
-        sidecar = tmp_path / "out.warnings.txt"
-        assert sidecar.exists()
-        assert "mic-not-opened" in sidecar.read_text()
+        # Warnings must NOT spill out as a sidecar file — they live in the log only.
+        assert not (tmp_path / "out.warnings.txt").exists()
 
     def test_emits_system_warning_on_mic_only_recording(self, tmp_path):
         rec = ms.MultiStreamRecorder(["sys", "mic"], 48000, role_labels=["system", "mic"])
@@ -903,6 +902,7 @@ class TestMultiStreamRecorderWarnings:
         path = tmp_path / "out.wav"
         rec.save(path)
         assert "system-audio-not-opened" in seen
+        assert not (tmp_path / "out.warnings.txt").exists()
 
     def test_no_warning_no_sidecar_on_clean_recording(self, tmp_path):
         rec = ms.MultiStreamRecorder(["sys", "mic"], 48000, role_labels=["system", "mic"])
@@ -1401,15 +1401,16 @@ class TestStreamLifecycleLogs:
             rec._close_one("sys", reason="disappeared")
         assert "[STREAM] closed device='sys' reason=disappeared" in buf.getvalue()
 
-    def test_save_logs_sidecar_creation(self, tmp_path):
+    def test_save_logs_warning_for_missing_role(self, tmp_path):
         rec = ms.MultiStreamRecorder(["sys", "mic"], 48000, role_labels=["system", "mic"])
         rec._frames = {"sys": [np.zeros((4800, 1), np.float32)], "mic": []}
         buf = io.StringIO()
         with patch.object(ms, "_log_file_handle", buf):
             rec.save(tmp_path / "out.wav")
         log = buf.getvalue()
-        assert "[REC] sidecar written" in log
         assert "[WARN] recorder: mic-not-opened" in log
+        # No sidecar file is written — warnings are log-only by design.
+        assert not (tmp_path / "out.warnings.txt").exists()
 
 
 # ── AudioDeviceMonitor ────────────────────────────────────────────────────────
