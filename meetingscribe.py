@@ -576,9 +576,15 @@ _PROMPT_DEFAULTS: dict = {
 要求：
 1. **会议概要** — 2~3 句话概括核心内容
 2. **主要议题** — 逐条列出讨论的关键议题
-3. **决策事项** — 明确达成的决定或共识
-4. **行动项** — 格式：负责人 · 事项 · 截止时间（无明确信息则标"待确认"）
+3. **决策事项** — 明确达成的决定或共识，整节合并为一个 `> [!important]` callout 块，条目在块内用列表罗列
+4. **行动项** — 格式：负责人 · 事项 · 截止时间（无明确信息则标"待确认"），整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列
 5. **关键洞察** — 值得记录的重要观点
+6. **风险与提醒** — 会议中提到的风险、阻塞点或需特别注意的事项，整节合并为一个 `> [!warning]` callout 块，条目在块内用列表罗列；无则省略本节
+
+callout 语法示例（每节只用一个 callout：标记行 + 列表条目，每行都以 > 开头；不要为每个条目单独开 callout）：
+> [!important]
+> - 确定采用方案 B，下季度上线。
+> - 数据迁移窗口定在 9 月第一周。
 
 用中文输出，格式为 Markdown，简洁清晰。若内容较短或不完整，如实说明。
 
@@ -592,9 +598,15 @@ You are a professional meeting notes assistant. Based on the following meeting t
 Requirements:
 1. **Meeting Summary** — 2–3 sentences summarizing the core content
 2. **Key Topics** — list each major topic discussed
-3. **Decisions Made** — explicit decisions or consensus reached
-4. **Action Items** — format: Owner · Task · Due Date (mark "TBD" if unknown)
+3. **Decisions Made** — explicit decisions or consensus reached, merged into one `> [!important]` callout block with a bullet list inside
+4. **Action Items** — format: Owner · Task · Due Date (mark "TBD" if unknown), merged into one `> [!tip]` callout block with a bullet list inside
 5. **Key Insights** — notable observations worth recording
+6. **Risks & Reminders** — risks, blockers, or points needing special attention, merged into one `> [!warning]` callout block with a bullet list inside; omit this section if none
+
+Callout syntax example (one callout per section: marker line + list items, every line starts with >; do NOT open a separate callout per item):
+> [!important]
+> - Adopt option B; ship next quarter.
+> - Data migration window: first week of September.
 
 Output in English, Markdown format, concise and clear. If the content is short or incomplete, state so honestly.
 
@@ -615,17 +627,22 @@ Output in English, Markdown format, concise and clear. If the content is short o
    - 保留逻辑层次：主讲人怎么展开论点的（背景 → 问题 → 方案 → 验证 → 总结），就按那个顺序写。
    - 用通顺的书面中文重写口语化的表达，但**不要做主观加工或评价**；这是"详细文字版本"，不是"摘要"。
    - 如果分享内容较长，可以拆为多个小节，每节都用 `##` 二级标题。
-3. **核心要点** — 用 3~7 条要点列出分享中最重要的结论 / 主张，每条 1~2 句。
-4. **最佳实践 / 可复用经验** — 列出主讲人明确推荐的做法、踩过的坑、避免的陷阱。无则写"未明确提及"。
+3. **核心要点** — 用 3~7 条要点列出分享中最重要的结论 / 主张，每条 1~2 句，整节合并为一个 `> [!important]` callout 块，条目在块内用列表罗列。
+4. **最佳实践 / 可复用经验** — 列出主讲人明确推荐的做法、踩过的坑、避免的陷阱，整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列。无则写"未明确提及"。
 5. **关键洞察** — 主讲人独到的观点或反直觉的结论；与行业常见做法的差异。无则写"无"。
 6. **适用边界 / 前提条件** — 这些经验在什么场景下成立？依赖哪些技术 / 团队规模 / 业务特征？主讲人有没有明确说"不适用于 X"？
-7. **风险与权衡** — 主讲人提到的限制、副作用、tradeoff。无则写"未明确提及"。
+7. **风险与权衡** — 主讲人提到的限制、副作用、tradeoff，整节合并为一个 `> [!warning]` callout 块，条目在块内用列表罗列。无则写"未明确提及"。
 8. **问答（Q&A）** — 把听众提问和主讲人回答配对列出。格式：
    - **问 [提问者，如已知]**：……
    - **答 [主讲人，如已知]**：……
    - 如果某个问题主讲人没有正面回答或当场承认不知道，明确标注"（未直接回答 / 待跟进）"。
    - 若没有问答环节，写"本次分享未包含问答环节"。
 9. **行动建议 / 后续动作** — 听众可立即落地的 2~5 条建议；如果分享中提到了延伸阅读 / 工具 / 文档链接，整理在此处。
+
+callout 语法示例（每节只用一个 callout：标记行 + 列表条目，每行都以 > 开头；不要为每个条目单独开 callout）：
+> [!important]
+> - 灰度发布应以场景为单位，而不是按服务切分。
+> - 可观测性建设要先于自动化排障。
 
 发言者标注规则：
 - 如果上一步校对结果里已经标注了角色或姓名（如「主讲人：」「提问者 A：」「张三：」），请在「分享正文」「问答」中**保留这些标注**。
@@ -649,17 +666,22 @@ Output structure (Markdown):
    - Preserve the logical structure (background → problem → approach → validation → takeaway), in the same order the presenter used.
    - Rewrite spoken English into clean written English, but do **not** add your own interpretation or evaluation. This section is a *long-form retelling*, not a summary.
    - Break the walkthrough into multiple subsections (`##` headings) if the talk is long.
-3. **Key Points** — 3–7 bullets capturing the most important claims / conclusions, 1–2 sentences each.
-4. **Best Practices / Reusable Lessons** — list practices the presenter explicitly recommended, plus pitfalls they called out. Write "Not explicitly mentioned" if absent.
+3. **Key Points** — 3–7 bullets capturing the most important claims / conclusions, 1–2 sentences each, merged into one `> [!important]` callout block with a bullet list inside.
+4. **Best Practices / Reusable Lessons** — list practices the presenter explicitly recommended, plus pitfalls they called out, merged into one `> [!tip]` callout block with a bullet list inside. Write "Not explicitly mentioned" if absent.
 5. **Insights** — non-obvious takeaways, contrarian observations, points of divergence from common industry practice. Write "None" if absent.
 6. **Applicability & Preconditions** — the contexts in which these practices hold (technology stack, team size, business shape). Did the presenter call out anything as **not** applicable?
-7. **Risks & Trade-offs** — limitations, side effects, and trade-offs the presenter acknowledged. Write "Not explicitly mentioned" if absent.
+7. **Risks & Trade-offs** — limitations, side effects, and trade-offs the presenter acknowledged, merged into one `> [!warning]` callout block with a bullet list inside. Write "Not explicitly mentioned" if absent.
 8. **Q&A** — pair audience questions with the presenter's answers. Format:
    - **Q [asker, if known]:** …
    - **A [presenter, if known]:** …
    - If the presenter deflected, deferred, or acknowledged not knowing, mark "(not directly answered / follow-up needed)".
    - If there was no Q&A segment, write "This session had no Q&A segment."
 9. **Action Items / Next Steps** — 2–5 actionable suggestions for the audience; collect any extended-reading links / tools / docs the presenter mentioned.
+
+Callout syntax example (one callout per section: marker line + list items, every line starts with >; do NOT open a separate callout per item):
+> [!important]
+> - Roll out by scenario, not by service.
+> - Build observability before automating diagnosis.
 
 Speaker-attribution rules:
 - If the polish step already labelled segments (e.g. "Presenter:", "Audience member A:", a specific name), **preserve those labels** in both the Walkthrough and the Q&A.
@@ -682,11 +704,16 @@ Output language: English. Markdown format, professional and objective. If the tr
 2. **核心问答摘要** — 按主题归纳关键问题与候选人的回答要点
 3. **技术 / 专业能力** — 具体技能掌握程度、深度、广度
 4. **综合素质** — 沟通表达、逻辑思维、学习能力、团队意识等
-5. **亮点** — 突出表现或印象深刻的回答
-6. **不足 / 待确认** — 回答模糊、经验欠缺或需进一步了解的方面
+5. **亮点** — 突出表现或印象深刻的回答，整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列
+6. **不足 / 待确认** — 回答模糊、经验欠缺或需进一步了解的方面，整节合并为一个 `> [!warning]` callout 块，条目在块内用列表罗列
 7. **专业能力评估** — 从专业知识、方案设计、项目管理、数据分析等维度逐项评估
 8. **价值观评估** — 从客户成功、极客精神、快速交付、简单直接、多元兼容等维度逐项评估
-9. **综合评价与建议** — 是否推荐进入下一轮，及理由
+9. **综合评价与建议** — 是否推荐进入下一轮，及理由，整节放入一个 `> [!important]` callout 块
+
+callout 语法示例（每节只用一个 callout：标记行 + 内容，每行都以 > 开头；不要为每个条目单独开 callout）：
+> [!tip]
+> - 对分布式事务的回答深入，且有真实生产案例佐证。
+> - 主动补充压测数据支撑方案选型。
 
 用中文及英文输出，格式为 Markdown，客观专业。若内容较短或不完整，如实说明。
 
@@ -702,11 +729,16 @@ Requirements:
 2. **Q&A Summary** — key questions and candidate's responses, grouped by theme
 3. **Technical / Professional Skills** — depth and breadth of specific skills demonstrated
 4. **Soft Skills** — communication, logical thinking, learning ability, teamwork, etc.
-5. **Highlights** — standout moments or particularly impressive answers
-6. **Gaps / To Verify** — vague answers, lacking experience, or areas needing follow-up
+5. **Highlights** — standout moments or particularly impressive answers, merged into one `> [!tip]` callout block with a bullet list inside
+6. **Gaps / To Verify** — vague answers, lacking experience, or areas needing follow-up, merged into one `> [!warning]` callout block with a bullet list inside
 7. **Professional Competency Assessment** — evaluate across dimensions such as domain knowledge, solution design, project management, and data analysis
 8. **Values Assessment** — evaluate across dimensions such as customer success, geek spirit, fast delivery, simple & direct, and diversity & inclusion
-9. **Overall Assessment & Recommendation** — whether to advance to next round, with reasoning
+9. **Overall Assessment & Recommendation** — whether to advance to next round, with reasoning, wrapped in one `> [!important]` callout block
+
+Callout syntax example (one callout per section: marker line + content, every line starts with >; do NOT open a separate callout per item):
+> [!tip]
+> - Deep answer on distributed transactions, backed by a real production case.
+> - Proactively cited load-test numbers to support the design choice.
 
 Output in English, Markdown format, objective and professional. If the content is short or incomplete, state so honestly.
 
@@ -4391,6 +4423,7 @@ def _cmd_ui_body(args, cfg):
         from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QPoint, QSize
         from PyQt6.QtGui import (
             QFont, QAction, QColor, QSyntaxHighlighter, QTextCharFormat,
+            QTextCursor, QTextFormat,
         )
         from PyQt6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
@@ -4598,6 +4631,70 @@ def _cmd_ui_body(args, cfg):
                 subprocess.run(["xdg-open", path])
         except Exception as e:
             _log("ERR", f"qt open path={path!r}: {type(e).__name__}: {e}")
+
+    # ── Markdown callouts (GitHub / Obsidian `> [!type]` blockquotes) ──────
+    import re
+
+    # type -> (icon, title, foreground, background); GitHub-flavoured colors.
+    _CALLOUT_STYLES = {
+        "note":      ("📝", "Note",      "#0969da", "#ddf4ff"),
+        "tip":       ("💡", "Tip",       "#1a7f37", "#dcffe4"),
+        "todo":      ("✅", "To-do",     "#1a7f37", "#dcffe4"),
+        "important": ("⭐", "Important", "#8250df", "#fbefff"),
+        "warning":   ("⚠️", "Warning",   "#9a6700", "#fff8c5"),
+        "caution":   ("🚫", "Caution",   "#cf222e", "#ffebe9"),
+    }
+    _CALLOUT_MARKER_RE = re.compile(r"^\[!([A-Za-z]+)\]\s*")
+
+    def _apply_callout_styles(doc) -> None:
+        """Restyle callout blockquotes after ``setMarkdown``.
+
+        Qt's Markdown importer renders ``> [!important]`` as a plain
+        blockquote with the literal ``[!important]`` text; this pass finds
+        those blocks (via the ``BlockQuoteLevel`` block property), paints a
+        colored card background across the quote run, and swaps the marker
+        for a bold colored icon+title.
+        """
+        def _quote_level(b) -> int:
+            return b.blockFormat().intProperty(QTextFormat.Property.BlockQuoteLevel)
+
+        block = doc.begin()
+        while block.isValid():
+            m = _CALLOUT_MARKER_RE.match(block.text()) if _quote_level(block) > 0 else None
+            if not m:
+                block = block.next()
+                continue
+            icon, title, fg, bg = _CALLOUT_STYLES.get(
+                m.group(1).lower(), ("💬", m.group(1).capitalize(), "#57606a", "#eef1f4")
+            )
+            # Body = this block + following quote blocks, stopping at the
+            # next non-quote block or the next callout marker.
+            run = [block]
+            nxt = block.next()
+            while (
+                nxt.isValid()
+                and _quote_level(nxt) > 0
+                and not _CALLOUT_MARKER_RE.match(nxt.text())
+            ):
+                run.append(nxt)
+                nxt = nxt.next()
+            for rb in run:
+                bf = rb.blockFormat()
+                bf.setBackground(QColor(bg))
+                cur = QTextCursor(rb)
+                cur.setBlockFormat(bf)
+            # Soft line breaks merge "> [!type]\n> body" into one paragraph,
+            # so replace just the marker and re-split with U+2028 when body
+            # text follows in the same block.
+            has_body = m.end() < len(block.text())
+            cur = QTextCursor(doc)
+            cur.setPosition(block.position())
+            cur.setPosition(block.position() + m.end(), QTextCursor.MoveMode.KeepAnchor)
+            title_fmt = QTextCharFormat()
+            title_fmt.setFontWeight(QFont.Weight.Bold)
+            title_fmt.setForeground(QColor(fg))
+            cur.insertText(f"{icon} {title}" + ("\u2028" if has_body else ""), title_fmt)
+            block = nxt
 
     # ── Internationalisation ─────────────────────────────────────────────
     #
@@ -6589,6 +6686,10 @@ def _cmd_ui_body(args, cfg):
             # Refresh "generate / open" label + style for the new selection.
             self._refresh_h_action_buttons()
 
+        def _set_body_markdown(self, md: str):
+            self.body_browser.setMarkdown(md)
+            _apply_callout_styles(self.body_browser.document())
+
         def _render_body_for_mode(self, m: dict, mode: str):
             meeting_p = m.get("meeting_md_path")
             interview_p = m.get("interview_md_path")
@@ -6620,7 +6721,7 @@ def _cmd_ui_body(args, cfg):
                 if legacy_p and not (meeting_p or interview_p or sharing_p):
                     parts.append(_read(legacy_p))
                 if parts:
-                    self.body_browser.setMarkdown("\n\n---\n\n".join(parts))
+                    self._set_body_markdown("\n\n---\n\n".join(parts))
                     # Title: name the single artifact if there's only one, else
                     # "Multiple summaries". (Don't try to enumerate every
                     # combination — the body itself shows the contents.)
@@ -6683,19 +6784,19 @@ def _cmd_ui_body(args, cfg):
                     f"# 🎓 {_t('hist.body.notes_sharing')}\n\n{_read(sharing_p)}"
                 )
             if len(summary_parts) >= 2:
-                self.body_browser.setMarkdown("\n\n---\n\n".join(summary_parts))
+                self._set_body_markdown("\n\n---\n\n".join(summary_parts))
                 self.body_title.setText(_t("hist.body.notes_both"))
             elif meeting_p:
-                self.body_browser.setMarkdown(_read(meeting_p))
+                self._set_body_markdown(_read(meeting_p))
                 self.body_title.setText(_t("hist.body.notes_meeting_md"))
             elif interview_p:
-                self.body_browser.setMarkdown(_read(interview_p))
+                self._set_body_markdown(_read(interview_p))
                 self.body_title.setText(_t("hist.body.notes_interview_md"))
             elif sharing_p:
-                self.body_browser.setMarkdown(_read(sharing_p))
+                self._set_body_markdown(_read(sharing_p))
                 self.body_title.setText(_t("hist.body.notes_sharing_md"))
             elif legacy_p:
-                self.body_browser.setMarkdown(_read(legacy_p))
+                self._set_body_markdown(_read(legacy_p))
                 self.body_title.setText(_t("hist.body.notes_legacy_md"))
             elif polish_p:
                 self.body_browser.setPlainText(_read(polish_p))
