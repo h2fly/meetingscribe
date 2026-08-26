@@ -22,6 +22,208 @@
   // Meeting notes / interview summary / sharing summary: claude | openai | gemini
   "meeting_notes_provider": "claude",
 
+  // ── Live bilingual captions (GUI recording view; fully local inference) ────
+  "live_captions": {
+    // Default state of the caption switch in the recording view.
+    "enabled": true,
+    // There is ONE recognition path: sherpa-onnx streaming zipformer (zh-en,
+    // ~320 ms) + opus-mt Marian translation, with finalized lines re-decoded
+    // by the offline FunASR stack (see "refine" below). The former "accurate
+    // mode" (FunASR streaming 2pass + NLLB) is gone — its streaming model is
+    // Chinese-only and measurably worse on English meetings, while its NLLB
+    // translation is still selectable on its own via mt_provider="nllb".
+    // Empty = auto-download the streaming zipformer bilingual model
+    // (~200 MB, one-time) into ~/Documents/meetingscribe/models/.
+    "asr_model_dir": "",
+    "mt_zh_en": "Helsinki-NLP/opus-mt-zh-en",
+    "mt_en_zh": "Helsinki-NLP/opus-mt-en-zh",
+    // Second pass: after a line finalizes, re-decode its audio with the
+    // offline FunASR stack in the background and replace the caption
+    // (fixes the streaming model's typos; costs extra RAM/CPU). Skipped for
+    // English-dominant lines — that stack is a Chinese model.
+    "refine": true,
+    // Max segments queued for that second pass (~1.0-1.4 s each). When
+    // speech outruns the re-decoder the extra segments are skipped —
+    // a correction that lands 30 s late is worse than none. Every skip
+    // and every completed pass is logged under [CAPTION] with its
+    // duration and whether the text actually changed, so you can tell
+    // whether refine earns its cost.
+    "refine_max_backlog": 3,
+    // Minimum refresh interval (ms) for the in-flight gray caption line;
+    // raise it for a calmer display, lower it for snappier partials.
+    "partial_interval_ms": 500,
+    // Display-layer paragraph merging: consecutive finalized lines whose
+    // arrival gap is <= this many ms are shown as one paragraph (display
+    // only — recognition/translation data is untouched). 0 = no merging.
+    "merge_gap_ms": 2500,
+    // How far back the caption panel can be scrolled, in minutes. Retention
+    // is by TIME so the guarantee holds regardless of speech cadence (a row
+    // count would cover 3 hours of a slow meeting but only 1.5 of a fast
+    // one). 0 = no time-based eviction, history_max alone applies.
+    // This is a MINIMUM: eviction runs in batches (once the overflow passes
+    // ~1 minute) because dropping one row per line would shift every
+    // paragraph and force a full repaint of the pane on every caption.
+    "history_minutes": 180,
+    // Row-count backstop for memory, not the primary limit: 12000 rows is
+    // 3 hours even at an extreme 66 finalized lines/minute. Older rows get
+    // dropped from the display (transcripts on disk are unaffected).
+    "history_max": 12000,
+    // Coalescing window (ms) for caption re-renders. Bursts of partial /
+    // partial_translation / translation / refined events land several
+    // times per second — this debounces them into one setHtml() per
+    // window so the scrollbar stops flickering. 0 = render every event.
+    // Only finalized lines reach the document: the in-flight gray line is a
+    // separate widget, and the pane is patched incrementally (only the
+    // changed paragraph is re-laid-out), so this window does not need to
+    // grow with history_minutes.
+    "render_debounce_ms": 120,
+    // Tag each caption line with its audio SIDE ([我方] / [对方]), decided by
+    // which source (mic vs system audio) carried more energy while the line
+    // was spoken. This is a side, not an identity — one microphone can carry
+    // a whole meeting room — and it is only the fallback shown until
+    // speaker_id below identifies the actual person. Nothing is tagged until
+    // both sources have actually been heard.
+    "speaker_labels": true,
+    // Periodic batch re-check, on its own worker thread. Every
+    // interval_minutes the finalized lines from that window — together with
+    // their current translations — go to a full-size LLM (by default the same
+    // polish_provider that cleans up offline transcripts) which re-checks and
+    // re-translates them with the WHOLE window as context. That context is
+    // what the per-line passes structurally cannot have: only here can the
+    // model see that 「拆特ops」 three lines back and 「ChatOps」 now are the
+    // same term. Corrections arrive as the usual refined / translation
+    // events, so lines you already read get rewritten in place.
+    // Cost: one LLM call per interval while recording. Set enabled=false to
+    // keep captions purely local.
+    "review": {
+      "enabled": true,
+      // Every rewrite is written to the daily log as
+      //   [CAPTION] review seg=N src: 「before」 → 「after」
+      //   [CAPTION] review seg=N dst: 「before」 → 「after」
+      // one line per change (unchanged lines log nothing), so a session can
+      // be audited afterwards. The log is purged after 7 days.
+      // Review period in minutes — also the span each batch covers.
+      "interval_minutes": 1,
+      // Max lines per batch; the remainder waits for the next round. If a
+      // batch takes longer than interval_minutes the worker just runs the
+      // next one immediately, so it catches up rather than drifting — lower
+      // this if your provider is slow (measured: 53 s for 6 lines through the
+      // claude CLI, most of which is process startup).
+      "max_lines": 120,
+      // A line missing from the reply (truncated answer) is put back for
+      // another round, at most this many times.
+      "max_tries": 2,
+      // Empty = use polish_provider (claude / openai / gemini).
+      "provider": ""
+    },
+    // Voice-print speaker identification, on its own worker thread. After a
+    // line finalizes, cam++ extracts a 192-dim voice print from its audio
+    // (~60 ms on M2) and online-clusters it, so everyone gets their own
+    // 说话人N. BOTH channels are treated alike: the several people sharing
+    // the call's audio are separated, and so are several people sharing one
+    // microphone in a meeting room — the channel only tints the tag (blue for
+    // our side). The model is zh-CN trained but a voice print captures
+    // timbre, not language, so it separates speakers in English meetings too.
+    "speaker_id": {
+      "enabled": true,
+      // iic/speech_campplus_sv_zh-cn_16k-common, ~27 MB, auto-downloaded.
+      "model": "cam++",
+      // Cosine similarity for "same speaker". Lower = more merging (two
+      // people may share a label), higher = more splitting (one person may
+      // get several labels). Measured on cam++'s own sample voices: same
+      // speaker 0.694, different speakers -0.08 / 0.01 — so 0.5 sits clear
+      // of both, with margin for real VoIP audio scoring lower than clean
+      // studio samples.
+      "threshold": 0.5,
+      // Upper bound on distinct speakers; beyond it a new voice folds into
+      // the nearest known speaker instead of growing the list forever.
+      "max_speakers": 8,
+      // Segments shorter than this are skipped — too little audio for a
+      // reliable voice print.
+      "min_secs": 1.0,
+      // Queue cap; excess segments keep their channel-based label.
+      "max_backlog": 3
+    },
+    // Only consulted when mt_provider = "nllb".
+    "nllb": {
+      "mt_model": "facebook/nllb-200-distilled-600M",
+      // Dynamic int8 quantization: 2-4x faster on CPU with negligible
+      // quality loss. Disable if translations look degraded.
+      "mt_int8": true
+    },
+    // Caption translation engine (Scheme C).
+    //   qwen    = local Qwen small model via llama.cpp (GGUF, auto-downloaded,
+    //             ~1 GB). Hotwords from stt.funasr.hotword that appear in a
+    //             caption line are injected as a keep-verbatim glossary, so
+    //             domain terms survive translation. Falls back to "default"
+    //             automatically when llama-cpp-python isn't installed.
+    //   marian  = opus-mt Marian (default, fastest: 120-150 ms/line).
+    //   nllb    = NLLB-600M (760-1200 ms/line).
+    //             Measured on real meeting lines, the two trade wins on
+    //             domain terminology: NLLB kept "PoC" and translated
+    //             "parcels" correctly where opus-mt produced 「钻石交易市场」
+    //             and 「土地」; opus-mt kept "RFP" where NLLB dropped a
+    //             letter. Try both on your own audio.
+    //   default = same as marian.
+    // NOTE on qwen for English-source meetings: measured on 4 real English
+    // caption lines, the 1.5B model returned the corrected ENGLISH as its
+    // "translation" in 3 of 4 — it corrects well but does not reliably
+    // translate en->zh at this size. Prefer marian/nllb for English audio.
+    "mt_provider": "default",
+    "qwen": {
+      "model_repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+      "model_file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      // Local GGUF path; empty = auto-download model_repo/model_file into
+      // ~/Documents/meetingscribe/models/ on first use.
+      "model_path": "",
+      "n_ctx": 2048,
+      // llama.cpp thread count; 0 = auto.
+      "threads": 0,
+      // GPU offload layers: -1 = all (Metal on Apple Silicon — measured
+      // ~170x less CPU and 4x faster per line; auto-falls-back to CPU
+      // when no GPU). 0 = force CPU-only.
+      "n_gpu_layers": -1,
+      // Finalized lines use the combined correction+translation call
+      // (prompts.caption_fix_mt): fixes homophones / broken English words
+      // using recent context + the hotword list, and the corrected text
+      // replaces the caption line. false = translate only.
+      "correct": true,
+      // GBNF grammar: llama.cpp enforces the two-line 修正/翻译 contract at
+      // decode time, which structurally prevents the 1.5B model from leaking
+      // prompt text or looping forever. With the grammar on, the zero-shot
+      // prompt (prompts.caption_fix_mt_strict) is used instead of the
+      // few-shot one — the example is what the model copies from. Older
+      // llama-cpp-python builds without bounded repetition fall back to
+      // prompts.caption_fix_mt automatically (logged under [CAPTION]).
+      // Costs ~0.6 s per finalized line (measured 1.22 -> 1.80 s on M2
+      // Metal); set false to trade the format guarantee back for speed.
+      // Partial (in-flight) lines are never grammar-constrained.
+      "grammar": true,
+      // Only hotwords this line plausibly contains are injected as a
+      // glossary — literal hits plus fuzzy near-misses (拆特ops -> ChatOps),
+      // at most this many. Dumping all ~100 hotwords into every prompt is
+      // what made the model apply unrelated terms.
+      "glossary_max": 12
+    }
+  },
+
+  // ── Hotword auto-maintenance (Schemes A+B; writes back to
+  //    stt.funasr.hotword in THIS file — no extra state files) ────────────────
+  "hotwords": {
+    // Extract hotwords automatically after each notes/summary generation
+    // and merge them into stt.funasr.hotword (available from the NEXT
+    // recording; live-caption fast mode needs an app restart).
+    "auto_update": true,
+    // Scheme A: rule-based mining (English acronyms / CamelCase /
+    // digit-bearing terms) — no LLM cost.
+    "rule_extract": true,
+    // Scheme B: LLM terminology extraction (reuses meeting_notes_provider;
+    // runs in the offline notes phase, never in the realtime path).
+    "llm_extract": true,
+    // Hotword list cap; oldest entries are evicted first (rolling vocabulary).
+    "max_count": 100
+  },
+
   // ── Recording devices ───────────────────────────────────────────────────────
   // Recording sample rate (Hz); ideally match the device's native rate.
   "sample_rate": 48000,
@@ -55,7 +257,21 @@
       "vad_model": "fsmn-vad",
       // Punctuation restoration model.
       "punc_model": "ct-punc",
-      // Hotwords (space-separated); boosts recognition of proper nouns.
+      // Speaker diarization (voice-print clustering). Empty = off.
+      // "cam++" = on: transcript lines become [12.3s] [说话人1] … and the
+      // polish / notes prompts keep the speaker attribution.
+      // COST: speaker ids are only consistent within one generate() call, so
+      // turning this on disables chunked parallel transcription — a long
+      // recording runs single-pass and takes roughly `workers` times longer.
+      "spk_model": "",
+      // Hotwords (space-separated); boosts recognition of proper nouns
+      // (e.g. "sandbox API网关 AI agent Kong GKE"). Shared by batch
+      // transcription AND live captions (fast-mode captions pick up
+      // changes after an app restart). AUTO-MAINTAINED: the "hotwords"
+      // block above appends newly extracted terms here after every notes
+      // generation (and `python3 meetingscribe.py hotwords` backfills from
+      // existing recordings). Manual edits are kept — entries are only
+      // deduplicated, never rewritten.
       "hotword": ""
     },
     "openai": {
@@ -121,6 +337,15 @@
   //
   //   • polish    — proofread / clean the raw transcript (parallel,
   //                 chunked). **Mode-independent.**
+  //   • hotwords_extract — mine ASR hotwords from the polished transcript
+  //                 after notes generation (Scheme B of the hotword
+  //                 automation; results merge into stt.funasr.hotword).
+  //                 **Mode-independent.**
+  //   • caption_mt — live-caption translation prompt for the Qwen backend
+  //                 (live_captions.mt_provider = "qwen"). **Mode-independent.**
+  //   • caption_fix_mt — live-caption ASR-correction + translation combo
+  //                 prompt (Qwen backend, finalized lines only).
+  //                 **Mode-independent.**
   //   • meeting   → notes_zh / notes_en — meeting minutes (Chinese / English)
   //   • interview → notes_zh / notes_en — interview report (Chinese / English)
   //   • sharing   → notes_zh / notes_en — sharing summary / tech talk /
@@ -131,8 +356,12 @@
   // the conventional way to keep multi-line prompts readable. A single
   // string is also accepted.
   //
-  // Only `{transcript}` is recognised as a placeholder (case-sensitive,
-  // literal substitution); other curly braces do not need escaping.
+  // Placeholders are case-sensitive literal substitutions; other curly
+  // braces do not need escaping. `{transcript}` is the only placeholder
+  // for hotwords_extract / notes_*; polish additionally takes `{hotwords}`
+  // (the current stt.funasr.hotword list, injected automatically);
+  // caption_mt / caption_fix_mt use `{src_lang}` / `{dst_lang}` /
+  // `{glossary}` / `{text}` (+ `{context}` for caption_fix_mt) instead.
   // Delete the whole "prompts" block or any single key to fall back to
   // the built-in defaults in the code.
   "prompts": {
@@ -149,12 +378,114 @@
       "5. 删除重复内容——语音识别可能对相邻片段重复识别同一句话，检查前后句子，去掉重复的短语或句子",
       "6. 无法确定的内容用【？】标注",
       "7. 如能可靠区分不同发言者，请在段落前标注角色或姓名（如「面试官：」/「候选人：」/「主持人：」/具体姓名）；若无法可靠区分则不要强行标注",
+      "8. 若某行带 [说话人N] 前缀（声纹聚类结果），必须保留发言人区分：同一个 N 视为同一个人，可结合上下文把它替换成姓名或角色（如「说话人2」→「候选人」）；不要把不同 N 合并成一个人，也不要因为整理段落而丢掉发言人标注",
+      "",
+      "【术语表】以下是本场景常出现的专有名词（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）：",
+      "{hotwords}",
       "",
       "只输出整理后的正文，不要解释修改内容。",
       "",
       "---",
       "【原始转写】",
       "{transcript}"
+    ],
+    // Scheme B hotword mining: runs after each notes generation (offline
+    // phase, never in the realtime caption/recording path). The parsed
+    // terms merge into stt.funasr.hotword above.
+    "hotwords_extract": [
+      "你是一个语音识别热词提取助手。请从下面的文本中提取值得加入 ASR 热词表的词条，用于提升后续录音转写对专有名词的识别准确率。",
+      "",
+      "提取范围：产品名、项目名、公司名、团队名、人名、技术术语、英文缩写、中英混合词（如 API网关）。",
+      "",
+      "要求：",
+      "1. 只输出热词本身，全部放在同一行，词与词之间用单个空格分隔",
+      "2. 每个热词内部不能含空格；英文多词术语拆成单个单词分别输出",
+      "3. 优先选择语音识别容易写错的词，不要输出常见普通词汇",
+      "4. 最多 30 个；一个都没有时输出空行",
+      "5. 不要输出任何解释、编号、标点或其他内容",
+      "",
+      "---",
+      "【文本】",
+      "{transcript}"
+    ],
+    // Live-caption translation prompt for the Qwen backend
+    // (live_captions.mt_provider = "qwen"). Placeholders: {src_lang} /
+    // {dst_lang} (中文/英文), {glossary} (hotword keep-verbatim
+    // instruction, may be empty), {text} (the caption line). The
+    // Marian / NLLB backends are not prompt-driven and ignore this.
+    "caption_mt": [
+      "你是专业的同声传译引擎。请把下面这句{src_lang}口语翻译成{dst_lang}，保持口语化、简洁、自然；只输出译文，不要任何解释或标注。{glossary}",
+      "",
+      "【原文】",
+      "{text}"
+    ],
+    // Combined ASR-correction + translation prompt for the Qwen caption
+    // backend (FINALIZED lines only, gated by live_captions.qwen.correct;
+    // in-flight partials keep using caption_mt). Placeholders: {src_lang}
+    // / {dst_lang} (中文/英文), {glossary} (hotword instruction, may be
+    // empty), {context} (previous finalized lines for discourse context),
+    // {text} (the caption line). Output must be two lines 修正：/翻译：.
+    "caption_fix_mt": [
+      "你是实时字幕的校对与同声传译引擎。输入是一句{src_lang}流式语音识别结果，可能有同音字错误或残缺的英文单词。",
+      "规则：",
+      "- 只修正确定的识别错误（同音字、残缺英文词），修正后的词要与原词发音相近；不确定的保持原样；不改写语义、不增删内容、不替换人名",
+      "- 「修正」行必须仍是{src_lang}（修正后的完整原文，不是翻译，不能丢掉任何分句）；「翻译」行才是{dst_lang}译文，口语化、简洁",
+      "{glossary}",
+      "上文语境（仅供理解，不要输出）：",
+      "{context}",
+      "",
+      "输出格式示例（严格两行，无其他内容）：",
+      "修正：预算下周才能确认，我们先把接口文档写完",
+      "翻译：The budget won't be confirmed until next week; let's finish the API docs first.",
+      "",
+      "【原文】",
+      "{text}"
+    ],
+    // Zero-shot twin of caption_fix_mt, used when live_captions.qwen.grammar
+    // is on: the GBNF grammar pins the two-line format at decode time, so the
+    // format example is dropped — a 1.5B model copies example wording into
+    // its own output, and few-shot underperforms zero-shot at this size.
+    // Same placeholders and same 修正：/翻译： contract. When the grammar
+    // can't be built (older llama-cpp-python), caption_fix_mt above is used
+    // instead — there the example is what keeps the format honest, so keep
+    // both blocks in sync when editing the rules.
+    "caption_fix_mt_strict": [
+      "你是实时字幕的校对与同声传译引擎。输入是一句{src_lang}流式语音识别结果，可能有同音字错误或残缺的英文单词。",
+      "规则：",
+      "- 只修正确定的识别错误（同音字、残缺英文词），修正后的词要与原词发音相近；不确定的保持原样；不改写语义、不增删内容、不替换人名",
+      "- 「修正」行必须仍是{src_lang}（修正后的完整原文，不是翻译，不能丢掉任何分句）；「翻译」行才是{dst_lang}译文，口语化、简洁",
+      "{glossary}",
+      "上文语境（仅供理解，不要输出）：",
+      "{context}",
+      "",
+      "先输出「修正：」行，再输出「翻译：」行；两行之外不要输出任何内容。",
+      "",
+      "【原文】",
+      "{text}"
+    ],
+    // Periodic batch re-check of live captions (live_captions.review).
+    // Placeholders: {hotwords} (current stt.funasr.hotword list), {lines}
+    // (numbered "N ||| 原文 ||| 当前译文"). Output contract parsed by
+    // _parse_caption_review: one line per entry, "N ||| 修正后的原文 ||| 译文".
+    // Entries the model omits or mangles leave that caption untouched.
+    "caption_review": [
+      "你是会议实时字幕的校对助手。下面是最近一段会议的流式识别字幕，按顺序编号，每条包含识别原文和当前译文。流式识别常有同音字错误、残缺英文单词、错误断句，译文也会因此跟着错。",
+      "",
+      "请结合**整段上下文**和术语表，逐条给出修正后的原文与译文：",
+      "1. 只修正确定的识别错误（同音字、残缺或拼错的英文词、明显错词）；不确定的保持原样",
+      "2. 不要改写语气或风格，不要合并或拆分条目，不要增删内容——条数必须与输入完全一致",
+      "3. 人名、产品名、技术术语优先采用术语表中的写法",
+      "4. 译文必须与修正后的原文对应：中文原文译成英文，英文原文译成中文；口语化、简洁",
+      "5. 无需修改的条目也要原样输出",
+      "",
+      "【术语表】（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）",
+      "{hotwords}",
+      "",
+      "【字幕】",
+      "{lines}",
+      "",
+      "严格按下面格式输出，每行一条，除此之外不要输出任何内容：",
+      "编号 ||| 修正后的原文 ||| 译文"
     ],
     "meeting": {
       "notes_zh": [

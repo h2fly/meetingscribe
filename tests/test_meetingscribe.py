@@ -2452,3 +2452,131 @@ class TestSharingMode:
         assert "bogus" in err or "invalid choice" in err
         # The valid choices should be mentioned somewhere in the message.
         assert "sharing" in err or "meeting" in err
+
+
+class TestQuietCaptureProgressFilter:
+    """tqdm redraws with \\r and str.splitlines() splits on it, so one FunASR
+    call used to land as hundreds of bar frames in the daily log (~5 000 of
+    8 583 [CAPTION] lines in a single caption session). Frames are dropped;
+    everything else must still reach the log."""
+
+    def _capture(self, monkeypatch, emit: str):
+        logged: list = []
+        monkeypatch.setattr(ms, "_log", lambda cat, msg: logged.append((cat, msg)))
+        with ms._QuietCapture("STT"):
+            sys.stdout.write(emit)
+        return [msg for _, msg in logged]
+
+    def test_tqdm_bar_frames_dropped(self, monkeypatch):
+        bar = ("\r  0%|          | 0/1 [00:00<?, ?it/s]"
+               "\r100%|##########| 1/1 [00:01<00:00,  1.13s/it]\n")
+        assert self._capture(monkeypatch, bar) == []
+
+    def test_ansi_coloured_bar_dropped(self, monkeypatch):
+        coloured = ("\x1b[A  0%|\x1b[34m          \x1b[0m| 0/1 "
+                    "[00:00<?, ?it/s]\x1b[A\n")
+        assert self._capture(monkeypatch, coloured) == []
+
+    def test_real_diagnostics_still_logged(self, monkeypatch):
+        out = self._capture(monkeypatch, "rtf_avg: 0.123\nUserWarning: heads up\n")
+        assert out == ["rtf_avg: 0.123", "UserWarning: heads up"]
+
+    def test_ansi_stripped_from_kept_lines(self, monkeypatch):
+        out = self._capture(monkeypatch, "\x1b[31mERROR: boom\x1b[0m\n")
+        assert out == ["ERROR: boom"]
+
+    def test_blank_lines_dropped(self, monkeypatch):
+        assert self._capture(monkeypatch, "\n   \n\n") == []
+
+    def test_category_preserved_and_streams_restored(self, monkeypatch):
+        logged: list = []
+        monkeypatch.setattr(ms, "_log", lambda cat, msg: logged.append((cat, msg)))
+        saved_out, saved_err = sys.stdout, sys.stderr
+        with ms._QuietCapture("CAPTION"):
+            print("hello")
+        assert logged == [("CAPTION", "hello")]
+        assert sys.stdout is saved_out and sys.stderr is saved_err
+
+    def test_exceptions_not_swallowed(self, monkeypatch):
+        monkeypatch.setattr(ms, "_log", lambda cat, msg: None)
+        with pytest.raises(ValueError):
+            with ms._QuietCapture("STT"):
+                raise ValueError("boom")
+
+
+class TestDevicePlanLogThrottle:
+    """The plan is re-derived every monitor tick — once a second while
+    recording. Logging each one made it 37% of a day's log (7385 lines, 3
+    distinct values). Repeats are throttled; changes are not."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        ms._device_plan_log_state.update(msg=None, at=0.0)
+        yield
+        ms._device_plan_log_state.update(msg=None, at=0.0)
+
+    def _sink(self, monkeypatch):
+        out = []
+        monkeypatch.setattr(ms, "_log", lambda cat, msg: out.append((cat, msg)))
+        return out
+
+    def test_first_line_always_logged(self, monkeypatch):
+        out = self._sink(monkeypatch)
+        ms._log_device_plan("plan: mic='A' sys='B'")
+        assert out == [("DEVICE", "plan: mic='A' sys='B'")]
+
+    def test_identical_repeat_suppressed(self, monkeypatch):
+        out = self._sink(monkeypatch)
+        for _ in range(5):
+            ms._log_device_plan("plan: mic='A' sys='B'")
+        assert len(out) == 1
+
+    def test_change_bypasses_the_throttle(self, monkeypatch):
+        """A device swap must never wait for the heartbeat window."""
+        out = self._sink(monkeypatch)
+        ms._log_device_plan("plan: mic='A' sys='B'")
+        ms._log_device_plan("plan: mic='USB headset' sys='B'")
+        assert len(out) == 2
+
+    def test_warning_change_also_bypasses(self, monkeypatch):
+        out = self._sink(monkeypatch)
+        ms._log_device_plan("plan: mic='A' warnings=[]")
+        ms._log_device_plan("plan: mic='A' warnings=['no-mic']")
+        assert len(out) == 2
+
+    def test_heartbeat_after_the_interval(self, monkeypatch):
+        out = self._sink(monkeypatch)
+        ms._log_device_plan("plan: mic='A'")
+        # Backdate the last emission past the heartbeat window.
+        ms._device_plan_log_state["at"] -= ms._DEVICE_PLAN_LOG_INTERVAL_SEC + 0.1
+        ms._log_device_plan("plan: mic='A'")
+        assert len(out) == 2
+
+    def test_flip_flopping_plans_both_logged(self, monkeypatch):
+        out = self._sink(monkeypatch)
+        for msg in ("plan: A", "plan: B", "plan: A", "plan: B"):
+            ms._log_device_plan(msg)
+        assert len(out) == 4      # every transition is a real event
+
+    def test_one_second_ticks_collapse_by_three(self, monkeypatch):
+        """The measured real-world pattern: identical plan, one tick a second
+        for 9 s. 7385 such lines in one day became 37% of the log."""
+        out = self._sink(monkeypatch)
+        clock = [1000.0]
+        monkeypatch.setattr(ms.time, "time", lambda: clock[0])
+        for _ in range(9):
+            ms._log_device_plan("plan: steady")
+            clock[0] += 1.0
+        # t=0 logs, then only t=3 and t=6 clear the 3 s heartbeat.
+        assert len(out) == 3
+
+    def test_change_midway_through_steady_ticks(self, monkeypatch):
+        out = self._sink(monkeypatch)
+        clock = [1000.0]
+        monkeypatch.setattr(ms.time, "time", lambda: clock[0])
+        for i in range(6):
+            ms._log_device_plan("plan: B" if i == 2 else "plan: A")
+            clock[0] += 1.0
+        # t=0 A, t=2 B (change), t=3 A (change back), t=6 would be next
+        # heartbeat but the loop ends at t=5 → 3 lines, none of them delayed.
+        assert [m for _, m in out] == ["plan: A", "plan: B", "plan: A"]

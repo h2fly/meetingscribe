@@ -76,10 +76,14 @@ meetingscribe.py — 录音 → 转写 → 校对 → 纪要/面试总结/分享
 
 import argparse
 import atexit
+import collections
 import copy
+import html
 import json
 import math
 import os
+import queue
+import re
 import signal
 import sys
 import threading
@@ -204,12 +208,33 @@ def _dbg(msg: str):
     _log("DEBUG", msg)
 
 
+# ANSI colour codes plus tqdm's bar / rate syntax. tqdm redraws with \r, and
+# str.splitlines() splits on \r too, so a single 60-second FunASR call lands
+# as hundreds of near-identical bar frames in the log (measured: ~5 000 of
+# the 8 583 [CAPTION] lines in one 30-minute caption session, 1.3 MB/day).
+# The frames carry no diagnostic value — timings we actually care about are
+# logged explicitly by their call sites — so _QuietCapture drops them.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_PROGRESS_NOISE_RE = re.compile(
+    r"^\s*\d{1,3}%\s*\|"            # "  0%|" / "100%|" bar prefix
+    r"|\d+/\d+\s*\[\d{2}:\d{2}"     # " 1/1 [00:01<00:00, …"
+    r"|\?it/s|\bit/s\]|\bs/it\]"    # rate suffixes, incl. the "?it/s" start
+)
+
+
+def _is_progress_noise(line: str) -> bool:
+    """True for tqdm bar frames / bare terminal control leftovers."""
+    return not line or bool(_PROGRESS_NOISE_RE.search(line))
+
+
 class _QuietCapture:
     """Context manager: redirect stdout+stderr into in-memory buffers, then
     forward the captured lines to _log(category, ...) on exit. Used around
     third-party libraries (FunASR) whose tqdm progress bars
     and per-frame timing dicts would otherwise drown the console. The captured
-    text still lands in the daily log file, just not in front of the user.
+    text still lands in the daily log file, just not in front of the user —
+    except tqdm progress frames, which are dropped entirely (see
+    `_is_progress_noise`): they made the caption log unreadable and unsearchable.
     """
     def __init__(self, category: str):
         self._category = category
@@ -230,9 +255,10 @@ class _QuietCapture:
         for buf in (self._sio_out, self._sio_err):
             text = buf.getvalue()
             for raw in text.splitlines():
-                line = raw.strip()
-                if line:
-                    _log(self._category, line)
+                line = _ANSI_RE.sub("", raw).strip()
+                if _is_progress_noise(line):
+                    continue
+                _log(self._category, line)
         return False  # don't swallow exceptions
 
 
@@ -498,19 +524,25 @@ def _indexerror_came_from_jieba(exc: BaseException) -> bool:
     return False
 
 
-def _load_funasr_automodel(asr_model: str, vad_model: str, punc_model: str):
+def _load_funasr_automodel(asr_model: str, vad_model: str, punc_model: str,
+                           spk_model: str = ""):
     """Construct ``funasr.AutoModel`` with self-healing for the jieba dict bug.
 
     On the first ``IndexError`` whose traceback originates in jieba, patch
     malformed ``jieba_usr_dict`` files under the modelscope cache and retry
     once with identical kwargs. If the retry fails, raise the *original*
     IndexError with the new failure chained via ``raise … from …``.
+
+    ``spk_model`` (e.g. ``"cam++"``) adds speaker diarization: results then
+    carry a ``sentence_info`` list whose entries have a ``spk`` cluster id.
     """
     from funasr import AutoModel
     kwargs = dict(
         model=asr_model, vad_model=vad_model, punc_model=punc_model,
         disable_update=True,
     )
+    if spk_model:
+        kwargs["spk_model"] = spk_model
     try:
         return AutoModel(**kwargs)
     except IndexError as original_err:
@@ -525,6 +557,88 @@ def _load_funasr_automodel(asr_model: str, vad_model: str, punc_model: str):
             return AutoModel(**kwargs)
         except Exception as retry_err:
             raise original_err from retry_err
+
+
+def _funasr_cache_key(asr_model: str, vad_model: str, punc_model: str,
+                      spk_model: str = ""):
+    """Key for `_funasr_model_cache`. Stays a 3-tuple without diarization so
+    the batch pipeline and the live-caption refine pass keep SHARING one
+    paraformer-large instance (~1 GB) instead of loading it twice."""
+    base = (asr_model, vad_model, punc_model)
+    return base + (spk_model,) if spk_model else base
+
+
+def _spk_label(spk, order: dict) -> str:
+    """Stable 1-based display label for a FunASR speaker cluster id.
+
+    FunASR hands back ints (0-based) on some versions and strings on others,
+    and clusters are numbered in the order the model happened to find them —
+    so labels are assigned by first appearance in the transcript instead.
+    """
+    key = str(spk)
+    if key not in order:
+        order[key] = len(order) + 1
+    return f"说话人{order[key]}"
+
+
+def _spk_lines(items, offset_s: float = 0.0) -> "list[str]":
+    """Format FunASR diarization output into `[12.3s] [说话人1] …` lines.
+
+    Reads the ``sentence_info`` payload that appears when AutoModel was built
+    with a ``spk_model``. Consecutive sentences from the same speaker merge
+    into one line — one line per sentence would bury the turn structure the
+    notes prompts are supposed to read. Returns ``[]`` when no usable
+    sentence_info is present, so callers can fall back to unlabelled lines
+    rather than losing the transcript to a FunASR version difference.
+    """
+    if not items:
+        return []
+    order: dict = {}
+    lines: list[str] = []
+    cur_label = None
+    cur_start = None
+    cur_texts: list[str] = []
+
+    def _flush():
+        if not cur_texts:
+            return
+        body = "".join(cur_texts).strip()
+        if not body:
+            return
+        if cur_start is not None:
+            lines.append(f"[{cur_start:05.1f}s] [{cur_label}] {body}")
+        else:
+            lines.append(f"[{cur_label}] {body}")
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for sent in (item.get("sentence_info") or []):
+            if not isinstance(sent, dict):
+                continue
+            text = str(sent.get("text") or "").strip()
+            if not text:
+                continue
+            label = _spk_label(sent.get("spk", 0), order)
+            start_s = None
+            try:
+                raw = sent.get("start")
+                if raw is None:
+                    ts = sent.get("timestamp")
+                    raw = ts[0][0] if ts and len(ts[0]) else None
+                if raw is not None:
+                    start_s = float(raw) / 1000.0 + offset_s
+            except (TypeError, ValueError, IndexError):
+                start_s = None
+            if label != cur_label:
+                _flush()
+                cur_label, cur_start, cur_texts = label, start_s, [text]
+            else:
+                if cur_start is None:
+                    cur_start = start_s
+                cur_texts.append(text)
+    _flush()
+    return lines
 
 
 # ── Prompt defaults ──────────────────────────────────────────────────────────
@@ -562,12 +676,122 @@ _PROMPT_DEFAULTS: dict = {
 5. 删除重复内容——语音识别可能对相邻片段重复识别同一句话，检查前后句子，去掉重复的短语或句子
 6. 无法确定的内容用【？】标注
 7. 如能可靠区分不同发言者，请在段落前标注角色或姓名（如「面试官：」/「候选人：」/「主持人：」/具体姓名）；若无法可靠区分则不要强行标注
+8. 若某行带 [说话人N] 前缀（声纹聚类结果），必须保留发言人区分：同一个 N 视为同一个人，可结合上下文把它替换成姓名或角色（如「说话人2」→「候选人」）；不要把不同 N 合并成一个人，也不要因为整理段落而丢掉发言人标注
+
+【术语表】以下是本场景常出现的专有名词（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）：
+{hotwords}
 
 只输出整理后的正文，不要解释修改内容。
 
 ---
 【原始转写】
 {transcript}
+""",
+    # ``hotwords_extract`` is mode-agnostic. Scheme B of the hotword
+    # automation: after notes generation the pipeline mines the polished
+    # transcript for ASR hotwords and merges them into
+    # `stt.funasr.hotword` in config.jsonc, so the NEXT recording already
+    # benefits. (Scheme A is the rule-based miner
+    # `_extract_hotword_candidates` — no LLM involved.)
+    "hotwords_extract": """\
+你是一个语音识别热词提取助手。请从下面的文本中提取值得加入 ASR 热词表的词条，用于提升后续录音转写对专有名词的识别准确率。
+
+提取范围：产品名、项目名、公司名、团队名、人名、技术术语、英文缩写、中英混合词（如 API网关）。
+
+要求：
+1. 只输出热词本身，全部放在同一行，词与词之间用单个空格分隔
+2. 每个热词内部不能含空格；英文多词术语拆成单个单词分别输出
+3. 优先选择语音识别容易写错的词，不要输出常见普通词汇
+4. 最多 30 个；一个都没有时输出空行
+5. 不要输出任何解释、编号、标点或其他内容
+
+---
+【文本】
+{transcript}
+""",
+    # ``caption_mt`` drives the live captions' Qwen translation backend
+    # (live_captions.mt_provider = "qwen"). Placeholders (literal
+    # str.replace, same as {transcript} elsewhere): {src_lang} /
+    # {dst_lang} = 中文/英文, {glossary} = 命中的热词术语表指令（可为空）,
+    # {text} = 原文。The Marian / NLLB backends are not prompt-driven and
+    # ignore this template.
+    "caption_mt": """\
+你是专业的同声传译引擎。请把下面这句{src_lang}口语翻译成{dst_lang}，保持口语化、简洁、自然；只输出译文，不要任何解释或标注。{glossary}
+
+【原文】
+{text}
+""",
+    # ``caption_fix_mt`` is the combined ASR-correction + translation
+    # prompt for the Qwen caption backend (used for FINALIZED lines when
+    # live_captions.qwen.correct is on; partials keep using caption_mt).
+    # Placeholders: {src_lang} / {dst_lang} (中文/英文), {glossary}（术语表
+    # 指令，可为空）, {context}（前几句定稿字幕，语境用）, {text}（原文）。
+    # Output contract parsed by `_parse_fix_mt`: two lines 修正：/翻译：.
+    "caption_fix_mt": """\
+你是实时字幕的校对与同声传译引擎。输入是一句{src_lang}流式语音识别结果，可能有同音字错误或残缺的英文单词。
+规则：
+- 只修正确定的识别错误（同音字、残缺英文词），修正后的词要与原词发音相近；不确定的保持原样；不改写语义、不增删内容、不替换人名
+- 「修正」行必须仍是{src_lang}（修正后的完整原文，不是翻译，不能丢掉任何分句）；「翻译」行才是{dst_lang}译文，口语化、简洁
+{glossary}
+上文语境（仅供理解，不要输出）：
+{context}
+
+输出格式示例（严格两行，无其他内容）：
+修正：预算下周才能确认，我们先把接口文档写完
+翻译：The budget won't be confirmed until next week; let's finish the API docs first.
+
+【原文】
+{text}
+""",
+    # ``caption_fix_mt_strict`` is the zero-shot twin of ``caption_fix_mt``,
+    # used when GBNF grammar is active (live_captions.qwen.grammar, default
+    # on): the two-line contract is then enforced by the llama.cpp decoder,
+    # so the format example can go away — and it should, because a 1.5B model
+    # copies example wording into its own output (measured failure mode) and
+    # few-shot prompting underperforms zero-shot at this size. Same
+    # placeholders and same `_parse_fix_mt` output contract as caption_fix_mt,
+    # which stays in use when the grammar can't be built (older
+    # llama-cpp-python) — there the example is what keeps the format honest.
+    "caption_fix_mt_strict": """\
+你是实时字幕的校对与同声传译引擎。输入是一句{src_lang}流式语音识别结果，可能有同音字错误或残缺的英文单词。
+规则：
+- 只修正确定的识别错误（同音字、残缺英文词），修正后的词要与原词发音相近；不确定的保持原样；不改写语义、不增删内容、不替换人名
+- 「修正」行必须仍是{src_lang}（修正后的完整原文，不是翻译，不能丢掉任何分句）；「翻译」行才是{dst_lang}译文，口语化、简洁
+{glossary}
+上文语境（仅供理解，不要输出）：
+{context}
+
+先输出「修正：」行，再输出「翻译：」行；两行之外不要输出任何内容。
+
+【原文】
+{text}
+""",
+    # ``caption_review`` is the periodic batch re-check of live captions
+    # (live_captions.review): every N minutes the finalized lines of the
+    # last N minutes go to the SAME provider that polishes transcripts, with
+    # the whole window as context — which is why it catches what the
+    # per-line passes cannot. Placeholders: {hotwords} (the current
+    # stt.funasr.hotword list), {lines} (numbered `N ||| 原文 ||| 当前译文`).
+    # Output contract parsed by `_parse_caption_review`: one line per entry,
+    # `N ||| 修正后的原文 ||| 译文`.
+    "caption_review": """\
+你是会议实时字幕的校对助手。下面是最近一段会议的流式识别字幕，按顺序编号，每条包含识别原文和当前译文。流式识别常有同音字错误、残缺英文单词、错误断句，译文也会因此跟着错。
+
+请结合**整段上下文**和术语表，逐条给出修正后的原文与译文：
+1. 只修正确定的识别错误（同音字、残缺或拼错的英文词、明显错词）；不确定的保持原样
+2. 不要改写语气或风格，不要合并或拆分条目，不要增删内容——条数必须与输入完全一致
+3. 人名、产品名、技术术语优先采用术语表中的写法
+4. 译文必须与修正后的原文对应：中文原文译成英文，英文原文译成中文；口语化、简洁
+5. 无需修改的条目也要原样输出
+
+【术语表】（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）
+{hotwords}
+
+【字幕】
+{lines}
+
+严格按下面格式输出，每行一条，除此之外不要输出任何内容：
+编号 ||| 修正后的原文 ||| 译文
 """,
     "meeting": {
         "notes_zh": """\
@@ -765,6 +989,107 @@ DEFAULT_CONFIG = {
     "transcribe_provider": "funasr",
     "polish_provider": "claude",
     "meeting_notes_provider": "claude",
+    # ── 实时双语字幕（GUI 录音页；全本地推理）──────────────────────────────
+    "live_captions": {
+        "enabled": True,           # GUI 字幕面板开关的默认值
+        # 识别链路只有一条：sherpa-onnx 流式 zipformer（中英双语）+ opus-mt 翻译，
+        # 定稿行再用离线 FunASR 大模型做 refine 二次校验。原来的「准确模式」
+        # （FunASR 流式 2pass + NLLB）已移除——它的流式模型是纯中文的，英文会话
+        # 上明显更差，而它的 NLLB 翻译仍可通过 mt_provider="nllb" 单独选用。
+        "asr_model_dir": "",       # 留空 = 首次使用时自动下载流式 zipformer 中英双语模型
+        "mt_zh_en": "Helsinki-NLP/opus-mt-zh-en",
+        "mt_en_zh": "Helsinki-NLP/opus-mt-en-zh",
+        "refine": True,            # 句子定稿后用离线 FunASR 大模型后台二次校验并替换
+        # 二次校验的最大排队段数（每段约 1.0-1.4 秒）。语速快时超出的段
+        # 直接跳过——迟到几十秒的修正没有价值，还会拖住后面的段。
+        "refine_max_backlog": 3,
+        "partial_interval_ms": 500,  # 进行中字幕的最小刷新间隔（调大 = 更稳定不闪跳）
+        # 显示层段落合并：相邻两句定稿间隔 ≤ 此毫秒数时合并为同一段显示
+        # （只影响展示，不影响识别/翻译数据）。0 = 不合并。
+        "merge_gap_ms": 2500,
+        # 字幕面板回看时长（分钟）：滚轮往上翻能看到最近这么久的字幕。
+        # 按时间保留，与语速无关；0 = 不按时间淘汰（只受 history_max 限制）。
+        "history_minutes": 180,
+        # 行数上限，仅作内存兜底（12000 行 ≈ 3 小时 × 66 行/分钟的极端语速）。
+        # 实测每行重绘成本约 11.6 µs，重绘间隔会随行数自动放宽。
+        "history_max": 12000,
+        # 字幕面板重绘合并窗口（毫秒）：把突发的 partial/translation/refined
+        # 事件合并成每窗口一次 setHtml()，消除滚动条闪烁。0 = 每事件立即重绘。
+        "render_debounce_ms": 120,
+        # 字幕行前标注声道来源（[我方] / [对方]）：按每段音频里哪一路
+        # （麦克风 / 系统音）相对能量更大来归属。这只是「哪一侧」，不是身份，
+        # 用作 speaker_id 出结果前的兜底；只有一路有声音时不标注。
+        "speaker_labels": True,
+        # 定期批量复核（独立线程）：每 interval_minutes 把这段时间的定稿字幕
+        # 连同当前译文整批交给大模型（默认复用 polish_provider），带整段上下文
+        # 重新校对并重译。这是唯一能利用「跨句上下文」的一层——单句 pass 不可能
+        # 知道三句前的「拆特ops」和现在的「ChatOps」是同一个词。
+        # 代价：每 interval_minutes 一次 LLM 调用（录音期间）。
+        "review": {
+            "enabled": True,
+            "interval_minutes": 5,   # 复核周期（分钟），也就是每批覆盖的时长
+            # 单批最多送多少行，超出的留到下一批。约束是「输出 token」而不是
+            # 上下文窗口：模型要把每行重新吐一遍，实测 120 行 ≈ 入 5.6k / 出
+            # 5.2k tok，刚好在常见的 8k 输出上限之下；而实测语速 6.1 行/分钟，
+            # 一个 5 分钟周期只攒约 30 行，120 已是 4 倍余量。
+            "max_lines": 120,
+            "max_tries": 2,          # 回复里漏掉的行最多重投几次
+            "provider": "",          # 留空 = 用 polish_provider
+        },
+        # 声纹识别（独立线程）：定稿后用 cam++ 提取 192 维声纹（约 60ms），
+        # 在线聚类。两个声道一视同仁——会议室里几个人共用一支麦克风也能分开，
+        # 所有人统一编号为「说话人1/2/3」，声道只决定标签颜色（蓝=我方一侧）。
+        "speaker_id": {
+            "enabled": True,
+            "model": "cam++",      # iic/speech_campplus_sv_zh-cn_16k-common（约 27MB，首次自动下载）
+            "threshold": 0.5,      # 余弦相似度阈值：调低=更容易并成同一个人，调高=更容易分裂
+            "max_speakers": 8,     # 上限；超出后新声音并入最近的已知说话人
+            "min_secs": 1.0,       # 短于此长度的片段不做声纹（太短不可靠）
+            "max_backlog": 3,      # 排队上限，超出的片段跳过识别
+        },
+        # 仅在 mt_provider="nllb" 时使用
+        "nllb": {
+            "mt_model": "facebook/nllb-200-distilled-600M",
+            "mt_int8": True,       # 动态 int8 量化（CPU 提速 2-4 倍，质量损失极小）
+        },
+        # 字幕翻译引擎（方案 C）：qwen = 本地 Qwen 小模型（llama.cpp/GGUF），
+        # 命中 stt.funasr.hotword 的术语会作为术语表注入翻译 prompt（译文保留原样）；
+        # 不可用（未装 llama-cpp-python / 模型下载失败）时自动回退到 default。
+        # marian（默认）/ nllb = 指定 MT 模型（实测两者在术语上互有胜负，
+        # NLLB 慢 6-8 倍）。default 等同 marian。
+        # 注意：英文源句上 1.5B 的 qwen 经常把「翻译」行吐回英文（实测 4 句中 3
+        # 句），英文会议建议用 marian / nllb。
+        "mt_provider": "qwen",
+        "qwen": {
+            "model_repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+            "model_file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            "model_path": "",      # 本地 GGUF 路径；留空 = 首次使用时自动下载 model_repo/model_file
+            "n_ctx": 2048,
+            "threads": 0,          # llama.cpp 线程数；0 = 自动
+            # GPU offload 层数：-1 = 全部（macOS Metal，实测 CPU 占用降 ~170 倍
+            # 且快 4 倍；无 GPU 时 llama.cpp 自动回退 CPU）；0 = 强制纯 CPU。
+            "n_gpu_layers": -1,
+            # 定稿行走"纠错+翻译"合并调用（prompts.caption_fix_mt）：
+            # 用前几句上下文 + 热词表修正同音字/残缺英文词，修正结果替换
+            # 字幕行。false = 只翻译不纠错。
+            "correct": True,
+            # GBNF 语法约束（llama.cpp 解码期强制输出格式）。开启时改用
+            # prompts.caption_fix_mt_strict（零样本，无格式示例）——格式由语法
+            # 保证，示例反而会被 1.5B 模型抄进译文。语法不可用（旧版
+            # llama-cpp-python）时自动回退到带示例的 caption_fix_mt。
+            "grammar": True,
+            # 术语表注入上限：只注入本行命中（含发音近似）的热词，最多这么多条。
+            # 整表灌进 prompt（热词可达 100 条）是模型胡乱套用术语的主因。
+            "glossary_max": 12,
+        },
+    },
+    # ── 热词自动维护（方案 A+B；写回本文件的 stt.funasr.hotword）────────────
+    "hotwords": {
+        "auto_update": True,       # 纪要/总结生成后自动提取热词并合并进 stt.funasr.hotword
+        "rule_extract": True,      # A：规则法（英文缩写/驼峰/含数字词等，无 LLM 开销）
+        "llm_extract": True,       # B：LLM 术语提取（复用 meeting_notes_provider，离线阶段执行）
+        "max_count": 100,          # 热词总量上限；超出时最早加入的先被淘汰
+    },
     # ── 录音设备 ──────────────────────────────────────────────────────────
     "sample_rate": 48000,
     "channels": 3,
@@ -780,6 +1105,10 @@ DEFAULT_CONFIG = {
             "model": "paraformer-zh",   # ASR 模型（首次运行自动下载）
             "vad_model": "fsmn-vad",    # VAD 分句模型，支持长音频
             "punc_model": "ct-punc",    # 标点恢复模型
+            # 说话人区分（声纹聚类）。留空 = 关闭；"cam++" = 开启，转写行变成
+            # [12.3s] [说话人1] …。注意：为保证说话人编号全程一致，开启后会
+            # 放弃分块并发、单趟转写，长录音耗时明显变长（约 chunk 并发数倍）。
+            "spk_model": "",
             "hotword": "",              # 热词（空格分隔），提升专有名词识别率
         },
         "openai": {
@@ -2108,6 +2437,32 @@ def _is_physical_output(name: str | None, transport: dict[str, str]) -> bool:
     return True
 
 
+# The resolved plan is re-derived on every monitor tick — once a second while
+# recording, from the recorder's own monitor fallback. Logging it each time
+# made it 37 % of a day's log (7 385 lines, only 3 distinct values, 6 191 of
+# the gaps exactly 1 s). A CHANGE is what has diagnostic value, so a change
+# prints immediately and identical repeats are throttled to a heartbeat. The
+# heartbeat can be raised freely — nothing is lost, since changes bypass it.
+_DEVICE_PLAN_LOG_INTERVAL_SEC = 3.0
+_device_plan_log_state: dict = {"msg": None, "at": 0.0}
+
+
+def _log_device_plan(msg: str) -> None:
+    """Log the resolved audio plan, collapsing identical repeats.
+
+    Racy by design across the monitor threads: the worst outcome of two
+    threads passing the check together is one extra identical line, which is
+    cheaper than serialising every device resolution behind a lock.
+    """
+    now = time.time()
+    if (msg == _device_plan_log_state["msg"]
+            and now - _device_plan_log_state["at"] < _DEVICE_PLAN_LOG_INTERVAL_SEC):
+        return
+    _device_plan_log_state["msg"] = msg
+    _device_plan_log_state["at"] = now
+    _log("DEVICE", msg)
+
+
 def resolve_audio_devices(query_fresh: bool = False) -> AudioPlan:
     """Single source of truth for audio device selection across the recording lifecycle.
 
@@ -2182,11 +2537,10 @@ def resolve_audio_devices(query_fresh: bool = False) -> AudioPlan:
         is_external_output=is_external,
         warnings=warnings,
     )
-    _log(
-        "DEVICE",
+    _log_device_plan(
         f"plan: mic={mic_name!r} sys={sys_source_name!r} "
         f"multi={multi_out!r} restore={restore!r} "
-        f"external={is_external} warnings={warnings}",
+        f"external={is_external} warnings={warnings}"
     )
     return plan
 
@@ -2663,6 +3017,7 @@ class MultiStreamRecorder:
 
     on_device_added: "callable | None" = None  # callback(device_name: str)
     on_warning: "callable | None" = None       # callback(code: str)
+    on_audio_chunk: "callable | None" = None   # callback(role, frames, samplerate) — live-caption tap
 
     def __init__(self, wanted: list, sample_rate: int, role_labels: list[str] | None = None):
         # wanted: 期望录制的设备名列表（保序，决定 L/R 声道分配）
@@ -2714,9 +3069,22 @@ class MultiStreamRecorder:
         return None
 
     def _make_cb(self, device: str):
+        try:
+            role = self.role_labels[self.wanted.index(device)]
+        except (ValueError, IndexError):
+            role = device
         def _cb(indata, frames, time_info, status):
             if self.recording:
-                self._frames[device].append(indata.copy())  # GIL 保护 list.append
+                data = indata.copy()
+                self._frames[device].append(data)  # GIL 保护 list.append
+                hook = self.on_audio_chunk
+                if hook is not None:
+                    # Same copy the recorder keeps — the tap never mutates it.
+                    # hook must be non-blocking (PortAudio callback thread).
+                    try:
+                        hook(role, data, self.sample_rate)
+                    except Exception:
+                        pass  # never let the tap break capture
                 if _DEBUG:
                     self._rms[device] = float(np.sqrt(np.mean(indata ** 2)))
         return _cb
@@ -3001,7 +3369,10 @@ class MultiStreamRecorder:
             frames = self._frames.get(device, [])
             if frames:
                 audio = np.concatenate(frames)
-                channels.append(audio[:, 0] if audio.ndim > 1 else audio)
+                # Downmix the device's own channels (see LiveCaptionEngine.feed):
+                # channel 0 alone loses anything panned right.
+                channels.append(
+                    audio.mean(axis=1) if audio.ndim > 1 else audio)
             else:
                 channels.append(None)  # 该设备未录到任何数据
 
@@ -3043,6 +3414,1921 @@ class MultiStreamRecorder:
         return True
 
 
+# ── 实时双语字幕引擎 ─────────────────────────────────────────────────────────
+
+_CAPTION_SAMPLE_RATE = 16000       # every caption ASR backend consumes 16 kHz mono
+# Peak RMS above which a source counts as "heard" for speaker attribution.
+# 0.01 was measured too high: a built-in mic at conversational distance sits
+# around 0.003-0.008 per 250 ms window, so neither source ever qualified.
+_CAPTION_ROLE_RMS_FLOOR = 0.002
+_CAPTION_RING_SECONDS = 30.0       # per-source backlog cap while models are loading
+_CAPTION_PACER_INTERVAL = 0.25     # seconds between drain/mix/feed iterations
+
+_SHERPA_ZIPFORMER_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2"
+)
+
+# Heavy caption backends survive across recording sessions so a new recording
+# doesn't re-load multi-GB models. Keyed ("asr"|"mt", mode); ASR entries get
+# reset_session() before reuse.
+_caption_backend_cache: dict = {}
+
+
+def _caption_resample(x: "np.ndarray", sr_from: int, sr_to: int = _CAPTION_SAMPLE_RATE) -> "np.ndarray":
+    """Linear-interpolation mono resample; fidelity is plenty for ASR feeds."""
+    x = np.asarray(x, dtype=np.float32)
+    if sr_from == sr_to or x.size == 0:
+        return x
+    n_out = int(round(x.size * sr_to / sr_from))
+    if n_out <= 0:
+        return np.zeros(0, dtype=np.float32)
+    xp = np.linspace(0.0, 1.0, num=x.size, endpoint=False)
+    xq = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(xq, xp, x).astype(np.float32)
+
+
+def _caption_is_english(text: str) -> bool:
+    """Crude language sniff: mostly ASCII letters → treat as English source."""
+    letters = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    return letters >= 3 and letters >= 3 * max(cjk, 1)
+
+
+# Pure filler syllables safe to drop anywhere. Grammatical sentence
+# particles (呢 / 啊 / 吧 / 嘛 / 呀) intentionally stay — they carry tone.
+# Multi-char interjections listed before their single-char substrings.
+_CAPTION_FILLERS = ("哎呀", "哎哟", "哎呦", "嗯", "呃", "唉", "哎")
+
+# 2-char stutter collapse whitelist: characters that never legitimately
+# reduplicate as a word. Deliberately excludes verbs like 看/说/做/听/问
+# ("看看" / "说说" are valid soft-imperatives) and words like 好/慢/常/明
+# ("好好" / "慢慢" / "常常" / "明明" are valid). Applied AFTER the 3+ char
+# collapse so cases like 「都都都 → 都」 still work at that rule.
+_CAPTION_STUTTER_2CHAR = re.compile(
+    r"(我|你|他|她|它|没|是|但|而|或|也|还|就|都|这|那|哪|谁|什|怎|如|因|所|"
+    r"把|被|让|给|从|到|在)\1"
+)
+
+
+def _caption_tidy_zh(text: str) -> str:
+    """Clean verbatim speech transcripts for subtitle display.
+
+    1. Drops pure filler syllables (嗯 / 呃 / 哎呀 …) — see _CAPTION_FILLERS.
+    2. Collapses adjacent stutter repeats: 「所以就像所以就像」→「所以就像」，
+       「但是但是」→「但是」，「都都都」→「都」. Longest n-grams first so
+       nested repeats collapse correctly. Two-char reduplications (谢谢 /
+       刚刚 / 慢慢) are intentional Chinese and stay: single chars only
+       collapse at 3+ repeats, n-gram collapsing starts at n=2.
+    3. Sweeps up punctuation orphans the removals leave behind.
+
+    Applied centrally before captions are displayed / translated, so the
+    English line benefits too.
+    """
+    if not text or _caption_is_english(text):
+        return text
+    for f in _CAPTION_FILLERS:
+        text = text.replace(f, "")
+    text = re.sub(r"(.)\1{2,}", r"\1", text)          # 都都都 → 都
+    for n in range(8, 1, -1):                          # 所以就像所以就像 → 所以就像
+        text = re.sub(r"(.{%d})\1+" % n, r"\1", text)
+    text = _CAPTION_STUTTER_2CHAR.sub(r"\1", text)     # 没没 / 就就 / 我我 → 单字
+    text = re.sub(r"[，、]{2,}", "，", text)
+    text = re.sub(r"[，、]+(?=[。？！，])", "", text)
+    text = re.sub(r"^[，、。？！\s]+", "", text)
+    return text
+
+
+# Decoding guards shared by the Marian / NLLB caption backends. Greedy
+# decoding (num_beams=1, chosen for latency) degenerates into loops when the
+# ASR hands it noise; forbidding any repeated 6-token n-gram plus a mild
+# penalty stops it at the source, before the display-layer collapse.
+_MT_NO_REPEAT_NGRAM = 6
+_MT_REPETITION_PENALTY = 1.15
+
+
+def _collapse_mt_repeats(text: str) -> str:
+    """Collapse degenerate repetition in MT output.
+
+    Backstop for NMT's classic failure on garbage input: a caption line of
+    「AND THEN OKAY WERE CON YEAH」 came back as 「…雅 的 内容 雅 的 内容 …」
+    ×30 followed by 「Ya Ya Ya …」 ×100. `no_repeat_ngram_size` on the
+    generate() call prevents most of it; this catches whatever slips through
+    (e.g. a hand-configured backend, or repeats longer than the n-gram bound).
+
+    Word-level rules run first and need 3+ occurrences, so English keeps its
+    legitimate repeats ("very very good"). Character-level rules only apply to
+    non-English output, where a repeated long n-gram is broken even at 2
+    occurrences — running them on English would eat "very very" as the 5-char
+    n-gram "very ". This is the translation-only tidy; source-side rules live
+    in `_caption_tidy_zh`, which deliberately leaves English alone.
+    """
+    if not text:
+        return text
+    # Word-level, SHORTEST phrase first: "Ya Ya Ya Ya" → "Ya",
+    # "the plan the plan the plan" → "the plan". Longest-first would leave
+    # "Ya Ya" behind — 6 × "Ya" reads as 3 × the phrase "Ya Ya", which
+    # collapses to a pair that no longer trips the 3+ threshold.
+    for n in range(1, 7):
+        text = re.sub(
+            r"\b((?:[A-Za-z0-9']+ ){%d}[A-Za-z0-9']+)(?: \1\b){2,}" % (n - 1),
+            r"\1", text)
+    if not _caption_is_english(text):
+        for n in range(8, 3, -1):       # long n-grams: 2+ repeats is broken
+            text = re.sub(r"(.{%d})\1+" % n, r"\1", text)
+        for n in range(3, 0, -1):       # short ones need 3+
+            text = re.sub(r"(.{%d})\1{2,}" % n, r"\1", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def _caption_fix_case(text: str, hotwords: "list[str] | None" = None) -> str:
+    """Normalize SHOUTED English from the streaming ASR into sentence case.
+
+    The fast-mode zipformer emits English in all caps ("AND THEN OKAY WERE
+    CON YEAH"), which reads as shouting next to the mixed-case lines the
+    refine pass produces for the same session. Only touches text that is
+    genuinely all-caps: a line with any lowercase is left alone, so
+    deliberate acronyms in normal text ("GKE 集群") never get downcased.
+
+    Known hotwords keep their configured casing (`ChatOps`, `gVisor`), and
+    the standalone pronoun "I" stays capitalized.
+    """
+    if not text:
+        return text
+    uppers = [c for c in text if c.isascii() and c.isalpha() and c.isupper()]
+    if len(uppers) < 3 or any(
+            c.isascii() and c.isalpha() and c.islower() for c in text):
+        return text
+    out = text.lower()
+    for w in (hotwords or []):
+        if len(w) < 2 or not any(c.isascii() and c.isalpha() for c in w):
+            continue
+        out = re.sub(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(w.lower()),
+                     w, out)
+    out = re.sub(r"(?<![A-Za-z0-9'])i(?![A-Za-z0-9'])", "I", out)
+    out = re.sub(r"\bi'(m|ll|ve|d)\b", lambda m: "I'" + m.group(1), out)
+    # Sentence case: first letter of the line and after . ! ?
+    out = re.sub(r"(^|[.!?]\s+)([a-z])",
+                 lambda m: m.group(1) + m.group(2).upper(), out)
+    return out
+
+
+# Interjections that carry no content even as a whole line. Distinct from
+# _CAPTION_FILLERS (which are stripped INSIDE a line): 啊 / 吧 / 呢 are kept
+# mid-sentence because they carry tone, but a line that is nothing but 啊 is
+# noise. Short real answers (对 / 好 / 是 / 可以) are deliberately absent.
+_CAPTION_NOISE_ONLY = set("啊呢嗯呃哦噢唉哎呀吧嘛唔额诶欸")
+
+
+def _caption_is_noise(text: str) -> bool:
+    """True for finalized lines with no content worth showing.
+
+    The streaming model emits a stray letter or particle for a cough, a
+    keyboard tap or an "mmm" — measured on a real 34-minute meeting, those
+    junk lines (`M`, `N`, `A`, `啊。`) were 4 of the 8 speaker clusters the
+    voice print created, each from a single segment, and they exhausted
+    `max_speakers` so genuinely new speakers later got folded into existing
+    ones. Dropping them at the source fixes the captions AND the clustering.
+    """
+    core = re.sub(r"[\s\W_]+", "", text or "", flags=re.UNICODE)
+    if not core:
+        return True
+    if len(core) == 1 and core.isascii() and core.isalpha():
+        return True     # "M" / "N" / "A" — a cough, not a word
+    return all(ch in _CAPTION_NOISE_ONLY for ch in core)
+
+
+def _dedup_caption_boundary(prev: str, curr: str, max_overlap: int = 12) -> str:
+    """Strip curr's leading n-gram when it matches prev's trailing n-gram.
+
+    Handles the paraformer streaming chunk-boundary duplicate pattern:
+        prev = "…运维体系那一块"
+        curr = "那一块。对，运维体系那块就"
+        → curr becomes "。对，运维体系那块就"
+
+    Trailing punctuation on prev is stripped for comparison (paraformer
+    auto-adds 。 / ，). Minimum overlap = 2 chars to avoid single-char
+    coincidences (e.g. two lines both starting with 我).
+    """
+    if not prev or not curr:
+        return curr
+    prev_norm = re.sub(r"[，。？！、,.?!;； \t]+$", "", prev)
+    limit = min(max_overlap, len(prev_norm), len(curr))
+    for n in range(limit, 1, -1):
+        if prev_norm.endswith(curr[:n]):
+            return curr[n:]
+    return curr
+
+
+def _append_hypothesis(clean: str, delta: str) -> str:
+    """Append a streaming chunk's new text, stripping a boundary duplicate.
+
+    Streaming decoders are append-only: once a token is emitted it cannot be
+    revised, so a syllable split across a chunk boundary gets committed twice
+    — measured on 18 s of real audio, the streaming pass produced 129 chars
+    where the offline pass produced 101 (+28 %), all of it repeats like
+    「今天今天天」/「十三十三」/「如果你如果」.
+
+    Since the duplicate always sits at the JOIN, the fix is to check the new
+    chunk's head against the text already accumulated — `_dedup_caption_boundary`
+    with its 2-character minimum, so a single-character coincidence (a genuine
+    「看看」 split across the boundary) is left alone.
+    """
+    if not delta:
+        return clean
+    return clean + _dedup_caption_boundary(clean, delta)
+
+
+def _join_caption_texts(parts: "list[str]") -> str:
+    """Join caption fragments for display: bare join between CJK chars,
+    single space when either side of the boundary is ASCII alphanumeric
+    (so merged English fragments don't run together)."""
+    out = ""
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if out and (
+            (out[-1].isascii() and out[-1].isalnum())
+            or (p[0].isascii() and p[0].isalnum())
+        ):
+            out += " "
+        out += p
+    return out
+
+
+def _prune_caption_rows(rows: "list[dict]", now: float,
+                        max_secs: float, max_rows: int,
+                        slack_secs: float = 60.0,
+                        slack_rows: int = 200) -> int:
+    """Drop caption rows that fell out of the retention window, in place.
+
+    Retention is primarily by TIME: a row cap can't promise "the last 3
+    hours" because the covered span depends on speech cadence (a fast
+    meeting finalizes 40 lines/min, a slow one 15). `max_rows` stays as a
+    memory backstop for pathological cadence. Rows are chronological, so
+    both passes just trim from the front. Returns the number dropped.
+
+    Eviction is BATCHED via the slack allowances, and that is not a
+    micro-optimization: dropping one row per append shifts every paragraph
+    in the pane, so the first display group changes and
+    `_CaptionDocRenderer` can no longer patch a tail — the whole document
+    gets re-laid-out on every single line once the window is full. Waiting
+    until the overflow exceeds the slack turns that into one rebuild per
+    minute (or per 200 rows) instead of one per line. The window is
+    therefore a *minimum*: up to `slack` extra history may be retained.
+    """
+    before = len(rows)
+    if max_secs > 0 and rows:
+        if rows[0].get("t", 0.0) < now - max_secs - slack_secs:
+            cutoff = now - max_secs
+            keep = 0
+            while keep < len(rows) and rows[keep].get("t", 0.0) < cutoff:
+                keep += 1
+            if keep:
+                del rows[:keep]
+    if max_rows > 0 and len(rows) > max_rows + slack_rows:
+        del rows[:-max_rows]
+    return before - len(rows)
+
+
+def _group_caption_rows(rows: "list[dict]", gap_secs: float = 2.5,
+                        max_chars: int = 120) -> "list[list[dict]]":
+    """Display-layer paragraph merging (data layer untouched): a row joins
+    the previous group when it arrived within `gap_secs` of the group's
+    last row, the group is still below `max_chars` of source text, AND both
+    rows carry the same speaker role — merging across a speaker change would
+    attribute one side's words to the other.
+    gap_secs <= 0 disables merging (one row per group)."""
+    groups: "list[list[dict]]" = []
+    for row in rows:
+        if groups and gap_secs > 0:
+            last = groups[-1]
+            close = (row.get("t", 0.0) - last[-1].get("t", 0.0)) <= gap_secs
+            small = sum(len(r.get("src", "")) for r in last) < max_chars
+            same_speaker = (
+                (row.get("speaker"), row.get("side"), row.get("role"))
+                == (last[-1].get("speaker"), last[-1].get("side"),
+                    last[-1].get("role")))
+            if close and small and same_speaker:
+                last.append(row)
+                continue
+        groups.append([row])
+    return groups
+
+
+_REVIEW_SEP = "|||"
+
+
+def _format_caption_review_lines(batch: "list[dict]") -> str:
+    """Render a review batch as `N ||| 原文 ||| 当前译文` lines."""
+    out = []
+    for i, row in enumerate(batch, start=1):
+        src = (row.get("text") or "").replace("\n", " ").strip()
+        dst = (row.get("dst") or "").replace("\n", " ").strip()
+        out.append(f"{i} {_REVIEW_SEP} {src} {_REVIEW_SEP} {dst or '（未翻译）'}")
+    return "\n".join(out)
+
+
+def _review_log_text(s: str, limit: int = 500) -> str:
+    """One-line, delimited rendering of caption text for the audit log.
+
+    Newlines and runs of whitespace collapse so a change is exactly one log
+    line (greppable), and the 「」 brackets keep the field boundaries readable
+    even when the text itself contains arrows or colons.
+    """
+    flat = re.sub(r"\s+", " ", (s or "").strip())
+    if len(flat) > limit:
+        flat = flat[:limit] + f"…(+{len(flat) - limit})"
+    return f"「{flat}」"
+
+
+def _parse_caption_review(reply: str, batch: "list[dict]") -> "dict[int, tuple]":
+    """Parse the caption_review reply into {segment_id: (text, dst)}.
+
+    Defensive in the same spirit as `_parse_fix_mt`, because this pass
+    rewrites lines the user has already read: an entry is dropped (leaving
+    the line untouched) when its index is unknown, when either field is
+    empty, or when the "correction" is not a minimal edit — length outside
+    0.5x–2.0x of the original OR SequenceMatcher similarity < 0.45. A batch
+    reply that omits entries simply leaves those lines alone, so a truncated
+    or chatty answer degrades to "no change" rather than to lost captions.
+    """
+    import difflib
+    out: "dict[int, tuple]" = {}
+    if not reply:
+        return out
+    for raw in reply.splitlines():
+        line = raw.strip()
+        if not line or _REVIEW_SEP not in line:
+            continue
+        parts = [p.strip() for p in line.split(_REVIEW_SEP)]
+        if len(parts) < 3:
+            continue
+        idx_txt = re.sub(r"[^\d]", "", parts[0])
+        if not idx_txt:
+            continue
+        pos = int(idx_txt) - 1
+        if not (0 <= pos < len(batch)):
+            continue
+        fixed, dst = parts[1], parts[2]
+        row = batch[pos]
+        original = (row.get("text") or "").strip()
+        sid = row.get("id")
+        if sid is None or not fixed or not dst:
+            continue
+        ratio = len(fixed) / max(len(original), 1)
+        if (
+            not (0.5 <= ratio <= 2.0)
+            or difflib.SequenceMatcher(None, original, fixed).ratio() < 0.45
+        ):
+            # Rewrite, hallucination or dropped clause — keep the original
+            # source but still take the translation, which is judged
+            # separately (it legitimately looks nothing like the source).
+            fixed = original
+        out[sid] = (fixed, dst)
+    return out
+
+
+class _SpeakerClusterer:
+    """Online cosine clustering of speaker embeddings.
+
+    Live captions can't run offline diarization (which needs the whole
+    recording to cluster globally), but each finalized segment already has
+    its audio, and a 192-dim cam++ voice print costs ~60 ms. So speakers are
+    identified incrementally: compare the segment's embedding against the
+    centroids seen so far, join the nearest one above `threshold`, otherwise
+    start a new speaker. Centroids are running means, so a speaker's print
+    sharpens as they talk more.
+
+    Channel role (mic vs system audio) can't do this job: everyone on the
+    call arrives mixed into one system-audio stream. Role still decides which
+    cluster is "me" — that's what the microphone channel authoritatively
+    knows — via `role_votes`.
+    """
+
+    def __init__(self, threshold: float = 0.6, max_speakers: int = 8):
+        self.threshold = float(threshold)
+        self.max_speakers = max(1, int(max_speakers))
+        self._centroids: "list[np.ndarray]" = []
+        self._counts: "list[int]" = []
+        self.role_votes: "list[dict]" = []
+
+    @staticmethod
+    def _unit(vec: "np.ndarray") -> "np.ndarray":
+        v = np.asarray(vec, dtype=np.float32).reshape(-1)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 0 else v
+
+    def assign(self, embedding: "np.ndarray", role: "str | None" = None) -> int:
+        """Cluster index for this embedding, creating a speaker if needed."""
+        emb = self._unit(embedding)
+        if emb.size == 0:
+            return -1
+        idx, created = -1, False
+        if self._centroids:
+            sims = [float(np.dot(c, emb)) for c in self._centroids]
+            best = int(np.argmax(sims))
+            if sims[best] >= self.threshold:
+                idx = best
+            elif len(self._centroids) >= self.max_speakers:
+                # Cap reached: fold into the nearest speaker rather than
+                # inventing 说话人9 for every new voice in a noisy room.
+                idx = best
+        if idx < 0:
+            self._centroids.append(emb)
+            self._counts.append(1)
+            self.role_votes.append({})
+            idx, created = len(self._centroids) - 1, True
+        if not created:
+            n = self._counts[idx]
+            self._centroids[idx] = self._unit(
+                (self._centroids[idx] * n + emb) / (n + 1))
+            self._counts[idx] = n + 1
+        if role:
+            votes = self.role_votes[idx]
+            votes[role] = votes.get(role, 0) + 1
+        return idx
+
+    def majority_side(self, idx: int) -> "str | None":
+        """Which channel this speaker mostly arrives on ("mic" / "system").
+
+        A SIDE, never an identity: a single microphone can carry several
+        people (everyone in one meeting room), so "came in on the mic" does
+        not mean "is the person running the app". Identity comes from the
+        voice print alone; this only decides which colour the tag gets.
+        """
+        if not (0 <= idx < len(self.role_votes)):
+            return None
+        votes = self.role_votes[idx]
+        if not votes:
+            return None
+        return max(votes.items(), key=lambda kv: kv[1])[0]
+
+    def display_number(self, idx: int) -> int:
+        """1-based speaker number in discovery order, across BOTH channels.
+
+        Numbering is global on purpose. Reserving 我 for the mic side broke
+        as soon as two people shared one microphone: they both scored a mic
+        majority and both got labelled 我.
+        """
+        return idx + 1 if idx >= 0 else 1
+
+
+class _CaptionSpeakerId:
+    """cam++ voice-print embeddings for live-caption speaker identification.
+
+    `iic/speech_campplus_sv_zh-cn_16k-common` (~27 MB, auto-downloaded by
+    modelscope on first use) returns a 192-dim embedding in ~60 ms per
+    segment on M2 — cheap enough to run on every finalized line. It is a
+    zh-CN trained model, but a voice print captures timbre rather than
+    language, so it still separates speakers in English meetings.
+    """
+
+    def __init__(self, model_id: str = "cam++"):
+        try:
+            from funasr import AutoModel
+        except ImportError as e:
+            raise RuntimeError(
+                "说话人识别需要 funasr：python3 -m pip install funasr modelscope torch"
+            ) from e
+        with _QuietCapture("CAPTION"):
+            self._model = AutoModel(model=model_id, disable_update=True)
+        _log("CAPTION", f"speaker id ready: {model_id}")
+
+    def embed(self, audio: "np.ndarray") -> "np.ndarray | None":
+        with _QuietCapture("CAPTION"):
+            res = self._model.generate(input=audio)
+        if not res:
+            return None
+        emb = res[0].get("spk_embedding") if isinstance(res[0], dict) else None
+        if emb is None:
+            return None
+        arr = emb.detach().cpu().numpy() if hasattr(emb, "detach") else np.asarray(emb)
+        return np.asarray(arr, dtype=np.float32).reshape(-1)
+
+
+class _CaptionDocRenderer:
+    """Incremental HTML renderer for the caption pane.
+
+    `setHtml` re-lays-out the WHOLE document and is linear in its size
+    (measured offscreen: 6.9 ms at 500 rows → 140 ms at 12 000), so with a
+    3-hour scroll-back buffer a full rebuild per caption event cannot keep
+    up. In steady state only the tail changes — a new paragraph is appended,
+    or the last one gets its translation — so this keeps the HTML of every
+    committed group and replaces just the tail from the first divergence.
+
+    Bookkeeping is by BLOCK NUMBER rather than character position: each group
+    renders to exactly `_BLOCKS_PER_GROUP` paragraphs, so group *i* starts at
+    block *i × 2* and the invariant `blockCount == 2 × len(committed)` is
+    checkable before every incremental edit. Any violation (or a divergence
+    at index 0) falls back to a full `setHtml`, so a bookkeeping bug can
+    only cost performance, never a corrupted pane.
+    """
+
+    _BLOCKS_PER_GROUP = 2   # source paragraph + translation paragraph
+
+    def __init__(self, view):
+        self._view = view
+        self._committed: "list[str]" = []
+
+    def reset(self) -> None:
+        """Forget the document (call when the pane is cleared)."""
+        self._committed = []
+
+    @staticmethod
+    def _first_divergence(old: "list[str]", new: "list[str]") -> int:
+        for i in range(min(len(old), len(new))):
+            if old[i] != new[i]:
+                return i
+        return min(len(old), len(new))
+
+    def render(self, groups_html: "list[str]", placeholder_html: str = "") -> str:
+        """Sync the view to `groups_html`. Returns the path taken, for tests
+        and logging: "unchanged" / "tail" / "full"."""
+        from PyQt6.QtGui import QTextCursor
+
+        view = self._view
+        doc = view.document()
+        sb = view.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 8
+        prev = sb.value()
+
+        if not groups_html:
+            if not self._committed and doc.toPlainText().strip():
+                return "unchanged"    # placeholder already on screen
+            self._set_full(placeholder_html)
+            self._committed = []
+            return "full"
+
+        k = self._first_divergence(self._committed, groups_html)
+        if k == len(self._committed) == len(groups_html):
+            return "unchanged"
+
+        # Rewrite from the LAST COMMITTED group even on a pure append. Block
+        # 2k does not exist yet when appending (it is one past the end), and
+        # inserting at the document end instead merges the new paragraph into
+        # the previous block — Qt's insertHtml is inline when the cursor sits
+        # in a non-empty block. Backing up one group keeps a single code path
+        # whose target block always exists, at the cost of re-laying-out one
+        # extra paragraph pair.
+        k_eff = min(k, len(self._committed) - 1) if self._committed else -1
+        expected_blocks = self._BLOCKS_PER_GROUP * len(self._committed)
+        # k_eff must leave at least one untouched leading group, otherwise the
+        # "patch" would rewrite the whole document anyway — setHtml is simpler
+        # and at least as fast for that, and reporting it as "full" keeps the
+        # diagnostic honest (a stream of them means the incremental path is
+        # not actually engaging).
+        block = (
+            doc.findBlockByNumber(self._BLOCKS_PER_GROUP * k_eff)
+            if k_eff >= 1 and doc.blockCount() == expected_blocks
+            else None
+        )
+        if block is None or not block.isValid():
+            self._set_full("".join(groups_html))
+            self._committed = list(groups_html)
+            self._restore_scroll(at_bottom, prev)
+            return "full"
+
+        was_append = k == len(self._committed)
+        view.setUpdatesEnabled(False)
+        try:
+            cursor = QTextCursor(doc)
+            cursor.setPosition(block.position())
+            cursor.movePosition(QTextCursor.MoveOperation.End,
+                                QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.insertHtml("".join(groups_html[k_eff:]))
+            self._committed = list(groups_html)
+        finally:
+            view.setUpdatesEnabled(True)
+        self._restore_scroll(at_bottom, prev)
+        return "append" if was_append else "tail"
+
+    def _set_full(self, doc_html: str) -> None:
+        view = self._view
+        view.setUpdatesEnabled(False)
+        try:
+            view.setHtml(doc_html)
+        finally:
+            view.setUpdatesEnabled(True)
+
+    def _restore_scroll(self, at_bottom: bool, prev: int) -> None:
+        # Follow the tail only when the user was already pinned at the
+        # bottom; otherwise keep their place so scrolling back through a
+        # 3-hour session isn't yanked away on every new line.
+        sb = self._view.verticalScrollBar()
+        sb.setValue(sb.maximum() if at_bottom else min(prev, sb.maximum()))
+
+
+def _caption_download(url: str, dest: Path) -> None:
+    """Stream a URL to disk with certifi's CA bundle.
+
+    Plain urllib uses the interpreter's default SSL context, which on
+    python.org macOS builds has no CA certificates wired in ("Install
+    Certificates.command" never run) → CERTIFICATE_VERIFY_FAILED. certifi
+    ships with transformers/modelscope, so prefer its bundle and keep the
+    default context only as fallback. Never disables verification.
+    """
+    import ssl
+    import urllib.request
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, headers={"User-Agent": "meetingscribe"})
+    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp, \
+            open(dest, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        next_pct = 0
+        while True:
+            block = resp.read(256 * 1024)
+            if not block:
+                break
+            f.write(block)
+            done += len(block)
+            if total and done * 100 // total >= next_pct:
+                _log("CAPTION", f"model download {done * 100 // total}% "
+                                f"({done // (1024 * 1024)} MB)")
+                next_pct += 10
+
+
+def _ensure_sherpa_model(url: str = _SHERPA_ZIPFORMER_URL) -> Path:
+    """Download + extract the fast-mode streaming zipformer once; returns model dir."""
+    models_dir = CONFIG_DIR / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    name = url.rsplit("/", 1)[-1]
+    target = models_dir / name.replace(".tar.bz2", "")
+    if (target / "tokens.txt").exists():
+        return target
+    import tarfile
+    tmp = models_dir / (name + ".part")
+    _log("CAPTION", f"downloading fast-mode ASR model ({url})")
+    _caption_download(url, tmp)
+    try:
+        with tarfile.open(tmp, "r:bz2") as tf:
+            try:
+                tf.extractall(models_dir, filter="data")
+            except TypeError:  # Python < 3.12: validate members manually
+                base = models_dir.resolve()
+                for m in tf.getmembers():
+                    dest = (models_dir / m.name).resolve()
+                    if not str(dest).startswith(str(base) + os.sep):
+                        raise RuntimeError(f"unsafe path in model archive: {m.name}")
+                tf.extractall(models_dir)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if not (target / "tokens.txt").exists():
+        raise RuntimeError(f"model archive extracted but {target} is incomplete")
+    _log("CAPTION", f"fast-mode ASR model ready at {target}")
+    return target
+
+
+def _ensure_qwen_gguf(repo: str, filename: str) -> Path:
+    """Download the caption-MT Qwen GGUF once into CONFIG_DIR/models.
+
+    Uses the HF `resolve` URL through `_caption_download` (certifi CA
+    bundle, progress logging) instead of huggingface_hub so the download
+    path is identical to the sherpa model's. Honours HF_ENDPOINT for
+    mirror setups.
+    """
+    models_dir = CONFIG_DIR / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    target = models_dir / filename
+    if target.exists():
+        return target
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    url = f"{endpoint}/{repo}/resolve/main/{filename}"
+    tmp = models_dir / (filename + ".part")
+    _log("CAPTION", f"downloading qwen MT model ({url})")
+    try:
+        _caption_download(url, tmp)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    _log("CAPTION", f"qwen MT model ready at {target}")
+    return target
+
+
+def _pick_model_file(model_dir: Path, stem: str) -> str:
+    """Prefer the int8-quantised onnx file when present (smaller + faster)."""
+    for pattern in (f"{stem}*int8.onnx", f"{stem}*.onnx"):
+        hits = sorted(p for p in model_dir.glob(pattern) if p.is_file())
+        if hits:
+            return str(hits[0])
+    raise RuntimeError(f"no {stem}*.onnx found in {model_dir}")
+
+
+class _SherpaCaptionASR:
+    """Fast mode: sherpa-onnx streaming zipformer (bilingual zh-en, ~320 ms)."""
+
+    def __init__(self, lc_cfg: dict, emit_partial, emit_final, hotword: str = ""):
+        self._emit_partial = emit_partial
+        self._emit_final = emit_final
+        try:
+            import sherpa_onnx
+        except ImportError as e:
+            raise RuntimeError(
+                "快速模式需要 sherpa-onnx：python3 -m pip install sherpa-onnx"
+            ) from e
+        cfg_dir = (lc_cfg.get("asr_model_dir") or "")
+        model_dir = Path(cfg_dir).expanduser() if cfg_dir else _ensure_sherpa_model()
+        kwargs = dict(
+            tokens=str(model_dir / "tokens.txt"),
+            encoder=_pick_model_file(model_dir, "encoder"),
+            decoder=_pick_model_file(model_dir, "decoder"),
+            joiner=_pick_model_file(model_dir, "joiner"),
+            num_threads=2,
+            sample_rate=_CAPTION_SAMPLE_RATE,
+            feature_dim=80,
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=2.4,
+            rule2_min_trailing_silence=0.8,
+            decoding_method="greedy_search",
+        )
+        # Contextual biasing for domain terms (sandbox / API 网关 / …):
+        # space-separated stt.funasr.hotword phrases, one per line for
+        # sherpa. Needs modified_beam_search + the model's bpe.vocab.
+        hotword = (hotword or "").strip()
+        bpe_vocab = model_dir / "bpe.vocab"
+        if hotword and bpe_vocab.exists():
+            hw_file = CONFIG_DIR / "models" / "caption_hotwords.txt"
+            hw_file.parent.mkdir(parents=True, exist_ok=True)
+            hw_file.write_text(
+                "\n".join(hotword.split()) + "\n", encoding="utf-8")
+            kwargs.update(
+                decoding_method="modified_beam_search",
+                hotwords_file=str(hw_file),
+                hotwords_score=1.5,
+                modeling_unit="cjkchar+bpe",
+                bpe_vocab=str(bpe_vocab),
+            )
+        try:
+            self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
+            if "hotwords_file" in kwargs:
+                _log("CAPTION", f"fast ASR hotwords active: {hotword}")
+        except Exception as e:
+            if "hotwords_file" not in kwargs:
+                raise
+            # Older sherpa-onnx builds lack hotword kwargs — degrade to
+            # greedy decoding rather than losing captions entirely.
+            _log("CAPTION", f"hotwords unsupported, falling back to greedy: "
+                            f"{type(e).__name__}: {e}")
+            for k in ("hotwords_file", "hotwords_score",
+                      "modeling_unit", "bpe_vocab"):
+                kwargs.pop(k, None)
+            kwargs["decoding_method"] = "greedy_search"
+            self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
+        # Kept for `_caption_fix_case`: this model emits English in ALL CAPS,
+        # and the configured spelling of a hotword must survive the downcase.
+        self._hotwords = [w for w in hotword.split() if len(w) >= 2]
+        self._stream = self._rec.create_stream()
+        self._seg_audio: list = []
+        # `_raw_hyp` mirrors what the recognizer last returned (needed to
+        # isolate each chunk's delta); `_clean_hyp` is our boundary-deduped
+        # version, which is what gets displayed. They diverge on purpose —
+        # the recognizer keeps its own append-only history either way.
+        self._raw_hyp = ""
+        self._clean_hyp = ""
+
+    def reset_session(self, emit_partial, emit_final):
+        """Rebind a cached instance to a new engine + fresh decoding stream."""
+        self._emit_partial = emit_partial
+        self._emit_final = emit_final
+        self._stream = self._rec.create_stream()
+        self._seg_audio: list = []
+        self._raw_hyp = ""
+        self._clean_hyp = ""
+
+    def _take_seg_audio(self) -> "np.ndarray":
+        audio = (
+            np.concatenate(self._seg_audio)
+            if self._seg_audio else np.zeros(0, dtype=np.float32)
+        )
+        self._seg_audio = []
+        return audio
+
+    def accept(self, samples: "np.ndarray"):
+        if samples.size:
+            self._stream.accept_waveform(_CAPTION_SAMPLE_RATE, samples)
+            self._seg_audio.append(np.asarray(samples, dtype=np.float32))
+            # Safety cap: sherpa's rule3 endpoint bounds utterances (~20 s),
+            # but never let the refine buffer grow unboundedly regardless.
+            excess = (
+                sum(len(a) for a in self._seg_audio)
+                - int(_CAPTION_RING_SECONDS * _CAPTION_SAMPLE_RATE)
+            )
+            while excess > 0 and len(self._seg_audio) > 1:
+                excess -= len(self._seg_audio.pop(0))
+        while self._rec.is_ready(self._stream):
+            self._rec.decode_stream(self._stream)
+        text = _caption_fix_case(self._advance_hypothesis(), self._hotwords)
+        if self._rec.is_endpoint(self._stream):
+            audio = self._take_seg_audio()
+            if text:
+                self._emit_final(text, audio)
+            self._rec.reset(self._stream)
+            self._raw_hyp = self._clean_hyp = ""
+        elif text:
+            self._emit_partial(text)
+
+    def _advance_hypothesis(self) -> str:
+        """Pull the recognizer's current hypothesis and fold in only what is
+        genuinely new, dropping a chunk-boundary duplicate at the join."""
+        raw = self._rec.get_result(self._stream).strip()
+        if raw != self._raw_hyp:
+            if raw.startswith(self._raw_hyp):
+                self._clean_hyp = _append_hypothesis(
+                    self._clean_hyp, raw[len(self._raw_hyp):])
+            else:
+                # The recognizer rewrote earlier text (a rescoring build, not
+                # the append-only behaviour we measured) — trust it wholesale
+                # rather than splicing two disagreeing histories.
+                self._clean_hyp = raw
+            self._raw_hyp = raw
+        return self._clean_hyp
+
+    def flush(self):
+        text = _caption_fix_case(self._advance_hypothesis(), self._hotwords)
+        if text:
+            self._emit_final(text, self._take_seg_audio())
+        self._raw_hyp = self._clean_hyp = ""
+
+
+class _MarianCaptionMT:
+    """Fast mode MT: opus-mt Marian models, one per direction, lazily loaded."""
+
+    def __init__(self, lc_cfg: dict):
+        self._ids = {
+            "zh-en": lc_cfg.get("mt_zh_en", "Helsinki-NLP/opus-mt-zh-en"),
+            "en-zh": lc_cfg.get("mt_en_zh", "Helsinki-NLP/opus-mt-en-zh"),
+        }
+        self._models: dict = {}
+        self._get("zh-en")  # load the primary direction eagerly → early failure
+
+    def _get(self, direction: str):
+        if direction not in self._models:
+            try:
+                from transformers import MarianMTModel, MarianTokenizer
+            except ImportError as e:
+                raise RuntimeError(
+                    "字幕翻译需要 transformers：python3 -m pip install transformers"
+                ) from e
+            with _QuietCapture("CAPTION"):
+                tok = MarianTokenizer.from_pretrained(self._ids[direction])
+                mdl = MarianMTModel.from_pretrained(self._ids[direction])
+                mdl.eval()
+            self._models[direction] = (tok, mdl)
+        return self._models[direction]
+
+    def translate(self, text: str) -> str:
+        import torch
+        direction = "en-zh" if _caption_is_english(text) else "zh-en"
+        tok, mdl = self._get(direction)
+        with torch.no_grad():
+            batch = tok([text], return_tensors="pt", truncation=True, max_length=512)
+            # No max_new_tokens: Marian's own generation_config caps length,
+            # and passing both triggers a warning print on every call.
+            # no_repeat_ngram_size + repetition_penalty are the fix for the
+            # degenerate loop greedy decoding falls into on garbage ASR input
+            # (one caption came back as 「雅 的 内容」×30 then "Ya"×100).
+            out = mdl.generate(
+                **batch, num_beams=1,
+                no_repeat_ngram_size=_MT_NO_REPEAT_NGRAM,
+                repetition_penalty=_MT_REPETITION_PENALTY)
+        return tok.decode(out[0], skip_special_tokens=True)
+
+
+class _NLLBCaptionMT:
+    """Optional MT backend: NLLB-200-distilled-600M, bidirectional zh↔en.
+
+    Reachable via `live_captions.mt_provider = "nllb"`. Slower than opus-mt
+    (760-1200 ms vs 120-150 ms per line, measured) but stronger on some
+    domain terminology, so it stays selectable now that the accurate MODE
+    that used to bundle it is gone.
+    """
+
+    def __init__(self, lc_cfg: dict):
+        model_id = (lc_cfg.get("nllb") or {}).get(
+            "mt_model", "facebook/nllb-200-distilled-600M"
+        )
+        try:
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        except ImportError as e:
+            raise RuntimeError(
+                "字幕翻译需要 transformers：python3 -m pip install transformers"
+            ) from e
+        with _QuietCapture("CAPTION"):
+            self._tok = AutoTokenizer.from_pretrained(model_id)
+            self._mdl = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+            self._mdl.eval()
+        if bool((lc_cfg.get("nllb") or {}).get("mt_int8", True)):
+            # Dynamic int8 quantization of the Linear layers: 2-4× faster
+            # sentence latency on CPU with minor quality loss — the
+            # difference between "…" backlogs and usable live translation.
+            try:
+                import torch
+                self._mdl = torch.quantization.quantize_dynamic(
+                    self._mdl, {torch.nn.Linear}, dtype=torch.qint8)
+                _log("CAPTION", "NLLB dynamic int8 quantization applied")
+            except Exception as e:
+                _log("CAPTION", f"NLLB int8 quantization skipped: "
+                                f"{type(e).__name__}: {e}")
+
+    def translate(self, text: str) -> str:
+        import torch
+        src, tgt = (
+            ("eng_Latn", "zho_Hans")
+            if _caption_is_english(text) else ("zho_Hans", "eng_Latn")
+        )
+        self._tok.src_lang = src
+        batch = self._tok([text], return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            out = self._mdl.generate(
+                **batch,
+                forced_bos_token_id=self._tok.convert_tokens_to_ids(tgt),
+                num_beams=1,
+                no_repeat_ngram_size=_MT_NO_REPEAT_NGRAM,
+                repetition_penalty=_MT_REPETITION_PENALTY,
+            )
+        return self._tok.decode(out[0], skip_special_tokens=True)
+
+
+_GLOSSARY_SPAN_RE = re.compile(r"[A-Za-z0-9]+")
+_GLOSSARY_MIXED_RE = re.compile(
+    r"[一-鿿]{0,2}[A-Za-z0-9]+[一-鿿]{0,2}")
+
+
+def _glossary_candidates(text: str, hotwords: "list[str]",
+                        limit: int = 12) -> "list[str]":
+    """Pick the hotwords worth showing the caption model for THIS line.
+
+    Dumping the whole hotword table (which auto-grows to
+    `hotwords.max_count`, 100 by default) into the prompt is what makes a
+    1.5B model invent semantic relations between unrelated terms. So only
+    terms the line plausibly contains get injected:
+
+    * literal containment (case-insensitive) — the term survived ASR intact;
+    * fuzzy match against the line's alnum / CJK-flanked-alnum spans — the
+      term got mangled, e.g. `拆特ops` still shares "ops" with `ChatOps`
+      (SequenceMatcher 0.6), which is exactly the case correction exists for.
+
+    Fuzzy matching needs ASCII to latch onto: a pure-CJK homophone
+    (`李雷` → `里雷`) shares no characters and would need pinyin, so those
+    terms are literal-match only. Literal hits rank first, then fuzzy hits by
+    descending similarity; the list is capped at `limit`.
+    """
+    import difflib
+    words = [w for w in (hotwords or []) if len(w) >= 2]
+    if not words or not text:
+        return []
+    low = text.lower()
+    spans = {
+        s.lower() for s in
+        _GLOSSARY_SPAN_RE.findall(text) + _GLOSSARY_MIXED_RE.findall(text)
+        if len(s) >= 3
+    }
+    literal = [w for w in words if w.lower() in low]
+    if _caption_is_english(text):
+        # Fuzzy matching is for ASR-mangled CJK-mixed terms (拆特ops →
+        # ChatOps). On an English line it is pure noise: English words share
+        # 3-character runs with unrelated hotwords constantly — measured on
+        # the real 100-term table, "Now we were told about this RFP around
+        # four day" matched Acme (were/ere), and "…they've ked us to
+        # commit…" pulled in eight terms. Literal hits only here.
+        return literal[:max(1, limit)]
+    # Fuzzy matching exists to recover terms the ASR mangled. A span that
+    # already matched a term literally is spelled correctly, so it needs no
+    # candidates — without this, `用 LangGraph` also dragged in LangSmith,
+    # LangChain and LangFuse just for sharing the "lang" prefix.
+    spans = {
+        s for s in spans
+        if not any(s in w.lower() or w.lower() in s for w in literal)
+    }
+    fuzzy = []
+    for w in words:
+        wl = w.lower()
+        if wl in low:
+            continue
+        if not any(c.isascii() and c.isalnum() for c in w):
+            continue  # pure CJK: no ASCII anchor for a fuzzy comparison
+        best = 0.0
+        for s in spans:
+            m = difflib.SequenceMatcher(None, wl, s)
+            # A shared run of ≥3 characters is what makes a near-miss
+            # credible. Ratio alone is too loose on short spans: measured on
+            # a real 100-term table, "dora" pulled in RMA (0.57) and
+            # Portland (0.50) purely on scattered single-letter matches.
+            if m.find_longest_match(0, len(wl), 0, len(s)).size < 3:
+                continue
+            best = max(best, m.ratio())
+        if best >= 0.45:
+            fuzzy.append((best, w))
+    fuzzy.sort(key=lambda p: -p[0])
+    return (literal + [w for _, w in fuzzy])[:max(1, limit)]
+
+
+# GBNF grammar for the qwen fix+translate call. The decoder itself then
+# guarantees the shape `_parse_fix_mt` expects, which structurally kills two
+# of the observed failure modes: leaked prompt/example text before the 修正
+# line, and infinite repetition (each line is length-bounded).
+#
+# Measured cost on M2 Metal (Qwen2.5-1.5B q4_K_M, min of 3 runs): 1.22 s →
+# 1.80 s per finalized line. Prompt length is NOT the factor — few-shot vs
+# zero-shot came out at 1.15 s vs 1.22 s — it's the per-token vocab filtering.
+# Only the fix path pays it; plain `translate` (which also serves partials)
+# stays unconstrained.
+_FIX_MT_GRAMMAR = r"""
+root ::= "修正：" line "\n" "翻译：" line
+line ::= [^\n]{1,400}
+"""
+
+
+def _parse_fix_mt(out: str, original: str) -> "tuple[str, str]":
+    """Parse the caption_fix_mt reply (two lines: 修正：… / 翻译：…).
+
+    Defensive against a small model ignoring the contract: when no 翻译：
+    line is found, the whole reply is treated as a plain translation and
+    the source line is left untouched. The corrected line must be a
+    *minimal edit* of the original — length within 0.66x–2.0x (catches
+    dropped clauses / hallucinated additions, which pure similarity
+    misses because a bare prefix still scores high) AND SequenceMatcher
+    similarity ≥ 0.5 (catches a translation or rewrite masquerading as
+    the correction). Anything suspicious → keep the raw ASR line.
+    """
+    import difflib
+    fixed = ""
+    trans = ""
+    for line in (out or "").splitlines():
+        s = line.strip()
+        if s.startswith(("修正：", "修正:")):
+            fixed = s[3:].strip()
+        elif s.startswith(("翻译：", "翻译:")):
+            trans = s[3:].strip()
+    if not trans:
+        return original, (out or "").strip()
+    ratio = len(fixed) / max(len(original), 1)
+    if (
+        not fixed
+        or not (0.66 <= ratio <= 2.0)
+        or difflib.SequenceMatcher(None, original, fixed).ratio() < 0.5
+    ):
+        fixed = original
+    return fixed, trans
+
+
+class _QwenCaptionMT:
+    """Scheme C MT: local Qwen instruct model (GGUF) via llama.cpp.
+
+    Prompt-driven, unlike Marian/NLLB — so it supports a hotword
+    glossary: every `stt.funasr.hotword` term that literally appears in
+    the source line is injected as a keep-verbatim terminology list, and
+    the rest of the line is translated normally by the same model.
+    Finalized lines can additionally go through `correct_and_translate`
+    (qwen.correct, default on): one combined call that first repairs
+    obvious ASR errors (homophones, broken English words) using recent
+    caption context + the hotwords this line plausibly contains
+    (`_glossary_candidates`), then translates — the same mechanism that
+    makes the offline polish step so much better than raw. Output shape is
+    pinned by a GBNF grammar when llama.cpp supports it (qwen.grammar).
+    """
+
+    def __init__(self, cfg: dict, lc_cfg: dict, hotword: str = ""):
+        qcfg = lc_cfg.get("qwen") or {}
+        try:
+            from llama_cpp import Llama
+        except ImportError as e:
+            raise RuntimeError(
+                "字幕翻译（qwen）需要 llama-cpp-python："
+                "python3 -m pip install llama-cpp-python"
+            ) from e
+        path = (qcfg.get("model_path") or "").strip()
+        model_path = (
+            Path(path).expanduser() if path
+            else _ensure_qwen_gguf(
+                qcfg.get("model_repo", "Qwen/Qwen2.5-1.5B-Instruct-GGUF"),
+                qcfg.get("model_file", "qwen2.5-1.5b-instruct-q4_k_m.gguf"))
+        )
+        if not model_path.exists():
+            raise RuntimeError(f"Qwen GGUF 模型不存在: {model_path}")
+        self._prompt_tpl = _resolve_prompt(cfg, "caption_mt")
+        self._correct = bool(qcfg.get("correct", True))
+        self._glossary_max = max(1, int(qcfg.get("glossary_max", 12)))
+        # Grammar first: it decides which fix prompt we use (strict/zero-shot
+        # when the decoder enforces the format, few-shot when it can't).
+        self._fix_grammar = None
+        if bool(qcfg.get("grammar", True)):
+            try:
+                from llama_cpp import LlamaGrammar
+                with _QuietCapture("CAPTION"):
+                    self._fix_grammar = LlamaGrammar.from_string(
+                        _FIX_MT_GRAMMAR, verbose=False)
+            except Exception as e:
+                # Bounded repetition `{m,n}` needs a recent llama.cpp; on older
+                # builds we lose the structural guarantee and lean on the
+                # few-shot example + `_parse_fix_mt`'s defensive checks instead.
+                self._fix_grammar = None
+                _log("CAPTION", f"GBNF grammar unavailable "
+                                f"({type(e).__name__}: {e}); "
+                                f"using few-shot caption_fix_mt")
+        self._fix_tpl = _resolve_prompt(
+            cfg,
+            "caption_fix_mt_strict" if self._fix_grammar is not None
+            else "caption_fix_mt")
+        threads = int(qcfg.get("threads", 0) or 0)
+        with _QuietCapture("CAPTION"):
+            self._llm = Llama(
+                model_path=str(model_path),
+                n_ctx=int(qcfg.get("n_ctx", 2048)),
+                n_threads=threads if threads > 0 else None,
+                # Full GPU offload by default: on Apple Silicon this moves
+                # inference to Metal (measured 6.8 → 0.04 CPU-seconds per
+                # caption line, 2.4s → 0.54s wall). Falls back to CPU
+                # automatically when no GPU is available.
+                n_gpu_layers=int(qcfg.get("n_gpu_layers", -1)),
+                verbose=False,
+            )
+        self.set_hotword(hotword)
+        _log("CAPTION", f"qwen MT ready: {model_path.name}")
+
+    def set_hotword(self, hotword: str):
+        self._hotwords = [w for w in (hotword or "").split() if len(w) >= 2]
+
+    def _glossary_hits(self, text: str) -> "list[str]":
+        """Literal hits only — the translate path must not rewrite words the
+        ASR got right, so near-misses are the fix path's business."""
+        low = text.lower()
+        return [w for w in self._hotwords if w.lower() in low][
+            :self._glossary_max]
+
+    def translate(self, text: str) -> str:
+        to_zh = _caption_is_english(text)
+        hits = self._glossary_hits(text)
+        glossary = (
+            "\n译文中出现以下术语时必须原样保留，不要翻译或改写：" + "、".join(hits)
+            if hits else ""
+        )
+        prompt = (
+            self._prompt_tpl
+            .replace("{src_lang}", "英文" if to_zh else "中文")
+            .replace("{dst_lang}", "中文" if to_zh else "英文")
+            .replace("{glossary}", glossary)
+            .replace("{text}", text)
+        )
+        # Deliberately NOT grammar-constrained: this path also translates
+        # in-flight partials, and GBNF sampling measured +0.30 s (0.42 → 0.72 s
+        # per line on M2 Metal) — enough to trip the partial-translation gate.
+        # There is no structure to enforce either: a single free-form line,
+        # already bounded by max_tokens.
+        with _QuietCapture("CAPTION"):
+            out = self._llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=256,
+            )
+        return (out["choices"][0]["message"]["content"] or "").strip()
+
+    def correct_and_translate(self, text: str,
+                              context: "list[str]") -> "tuple[str, str]":
+        """One combined call: fix obvious ASR errors, then translate.
+        Returns (corrected_source, translation). Falls back to plain
+        translation when qwen.correct is off."""
+        if not self._correct:
+            return text, self.translate(text)
+        to_zh = _caption_is_english(text)
+        hits = _glossary_candidates(text, self._hotwords, self._glossary_max)
+        glossary = (
+            "\n术语表（仅当原文中的词与下列术语发音相近时才修正为术语写法，发音不相近时忽略此表）："
+            + " ".join(hits)
+            if hits else ""
+        )
+        prompt = (
+            self._fix_tpl
+            .replace("{src_lang}", "英文" if to_zh else "中文")
+            .replace("{dst_lang}", "中文" if to_zh else "英文")
+            .replace("{glossary}", glossary)
+            .replace("{context}", "\n".join(context[-3:]) or "（无）")
+            .replace("{text}", text)
+        )
+        with _QuietCapture("CAPTION"):
+            out = self._llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=512,
+                **({"grammar": self._fix_grammar}
+                   if self._fix_grammar is not None else {}),
+            )
+        content = (out["choices"][0]["message"]["content"] or "").strip()
+        return _parse_fix_mt(content, text)
+
+
+class LiveCaptionEngine:
+    """Streaming ASR → MT pipeline behind the GUI's live bilingual captions.
+
+    Lifecycle: construct → start() → feed() from PortAudio callbacks → stop().
+    Events arrive on `on_event(dict)` from worker threads (never the Qt thread):
+      {"type": "status", "state": "loading" | "ready" | "stopped"}
+      {"type": "error", "message": str}
+      {"type": "partial", "text": str}                  # current unfinished line
+      {"type": "final", "id": int, "text": str}         # finished source line
+      {"type": "translation", "id": int, "text": str}   # its translation
+    """
+
+    def __init__(self, cfg: dict, on_event):
+        self.cfg = cfg or {}
+        self.on_event = on_event
+        self._lc = _deep_merge(
+            DEFAULT_CONFIG["live_captions"], self.cfg.get("live_captions", {})
+        )
+        self._buffers: "dict[str, collections.deque]" = {}
+        self._buf_lock = threading.Lock()
+        self._dropped_secs = 0.0
+        self._drop_log_at = 0.0
+        self._running = False
+        self._asr_thread: "threading.Thread | None" = None
+        self._mt_thread: "threading.Thread | None" = None
+        self._refine_thread: "threading.Thread | None" = None
+        self._mt_queue: "queue.Queue" = queue.Queue()
+        self._refine_queue: "queue.Queue" = queue.Queue()
+        self._seg_id = 0
+        # Last finalized (post-tidy) text, used by _dedup_caption_boundary to
+        # strip paraformer chunk-boundary duplicates when the next segment
+        # starts with the tail of the previous one.
+        self._last_final_text = ""
+        # Latest in-flight partial line, translated opportunistically when
+        # the MT queue is idle so English appears before the line finalizes.
+        self._partial_lock = threading.Lock()
+        self._partial_pending = ""
+        # Throttle partial caption updates so the line doesn't jitter with
+        # every decoder step (user-tunable via live_captions.partial_interval_ms).
+        self._partial_min_interval = (
+            max(0, int(self._lc.get("partial_interval_ms", 500))) / 1000.0)
+        self._last_partial_emit = 0.0
+        # MT coalescing: segments queue their id; the worker always translates
+        # the LATEST text for that id, so a refine that lands before the
+        # original translation ran replaces it instead of doubling the work.
+        self._mt_lock = threading.Lock()
+        self._mt_texts: dict = {}
+        self._mt_done: dict = {}
+        self._mt_last_secs = 0.0
+        # Cost of the last PARTIAL translation specifically — the gate for
+        # whether opportunistic partial translation stays on.
+        self._mt_partial_secs = 0.0
+        # Speaker attribution for live captions. Streaming voice-print
+        # clustering (cam++) is not viable here, but the recorder already
+        # tells us which ROLE each audio chunk came from — mic = me, system
+        # audio = whoever is on the call — so each finalized segment is
+        # attributed to whichever source carried more energy while it was
+        # being spoken. Caveat: several remote speakers share one role.
+        self._role_energy: dict = {}
+        self._role_peak: dict = {}
+        self._role_seen: set = set()
+        self._speaker_labels = bool(self._lc.get("speaker_labels", True))
+        # Voice-print speaker identification (own worker thread, so a 60 ms
+        # embedding never sits in front of ASR or MT). Splits the single
+        # system-audio channel into the individual people on the call, which
+        # channel role alone cannot do.
+        _sid = self._lc.get("speaker_id") or {}
+        self._spk_enabled = bool(_sid.get("enabled", True))
+        self._spk_model_id = (_sid.get("model") or "cam++").strip()
+        self._spk_min_samples = int(
+            max(0.2, float(_sid.get("min_secs", 1.0))) * _CAPTION_SAMPLE_RATE)
+        self._spk_max_backlog = max(1, int(_sid.get("max_backlog", 3)))
+        self._spk_dropped = 0
+        self._spk_clusterer = _SpeakerClusterer(
+            threshold=float(_sid.get("threshold", 0.6)),
+            max_speakers=int(_sid.get("max_speakers", 8)))
+        self._spk_queue: "queue.Queue" = queue.Queue()
+        self._spk_thread: "threading.Thread | None" = None
+        # Periodic batch re-check: every `interval_minutes` the finalized
+        # lines of that window go to the SAME provider that polishes
+        # transcripts, with the whole window as context. That context is the
+        # point — a per-line pass cannot know that 「拆特ops」 three lines ago
+        # and 「ChatOps」 now are the same thing.
+        _rev = self._lc.get("review") or {}
+        self._review_enabled = bool(_rev.get("enabled", True))
+        self._review_interval = max(
+            30.0, float(_rev.get("interval_minutes", 5)) * 60.0)
+        self._review_max_lines = max(1, int(_rev.get("max_lines", 120)))
+        self._review_provider = (_rev.get("provider") or "").strip()
+        # A line the model omitted (truncated reply) goes back for another
+        # round, but only this many times — otherwise one stubborn line
+        # would sit at the head of the buffer forever.
+        self._review_max_tries = max(0, int(_rev.get("max_tries", 2)))
+        self._review_lock = threading.Lock()
+        self._review_buffer: "list[dict]" = []
+        self._review_thread: "threading.Thread | None" = None
+        # Rolling discourse context for the qwen correct+translate call:
+        # the last few finalized (corrected) source lines.
+        self._mt_context: "collections.deque" = collections.deque(maxlen=3)
+        # Fast mode re-decodes finalized segments with the offline FunASR
+        # stack in the background ("对过去的断句二次校验").
+        self._refine_enabled = bool(self._lc.get("refine", True))
+        # A re-decode costs ~1.0–1.4 s per segment (measured on M2, offline
+        # paraformer-large + vad + punc). When speech comes in faster than
+        # that the queue grows without bound and refinements land minutes
+        # after the line scrolled away — worse than not refining at all. Cap
+        # the backlog and drop the excess: the streaming text stays on screen.
+        self._refine_max_backlog = max(
+            1, int(self._lc.get("refine_max_backlog", 3)))
+        self._refine_dropped = 0
+
+    # ── event plumbing ──
+    def _emit(self, **ev):
+        try:
+            self.on_event(ev)
+        except Exception as e:
+            _log("ERR", f"caption on_event: {type(e).__name__}: {e}")
+
+    def _emit_partial(self, text: str):
+        # Tidy the IN-FLIGHT line too, not just finalized ones. A streaming
+        # decoder oscillates between hypotheses while a sentence is still
+        # open, and it shows: measured on one real meeting, the partial line
+        # carried 4-19x the duplication of the offline transcript of the SAME
+        # audio (single-char 85 vs 21 per 1000, triples 25 vs 1.3, 2-char word
+        # repeats 55 vs 5.4) — 「大大大家大家」/「在在在在」/「训练练练习」.
+        # Running the same collapse here removes the triples and word repeats
+        # outright, and gives the partial translation a clean input as well.
+        text = _caption_tidy_zh(text)
+        with self._partial_lock:
+            self._partial_pending = text
+        now = time.time()
+        if now - self._last_partial_emit < self._partial_min_interval:
+            return  # pending text still reaches MT; only the UI update waits
+        self._last_partial_emit = now
+        self._emit(type="partial", text=text)
+
+    def _queue_translation(self, sid: int, text: str):
+        with self._mt_lock:
+            self._mt_texts[sid] = text
+        self._mt_queue.put(sid)
+
+    def _review_record(self, sid: int, text: str):
+        if not self._review_enabled:
+            return
+        with self._review_lock:
+            for row in self._review_buffer:
+                if row["id"] == sid:      # refine/correct rewrote the line
+                    row["text"] = text
+                    return
+            self._review_buffer.append({"id": sid, "text": text, "dst": ""})
+
+    def _review_record_translation(self, sid: int, dst: str):
+        if not self._review_enabled:
+            return
+        with self._review_lock:
+            for row in self._review_buffer:
+                if row["id"] == sid:
+                    row["dst"] = dst
+                    return
+
+    def _take_segment_role(self) -> "str | None":
+        """Role that carried this segment, or None when labels would be noise.
+
+        Requires two roles to have been heard in the session: labelling every
+        line 「我」 in a solo recording (or when system audio never opened)
+        tells the user nothing.
+        """
+        tally, self._role_energy = self._role_energy, {}
+        if not self._speaker_labels or len(self._role_seen) < 2 or not tally:
+            return None
+        return max(tally.items(), key=lambda kv: kv[1])[0]
+
+    def _finalize_segment(self, text: str, audio: "np.ndarray | None" = None):
+        with self._partial_lock:
+            self._partial_pending = ""
+        text = _caption_tidy_zh(text)
+        text = _dedup_caption_boundary(self._last_final_text, text).strip()
+        if not text:
+            return  # entire segment was a duplicate of the previous tail
+        if _caption_is_noise(text):
+            # Never reaches the pane, MT, refine or the voice print: a junk
+            # segment used to cost a caption line AND a phantom speaker.
+            _log("CAPTION", f"noise segment dropped: {text!r}")
+            return
+        self._last_final_text = text
+        self._seg_id += 1
+        sid = self._seg_id
+        role = self._take_segment_role()
+        self._emit(type="final", id=sid, text=text, role=role)
+        self._review_record(sid, text)
+        self._queue_translation(sid, text)
+        # The refine pass re-decodes with paraformer-zh — a CHINESE model. On
+        # an English line it does not correct, it corrupts: a real session
+        # (2026-08-26 15:15) logged changed=True on 53 of 56 English segments,
+        # 1.7–2.5 s each, and the user saw the pass "do nothing useful". So
+        # English-dominant segments keep the bilingual streaming model's own
+        # text, which is the better source for them.
+        if (
+            self._refine_enabled
+            and audio is not None
+            and getattr(audio, "size", 0) >= int(0.5 * _CAPTION_SAMPLE_RATE)
+            and not _caption_is_english(text)
+        ):
+            if self._refine_queue.qsize() >= self._refine_max_backlog:
+                self._refine_dropped += 1
+                _log("CAPTION",
+                     f"refine skipped seg={sid} (backlog="
+                     f"{self._refine_queue.qsize()} >= "
+                     f"{self._refine_max_backlog}; dropped_total="
+                     f"{self._refine_dropped})")
+            else:
+                self._refine_queue.put((sid, audio, text))
+        if (
+            self._spk_enabled
+            and audio is not None
+            and getattr(audio, "size", 0) >= self._spk_min_samples
+        ):
+            if self._spk_queue.qsize() >= self._spk_max_backlog:
+                self._spk_dropped += 1
+                _log("CAPTION",
+                     f"speaker id skipped seg={sid} (backlog="
+                     f"{self._spk_queue.qsize()}; dropped_total="
+                     f"{self._spk_dropped})")
+            else:
+                self._spk_queue.put((sid, audio, role))
+
+    # ── audio input; called on PortAudio callback threads — keep it light ──
+    def feed(self, source: str, frames: "np.ndarray", samplerate: int):
+        if not self._running:
+            return
+        try:
+            # Downmix ALL of a device's channels. Taking only channel 0
+            # silently discarded content: playing a role-separated stereo
+            # recording back through BlackHole put the speech on channel 1,
+            # so the clean digital copy read as pure silence (RMS 0.0000) and
+            # the captions came from the microphone re-recording the speakers
+            # through the air. Same loss would hit any hard-right-panned
+            # participant in a live call.
+            mono = (frames.mean(axis=1)
+                    if getattr(frames, "ndim", 1) > 1 else frames)
+            dropped = 0.0
+            with self._buf_lock:
+                buf = self._buffers.setdefault(source, collections.deque())
+                buf.append((np.asarray(mono, dtype=np.float32), int(samplerate)))
+                total = sum(len(c) / sr for c, sr in buf)
+                while buf and total > _CAPTION_RING_SECONDS:
+                    c, sr = buf.popleft()
+                    total -= len(c) / sr
+                    dropped += len(c) / sr
+            if dropped:
+                # Audio thrown away because the ASR fell this far behind. It
+                # used to happen in complete silence, which made a whole class
+                # of "why did the captions miss that" unanswerable — and the
+                # `captions` replay tool hit it immediately by feeding faster
+                # than the recognizer consumes.
+                self._dropped_secs += dropped
+                now = time.time()
+                if now - self._drop_log_at > 5.0:
+                    self._drop_log_at = now
+                    _log("CAPTION",
+                         f"ring buffer overflow: dropped {dropped:.1f}s from "
+                         f"{source!r} (ASR behind by >{_CAPTION_RING_SECONDS:.0f}s; "
+                         f"session total {self._dropped_secs:.1f}s)")
+        except Exception as e:
+            _log("ERR", f"caption feed: {type(e).__name__}: {e}")
+
+    def backlog_secs(self) -> float:
+        """Seconds of audio waiting on the slowest source's ring buffer.
+
+        Exposed so a caller can pace itself: past `_CAPTION_RING_SECONDS`
+        `feed()` starts dropping, which the `captions` replay tool would
+        otherwise hit immediately by pushing samples faster than the
+        recognizer consumes them.
+        """
+        with self._buf_lock:
+            return max((sum(len(c) / sr for c, sr in buf)
+                        for buf in self._buffers.values()), default=0.0)
+
+    def _drain_mixed(self) -> "np.ndarray":
+        """Drain all per-source backlogs, resample to 16 kHz, sum into mono."""
+        with self._buf_lock:
+            drained = {s: list(b) for s, b in self._buffers.items()}
+            for b in self._buffers.values():
+                b.clear()
+        tracks = []
+        for source, chunks in drained.items():
+            if not chunks:
+                continue
+            parts = [_caption_resample(c, sr) for c, sr in chunks]
+            track = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+            if track.size:
+                tracks.append(track)
+                # Energy per role, accumulated until the segment finalizes.
+                # Scored RELATIVE to each source's own running peak: a mic at
+                # -30 dBFS and a digital playback stream at -6 dBFS are not
+                # comparable in absolute RMS, and comparing them raw made the
+                # louder channel win nearly every segment (observed: almost
+                # every line tagged 对方). Peak decays slowly so a one-off
+                # loud burst doesn't desensitise a source for the session.
+                rms = float(np.sqrt(np.mean(np.square(track))))
+                peak = max(self._role_peak.get(source, 0.0) * 0.999, rms,
+                           _CAPTION_ROLE_RMS_FLOOR)
+                self._role_peak[source] = peak
+                self._role_energy[source] = (
+                    self._role_energy.get(source, 0.0)
+                    + (rms / peak) * track.size)
+                if peak > _CAPTION_ROLE_RMS_FLOOR:
+                    # Peak over the session, not the current window: a
+                    # built-in mic never reaches the old 0.01 instantaneous
+                    # bar, so `side` came back None for all 208 segments of a
+                    # real meeting and the tag never got its colour.
+                    self._role_seen.add(source)
+        if not tracks:
+            return np.zeros(0, dtype=np.float32)
+        n = max(len(t) for t in tracks)
+        mixed = np.zeros(n, dtype=np.float32)
+        for t in tracks:
+            mixed[: len(t)] += t
+        return np.clip(mixed, -1.0, 1.0)
+
+    # ── lifecycle ──
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._asr_thread = threading.Thread(
+            target=self._asr_worker, daemon=True, name="caption-asr")
+        self._mt_thread = threading.Thread(
+            target=self._mt_worker, daemon=True, name="caption-mt")
+        self._asr_thread.start()
+        self._mt_thread.start()
+        if self._refine_enabled:
+            self._refine_thread = threading.Thread(
+                target=self._refine_worker, daemon=True, name="caption-refine")
+            self._refine_thread.start()
+        if self._spk_enabled:
+            self._spk_thread = threading.Thread(
+                target=self._speaker_worker, daemon=True, name="caption-spk")
+            self._spk_thread.start()
+        if self._review_enabled:
+            self._review_thread = threading.Thread(
+                target=self._review_worker, daemon=True, name="caption-review")
+            self._review_thread.start()
+        _log("CAPTION", f"engine start refine={self._refine_enabled}")
+
+    def stop(self):
+        self._running = False
+        self._mt_queue.put(None)
+        self._refine_queue.put(None)
+        self._spk_queue.put(None)
+        for t in (self._asr_thread, self._mt_thread, self._refine_thread,
+                  self._spk_thread, self._review_thread):
+            if t:
+                t.join(timeout=5.0)
+        self._asr_thread = self._mt_thread = self._refine_thread = None
+        self._emit(type="status", state="stopped")
+        _log("CAPTION", "engine stopped")
+
+    # ── backend selection (overridable in tests) ──
+    def _stt_funasr_cfg(self) -> dict:
+        return _deep_merge(
+            DEFAULT_CONFIG["stt"], self.cfg.get("stt", {})).get("funasr", {})
+
+    def _load_asr_backend(self):
+        key = ("asr",)
+        backend = _caption_backend_cache.get(key)
+        if backend is not None:
+            backend.reset_session(self._emit_partial, self._finalize_segment)
+            return backend
+        backend = _SherpaCaptionASR(
+            self._lc, self._emit_partial, self._finalize_segment,
+            hotword=self._stt_funasr_cfg().get("hotword", ""))
+        _caption_backend_cache[key] = backend
+        return backend
+
+    def _load_mt_backend(self):
+        provider = (self._lc.get("mt_provider") or "default").strip().lower()
+        hotword = self._stt_funasr_cfg().get("hotword", "")
+        if provider == "qwen":
+            backend = _caption_backend_cache.get(("mt", "qwen"))
+            if backend is not None:
+                backend.set_hotword(hotword)  # hotword may have grown since caching
+                return backend
+            try:
+                backend = _QwenCaptionMT(self.cfg, self._lc, hotword=hotword)
+                _caption_backend_cache[("mt", "qwen")] = backend
+                return backend
+            except Exception as e:
+                _log("CAPTION",
+                     f"qwen MT unavailable, falling back to opus-mt: "
+                     f"{type(e).__name__}: {e}")
+        # marian / nllb pin the MT model independently of the ASR mode. That
+        # combination matters: fast mode's bilingual streaming ASR is the
+        # better English recognizer, but on domain terminology the two MT
+        # models trade wins — measured on real meeting lines, NLLB kept `PoC`
+        # and `包裹` where opus-mt produced 「钻石交易市场」and 「土地」, while
+        # opus-mt kept `RFP` where NLLB dropped a letter. NLLB also costs
+        # 760–1200 ms per line against opus-mt's 120–150 ms. No default is
+        # right for everyone, hence the knob.
+        want = "nllb" if provider == "nllb" else "marian"
+        key = ("mt", want)
+        backend = _caption_backend_cache.get(key)
+        if backend is None:
+            backend = (
+                _MarianCaptionMT(self._lc) if want == "marian"
+                else _NLLBCaptionMT(self._lc)
+            )
+            _caption_backend_cache[key] = backend
+        return backend
+
+    # ── workers ──
+    def _asr_worker(self):
+        self._emit(type="status", state="loading")
+        try:
+            backend = self._load_asr_backend()
+        except Exception as e:
+            _log("ERR", f"caption asr load: {type(e).__name__}: {e}")
+            self._emit(type="error", message=str(e))
+            self._running = False
+            return
+        self._emit(type="status", state="ready")
+        try:
+            while self._running:
+                time.sleep(_CAPTION_PACER_INTERVAL)
+                chunk = self._drain_mixed()
+                try:
+                    backend.accept(chunk)
+                except Exception as e:
+                    _log("ERR", f"caption asr step: {type(e).__name__}: {e}")
+        finally:
+            try:
+                backend.flush()
+            except Exception as e:
+                _log("CAPTION", f"asr flush: {type(e).__name__}: {e}")
+
+    def _mt_worker(self):
+        backend = None
+
+        def _ensure_backend():
+            nonlocal backend
+            if backend is None:
+                try:
+                    backend = self._load_mt_backend()
+                except Exception as e:
+                    _log("ERR", f"caption mt load: {type(e).__name__}: {e}")
+                    self._emit(type="error", message=str(e))
+                    backend = False  # sentinel: don't retry every segment
+            return backend
+
+        # Preload so the first finalized line doesn't pay model-load latency.
+        _ensure_backend()
+        last_partial = ""
+        while True:
+            try:
+                item = self._mt_queue.get(timeout=0.25)
+            except queue.Empty:
+                # Idle tick: opportunistically translate the in-flight
+                # partial so English shows up before the line finalizes.
+                # Skipped when the PARTIAL path itself is slow (e.g. NLLB on
+                # CPU): a partial in flight delays the next finalized line by
+                # its own duration, so that — not the fix path's cost — is the
+                # right thing to gate on. Gating on the shared last-call time
+                # would let the grammar-constrained fix call (~1.8 s) disable
+                # partial translation outright.
+                if not self._running or not _ensure_backend():
+                    continue
+                if self._mt_partial_secs > 0.8:
+                    continue
+                with self._partial_lock:
+                    text = self._partial_pending
+                if text and text != last_partial and len(text) >= 6:
+                    last_partial = text
+                    try:
+                        t0 = time.time()
+                        out = _collapse_mt_repeats(backend.translate(text))
+                        self._mt_partial_secs = time.time() - t0
+                        self._emit(type="partial_translation", text=out)
+                    except Exception as e:
+                        _log("ERR", f"caption partial translate: "
+                                    f"{type(e).__name__}: {e}")
+                continue
+            if item is None:
+                break
+            if not _ensure_backend():
+                continue
+            with self._mt_lock:
+                text = self._mt_texts.get(item, "")
+            if not text or self._mt_done.get(item) == text:
+                continue  # superseded duplicate or nothing to do
+            try:
+                t0 = time.time()
+                fix = getattr(backend, "correct_and_translate", None)
+                if fix is not None:
+                    # Combined ASR-correction + translation (qwen backend).
+                    # The corrected line replaces the caption via the same
+                    # `refined` event the FunASR refine pass uses; if that
+                    # pass later re-queues this id with new text, the
+                    # coalescing above simply corrects it again.
+                    fixed, out = fix(text, list(self._mt_context))
+                    corrected = bool(fixed) and fixed != text
+                    if corrected:
+                        self._emit(type="refined", id=item, text=fixed)
+                    self._mt_context.append(fixed or text)
+                else:
+                    corrected = False
+                    out = backend.translate(text)
+                self._mt_last_secs = time.time() - t0
+                self._mt_done[item] = text
+                out = _collapse_mt_repeats(out)
+                self._emit(type="translation", id=item, text=out)
+                self._review_record_translation(item, out)
+                _log("CAPTION",
+                     f"mt seg={item} took={self._mt_last_secs:.2f}s "
+                     f"corrected={corrected} out_chars={len(out or '')}")
+            except Exception as e:
+                _log("ERR", f"caption translate: {type(e).__name__}: {e}")
+
+    def _take_review_batch(self) -> "list[dict]":
+        """Pop up to `max_lines` buffered rows; the rest wait for the next
+        round so a long window can't build an unbounded prompt."""
+        with self._review_lock:
+            batch = self._review_buffer[:self._review_max_lines]
+            self._review_buffer = self._review_buffer[len(batch):]
+        return batch
+
+    def _review_llm(self, prompt: str) -> str:
+        """Overridable in tests. Uses the transcript-polish provider, i.e.
+        the same big model whose offline output is visibly better than
+        anything the realtime path can produce."""
+        provider = self._review_provider or self.cfg.get(
+            "polish_provider", "claude")
+        return _llm_run(prompt, provider, self.cfg, "字幕复核")
+
+    def _review_worker(self):
+        """Every `interval_minutes`, re-check that window's finalized lines.
+
+        Runs on its own thread and never touches the realtime path: a batch
+        LLM call takes seconds to tens of seconds, which is fine for lines
+        the user read minutes ago. Failure is swallowed — the captions simply
+        stay as they were.
+        """
+        next_run = time.time() + self._review_interval
+        while self._running:
+            time.sleep(0.5)
+            if time.time() < next_run:
+                continue
+            # next_run advances BEFORE the call on purpose: if a batch takes
+            # longer than the interval (measured 53 s for 6 lines through the
+            # claude CLI, most of it process startup), the next tick fires
+            # immediately and the worker catches up instead of drifting.
+            next_run = time.time() + self._review_interval
+            batch = self._take_review_batch()
+            if not batch:
+                continue
+            try:
+                t0 = time.time()
+                prompt = (
+                    _resolve_prompt(self.cfg, "caption_review")
+                    .replace("{hotwords}",
+                             _cfg_hotword(self.cfg) or "（无）")
+                    .replace("{lines}", _format_caption_review_lines(batch))
+                )
+                fixes = _parse_caption_review(self._review_llm(prompt), batch)
+                changed, dst_changed, missed = 0, 0, []
+                for row in batch:
+                    got = fixes.get(row["id"])
+                    if not got:
+                        # Popped from the buffer but absent from the reply —
+                        # a truncated or partial answer. Without putting it
+                        # back the line would never be reviewed again.
+                        if row.get("tries", 0) < self._review_max_tries:
+                            row["tries"] = row.get("tries", 0) + 1
+                            missed.append(row)
+                        continue
+                    text, dst = got
+                    # Every rewrite is logged with its before/after, one line
+                    # each, so a session can be audited after the fact: this
+                    # pass silently changes lines the user already read, and
+                    # aggregate counts alone make that unverifiable.
+                    if text != row["text"]:
+                        self._emit(type="refined", id=row["id"], text=text)
+                        changed += 1
+                        _log("CAPTION",
+                             f"review seg={row['id']} src: "
+                             f"{_review_log_text(row['text'])} → "
+                             f"{_review_log_text(text)}")
+                    if dst and dst != row["dst"]:
+                        self._emit(type="translation", id=row["id"], text=dst)
+                        dst_changed += 1
+                        _log("CAPTION",
+                             f"review seg={row['id']} dst: "
+                             f"{_review_log_text(row['dst'])} → "
+                             f"{_review_log_text(dst)}")
+                if missed:
+                    # Front of the queue, oldest first: retrying is bounded by
+                    # `tries`, so a model that keeps ignoring a line drops it
+                    # rather than blocking the buffer forever.
+                    with self._review_lock:
+                        self._review_buffer[:0] = missed
+                _log("CAPTION",
+                     f"review batch={len(batch)} parsed={len(fixes)} "
+                     f"src_changed={changed} dst_changed={dst_changed} "
+                     f"requeued={len(missed)} took={time.time() - t0:.1f}s")
+            except Exception as e:
+                _log("ERR", f"caption review: {type(e).__name__}: {e}")
+
+    def _load_speaker_backend(self):
+        return _CaptionSpeakerId(self._spk_model_id)
+
+    def _speaker_worker(self):
+        """Voice-print identification for finalized segments.
+
+        Emits `speaker` events carrying the display number and whether this
+        speaker is the local one, so the pane can relabel a line from the
+        channel-based guess (`[对方]`) to the actual person (`[说话人2]`).
+        Failure is non-fatal: the label just stays at whatever role said.
+        """
+        backend = None
+        while True:
+            item = self._spk_queue.get()
+            if item is None:
+                break
+            if backend is None:
+                try:
+                    backend = self._load_speaker_backend()
+                except Exception as e:
+                    _log("ERR", f"caption speaker id load: "
+                                f"{type(e).__name__}: {e}")
+                    backend = False   # sentinel: off for this session
+            if not backend:
+                continue
+            sid, audio, role = item
+            try:
+                t0 = time.time()
+                emb = backend.embed(audio)
+                if emb is None or emb.size == 0:
+                    continue
+                idx = self._spk_clusterer.assign(emb, role)
+                if idx < 0:
+                    continue
+                side = self._spk_clusterer.majority_side(idx)
+                self._emit(type="speaker", id=sid,
+                           speaker=self._spk_clusterer.display_number(idx),
+                           side=side)
+                _log("CAPTION",
+                     f"speaker seg={sid} cluster={idx} "
+                     f"n={self._spk_clusterer.display_number(idx)} side={side} "
+                     f"role={role} took={time.time() - t0:.2f}s")
+            except Exception as e:
+                _log("ERR", f"caption speaker id: {type(e).__name__}: {e}")
+
+    def _load_refine_backend(self):
+        stt = self._stt_funasr_cfg()
+        key = (
+            stt.get("model", "paraformer-zh"),
+            stt.get("vad_model", "fsmn-vad"),
+            stt.get("punc_model", "ct-punc"),
+        )
+        if key not in _funasr_model_cache:
+            _funasr_model_cache[key] = _load_funasr_automodel(*key)
+        return _funasr_model_cache[key]
+
+    def _refine_worker(self):
+        """Fast-mode second pass: re-decode finalized segment audio with the
+        offline FunASR stack (same cached models as the batch pipeline) and
+        replace the caption line + its translation when the text improves."""
+        model = None
+        while True:
+            item = self._refine_queue.get()
+            if item is None:
+                break
+            if model is None:
+                try:
+                    model = self._load_refine_backend()
+                except Exception as e:
+                    _log("ERR", f"caption refine load: {type(e).__name__}: {e}")
+                    model = False  # sentinel: refinement off for this session
+            if not model:
+                continue
+            sid, audio, before = item
+            try:
+                hw = (self._stt_funasr_cfg().get("hotword") or "").strip()
+                kwargs = {"hotword": hw} if hw else {}
+                t0 = time.time()
+                with _QuietCapture("CAPTION"):
+                    res = model.generate(input=audio, batch_size_s=60, **kwargs)
+                text = (res[0].get("text") or "").strip() if res else ""
+                text = _caption_tidy_zh(text)
+                # One line per segment quantifies what the pass actually buys:
+                # `changed=False` runs are pure cost, so a session's ratio tells
+                # you whether refine is worth its ~1.2 s and RAM.
+                _log("CAPTION",
+                     f"refine seg={sid} took={time.time() - t0:.2f}s "
+                     f"chars={len(before)}→{len(text)} "
+                     f"changed={bool(text) and text != before}")
+                if text:
+                    self._emit(type="refined", id=sid, text=text)
+                    self._review_record(sid, text)
+                    # Re-queue under the same id: coalescing in _mt_worker
+                    # drops the original translation if it hasn't run yet.
+                    self._queue_translation(sid, text)
+            except Exception as e:
+                _log("ERR", f"caption refine: {type(e).__name__}: {e}")
+
+
 # ── 转写 ──────────────────────────────────────────────────────────────────────
 
 def transcribe(audio_path: Path, provider: str, cfg: dict, on_progress=None, on_chunk_done=None) -> str:
@@ -3070,6 +5356,7 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
     asr_model   = pcfg.get("model", "paraformer-zh")
     vad_model   = pcfg.get("vad_model", "fsmn-vad")
     punc_model  = pcfg.get("punc_model", "ct-punc")
+    spk_model   = (pcfg.get("spk_model") or "").strip()
     hotword     = pcfg.get("hotword", "")
     chunk_secs       = int(pcfg.get("chunk_secs", 300))
     _workers_cfg     = int(pcfg.get("workers", 0))
@@ -3090,12 +5377,23 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
     total_secs = total_frames / framerate
 
     def _load_model():
-        key = (asr_model, vad_model, punc_model)
+        key = _funasr_cache_key(asr_model, vad_model, punc_model, spk_model)
         if key not in _funasr_model_cache:
             _funasr_model_cache[key] = _load_funasr_automodel(
-                asr_model, vad_model, punc_model,
+                asr_model, vad_model, punc_model, spk_model,
             )
         return _funasr_model_cache[key]
+
+    def _format(items, offset_s=0.0):
+        """Speaker-labelled lines when diarization is on, plain otherwise."""
+        if not spk_model:
+            return _items_to_lines(items, offset_s)
+        lines = _spk_lines(items, offset_s)
+        if lines:
+            return lines
+        _log("WARN", f"spk_model='{spk_model}' produced no sentence_info; "
+                     f"falling back to unlabelled lines")
+        return _items_to_lines(items, offset_s)
 
     def _items_to_lines(items, offset_s=0.0):
         """Turn FunASR's generate() output into [HH.Hs] prefixed lines. Defensive:
@@ -3128,8 +5426,22 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
                 lines.append(text)
         return lines
 
-    # ── 短录音：直接串行转写 ──────────────────────────────────────────────────
-    if chunk_secs <= 0 or total_secs <= chunk_secs:
+    # Diarization forces the serial path: cam++ clusters voices per generate()
+    # call, so chunk 2's 说话人1 is a different person from chunk 1's. Chunked
+    # labels would be worse than none — the notes LLM would merge two people
+    # into one. The cost is real (no 6-way parallelism), so it's logged and
+    # printed, and the whole feature stays opt-in via stt.funasr.spk_model.
+    diarize_serial = bool(spk_model) and chunk_secs > 0 and total_secs > chunk_secs
+    if diarize_serial:
+        _log("STT", f"diarization on (spk_model='{spk_model}'): forcing serial "
+                    f"single-pass over {total_secs / 60:.1f} min "
+                    f"(chunk_secs={chunk_secs} ignored) to keep speaker ids "
+                    f"consistent across the recording")
+        print(f"[转写] 已开启说话人区分（{spk_model}）：为保证说话人编号全程一致，"
+              f"本次不分块并发，{total_secs / 60:.1f} 分钟录音将单趟转写，耗时明显变长")
+
+    # ── 短录音 / 说话人区分：直接串行转写 ────────────────────────────────────
+    if chunk_secs <= 0 or total_secs <= chunk_secs or diarize_serial:
         print(f"[转写] 加载 FunASR {asr_model}（首次运行会自动下载模型）...")
         m = _load_model()
         if on_progress:
@@ -3144,7 +5456,7 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
             results = m.generate(**kwargs)
         if on_progress:
             on_progress(38)
-        result_text = "\n".join(_items_to_lines(results))
+        result_text = "\n".join(_format(results))
         if on_chunk_done:
             on_chunk_done(result_text, 0)
         return result_text
@@ -3172,7 +5484,7 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
         try:
             with _QuietCapture("STT"):
                 items = m.generate(**kwargs)
-            return idx, _items_to_lines(items, offset_s)
+            return idx, _format(items, offset_s)
         except Exception as e:
             import traceback
             _log("ERR", f"funasr chunk {idx + 1} failed: {type(e).__name__}: {e}")
@@ -3583,7 +5895,9 @@ def polish_transcript(transcript: str, provider: str, cfg: dict, mode: str = "me
 
     def _run(i_chunk):
         i, chunk = i_chunk
-        prompt = _resolve_prompt(cfg, "polish").replace("{transcript}", chunk)
+        prompt = (_resolve_prompt(cfg, "polish")
+                  .replace("{transcript}", chunk)
+                  .replace("{hotwords}", _cfg_hotword(cfg) or "（无）"))
         result = _llm_run(prompt, provider, cfg, f"校对[{i}/{total}]")
         print(f"[校对] 第 {i}/{total} 块完成")
         return result
@@ -3614,6 +5928,188 @@ def generate_notes(transcript: str, provider: str, cfg: dict, mode: str = "meeti
         notes_en = fut_en.result()
     divider = "\n\n---\n\n"
     return notes_zh + divider + notes_en
+
+
+# ── 热词自动维护（方案 A+B）───────────────────────────────────────────────────
+# A（规则）+ B（LLM）从转写/纪要中提取专有名词，合并进 config.jsonc 的
+# stt.funasr.hotword —— 本次会议提取的热词从下一次录音开始生效。
+# 不引入任何额外的配置/状态文件：config.jsonc 是唯一存储。
+
+# Not "meaningless" words — just ones so common in code-switched speech
+# that boosting them as hotwords would hurt more than help.
+_HOTWORD_STOPWORDS = frozenset("""
+a an the and or but if then else for to of in on at by with from as is are was
+were be been being am do does did done have has had having will would can could
+should shall may might must not no yes it its this that these those there their
+here what when where which who whom why how all any both each few more most
+other some such own same so than too very just also about into over under again
+once during before after above below up down out off further then we you they
+he she me my your our his her them him us ok okay right well like get got make
+made go going went gone come came take took taken see saw seen know knew known
+think thought want wanted need needed use used using work works worked working
+one two three four five ten new old good bad big small long short high low time
+day week month year way thing things people team teams part parts lot bit end
+start next last first second per via etc app apps item items case cases
+""".split())
+
+
+def _cfg_hotword(cfg: dict) -> str:
+    """The current stt.funasr.hotword string ("" when unset)."""
+    return (((cfg.get("stt") or {}).get("funasr") or {})
+            .get("hotword") or "").strip()
+
+
+def _extract_hotword_candidates(text: str) -> "list[str]":
+    """方案 A：规则法热词候选（无 LLM 开销）。
+
+    Mines English/alphanumeric tokens that look like terminology:
+    acronyms (GKE), CamelCase / mixed-case (BigQuery), digit-bearing
+    (N4D). In CJK-dominant text (the normal meetingscribe transcript),
+    plain English words that recur are also kept — code-switched English
+    inside Chinese speech is inherently likely to be terminology. In
+    English-dominant text (e.g. the notes' English half) plain words are
+    skipped, otherwise every sentence-initial capital would qualify.
+    Chinese-only terms are scheme B's (LLM) job. Returns candidates
+    ordered by frequency (desc), then first appearance.
+    """
+    import re
+    if not text:
+        return []
+    ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
+    cjk = sum(1 for c in text if "一" <= c <= "鿿")
+    english_doc = ascii_letters > cjk
+    counts: "dict[str, int]" = {}
+    display: "dict[str, str]" = {}
+    order: "list[str]" = []
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9+#._\-]*", text):
+        tok = tok.strip("._-")
+        if not 2 <= len(tok) <= 32:
+            continue
+        low = tok.lower()
+        if low in _HOTWORD_STOPWORDS:
+            continue
+        if low not in counts:
+            order.append(low)
+            display[low] = tok
+        elif tok != tok.lower() and display[low] == display[low].lower():
+            display[low] = tok  # prefer a cased variant over all-lowercase
+        counts[low] = counts.get(low, 0) + 1
+    out = []
+    for low in order:
+        tok = display[low]
+        acronym = tok.isupper() and len(tok) <= 10
+        has_digit = any(c.isdigit() for c in tok)
+        mixed_case = any(c.isupper() for c in tok[1:])
+        if acronym or has_digit or mixed_case:
+            out.append(low)
+        elif not english_doc and (counts[low] >= 2 or tok[0].isupper()):
+            # In CJK text a Capitalized English token is almost surely a
+            # proper noun (FunASR capitalizes recognized names), so one
+            # occurrence suffices; plain lowercase needs repetition.
+            out.append(low)
+    out.sort(key=lambda w: (-counts[w], order.index(w)))
+    return [display[w] for w in out[:50]]
+
+
+def _clean_hotword_token(tok: str) -> str:
+    return tok.strip(".,;:!?，。、；：！？·\"'`()（）[]【】<>《》")
+
+
+def _merge_hotwords(existing: str, new_terms: "list[str]",
+                    max_count: int = 100) -> str:
+    """Merge new hotword candidates into the existing space-separated
+    hotword string: case-insensitive dedup, first-seen casing wins,
+    insertion order preserved. Over `max_count` the OLDEST entries are
+    evicted (rolling vocabulary), so the list keeps tracking recent
+    meetings instead of freezing at the cap."""
+    seen: "set[str]" = set()
+    out: "list[str]" = []
+    for tok in (existing or "").split() + list(new_terms):
+        tok = _clean_hotword_token(tok)
+        if not 2 <= len(tok) <= 32 or " " in tok or tok.isdigit():
+            continue
+        low = tok.lower()
+        if low in seen or low in _HOTWORD_STOPWORDS:
+            continue
+        seen.add(low)
+        out.append(tok)
+    if max_count > 0 and len(out) > max_count:
+        out = out[-max_count:]
+    return " ".join(out)
+
+
+def _parse_llm_hotwords(out: str) -> "list[str]":
+    """Parse the hotwords_extract LLM reply. Instructed to emit one
+    space-separated line, but tolerate bullets / 、 separators / a stray
+    preamble line ending in a colon."""
+    import re
+    toks: "list[str]" = []
+    for line in (out or "").splitlines():
+        line = line.strip().lstrip("-*•").strip()
+        if not line or line.startswith("#") or line.endswith(("：", ":")):
+            continue
+        for tok in re.split(r"[\s,，、;；/|]+", line):
+            tok = _clean_hotword_token(tok)
+            if 2 <= len(tok) <= 32:
+                toks.append(tok)
+    return toks[:50]
+
+
+def _extract_hotwords_llm(text: str, provider: str, cfg: dict) -> "list[str]":
+    """方案 B：LLM 术语提取（离线阶段，不影响实时字幕/录音路径）。"""
+    prompt = _resolve_prompt(cfg, "hotwords_extract").replace("{transcript}", text)
+    return _parse_llm_hotwords(_llm_run(prompt, provider, cfg, "热词提取"))
+
+
+def _persist_hotwords(new_terms: "list[str]", cfg: dict,
+                      max_count: int = 100) -> "list[str]":
+    """Merge `new_terms` into stt.funasr.hotword, update the runtime cfg
+    in place, and write config.jsonc (comment-preserving in-place patch
+    via save_config). Returns the terms actually added."""
+    existing = ((cfg.get("stt") or {}).get("funasr") or {}).get("hotword", "") or ""
+    merged = _merge_hotwords(existing, new_terms, max_count)
+    if merged == _merge_hotwords(existing, [], max_count):
+        return []
+    known = {t.lower() for t in existing.split()}
+    added = [t for t in merged.split() if t.lower() not in known]
+    cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = merged
+    try:
+        on_disk: dict = {}
+        if CONFIG_FILE.exists():
+            on_disk = json.loads(
+                _strip_jsonc_comments(CONFIG_FILE.read_text(encoding="utf-8")))
+        on_disk.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = merged
+        save_config(on_disk)
+        _log("STT", f"hotword updated: +{len(added)} "
+                    f"({' '.join(added)}) → {len(merged.split())} total")
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        _log("WARN", f"hotword persist failed: {type(e).__name__}: {e}")
+    return added
+
+
+def _auto_update_hotwords(transcript: str, provider: str, cfg: dict) -> "list[str]":
+    """方案 A+B 入口：纪要/总结生成后调用。绝不抛异常——热词维护失败
+    不允许影响已经成功的转写/纪要流水线。Returns the newly added terms."""
+    try:
+        hw_cfg = _deep_merge(DEFAULT_CONFIG["hotwords"], cfg.get("hotwords") or {})
+        if not hw_cfg.get("auto_update", True):
+            return []
+        candidates: "list[str]" = []
+        if hw_cfg.get("rule_extract", True):
+            candidates += _extract_hotword_candidates(transcript or "")
+        if hw_cfg.get("llm_extract", True):
+            try:
+                candidates += _extract_hotwords_llm(transcript or "", provider, cfg)
+            except (Exception, SystemExit) as e:
+                # _llm_* error paths may sys.exit(); a failed extraction
+                # must not kill a pipeline that already produced notes.
+                _log("WARN", f"hotword llm extract failed: {type(e).__name__}: {e}")
+        if not candidates:
+            return []
+        return _persist_hotwords(candidates, cfg, int(hw_cfg.get("max_count", 100)))
+    except Exception as e:
+        _log("WARN", f"hotword auto-update failed: {type(e).__name__}: {e}")
+        return []
 
 
 def transcribe_and_polish(
@@ -3653,7 +6149,9 @@ def transcribe_and_polish(
         _warmup_fut = polish_ex.submit(_llm_run, "x", polish_provider, cfg, "预热")
 
         def on_chunk_done(text: str, idx: int):
-            prompt = _resolve_prompt(cfg, "polish").replace("{transcript}", text)
+            prompt = (_resolve_prompt(cfg, "polish")
+                      .replace("{transcript}", text)
+                      .replace("{hotwords}", _cfg_hotword(cfg) or "（无）"))
             print(f"[校对] 第 {idx + 1} 块转写完成，已提交校对...")
             fut = polish_ex.submit(_llm_run, prompt, polish_provider, cfg, f"校对[块{idx + 1}]")
             pending.append((idx, fut))
@@ -4252,6 +6750,10 @@ def _cmd_record_body(args, cfg):
     print("─" * 60)
     note_path = save_minutes(notes, audio_path, mode)
     print(f"\n✅ 完成！{notes_label}已保存: {note_path}")
+    added_hw = _auto_update_hotwords(transcript_polished, notes_provider, cfg)
+    if added_hw:
+        print(f"[热词] 新增 {len(added_hw)} 个：{' '.join(added_hw)}"
+              f"（已写入 config.jsonc，下次录音生效）")
 
 
 def cmd_transcribe(args, cfg):
@@ -4346,6 +6848,10 @@ def _cmd_transcribe_body(args, cfg):
     print("─" * 60)
     note_path = save_minutes(notes, audio_path, mode)
     print(f"\n✅ 完成！{notes_label}已保存: {note_path}")
+    added_hw = _auto_update_hotwords(transcript_polished, notes_provider, cfg)
+    if added_hw:
+        print(f"[热词] 新增 {len(added_hw)} 个：{' '.join(added_hw)}"
+              f"（已写入 config.jsonc，下次录音生效）")
 
 
 def cmd_config(args, cfg):
@@ -4365,6 +6871,330 @@ def cmd_config(args, cfg):
         print(f"✅ {key} = {value}")
     else:
         print(json.dumps(cfg, ensure_ascii=False, indent=2))
+
+
+def _wav_channels_by_role(path: Path) -> "tuple[dict, int]":
+    """Split a recording into {role: samples}, mirroring how it was captured.
+
+    `MultiStreamRecorder.save` writes channel 0 = system audio, channel 1 =
+    microphone (the `wanted` order). Feeding them back as SEPARATE sources is
+    what makes a replay faithful: the engine mixes and attributes them exactly
+    as it would live. A mono file is treated as microphone-only.
+    """
+    with wave.open(str(path), "rb") as wf:
+        sr, ch, n = wf.getframerate(), wf.getnchannels(), wf.getnframes()
+        raw = np.frombuffer(wf.readframes(n), dtype=np.int16)
+    data = raw.astype(np.float32) / 32768.0
+    if ch <= 1:
+        return {"mic": data}, sr
+    frames = data.reshape(-1, ch)
+    return {"system": frames[:, 0], "mic": frames[:, 1]}, sr
+
+
+def cmd_captions(args, cfg):
+    """`captions` 子命令：把已有录音回放进实时字幕引擎。"""
+    _, restore = _setup_log_file()
+    try:
+        _cmd_captions_body(args, cfg)
+    finally:
+        restore()
+
+
+def _cmd_captions_body(args, cfg):
+    """Replay a WAV through LiveCaptionEngine with no audio devices involved.
+
+    Playing a file through the speakers and letting the microphone pick it up
+    is NOT a way to test caption changes: it adds a whole speaker → room →
+    mic round trip, and a role-separated recording puts its speech on the
+    channel the capture device does not carry. This feeds the samples straight
+    into the engine instead, so two runs over the same file are comparable and
+    a caption change can be judged without a room.
+    """
+    path = Path(args.file).expanduser()
+    if not path.exists():
+        print(f"[错误] 文件不存在: {path}")
+        sys.exit(1)
+
+    tracks, sr = _wav_channels_by_role(path)
+    total_secs = max(len(v) for v in tracks.values()) / sr
+    start = max(0.0, float(getattr(args, "start", 0) or 0))
+    span = float(getattr(args, "seconds", 0) or 0)
+    if start or span:
+        a = int(start * sr)
+        b = int((start + span) * sr) if span else None
+        tracks = {k: v[a:b] for k, v in tracks.items()}
+        total_secs = max(len(v) for v in tracks.values()) / sr
+
+    cfg = copy.deepcopy(cfg)
+    lc = cfg.setdefault("live_captions", {})
+    # The review pass is time-driven and costs an LLM call per interval, so a
+    # replay opts in explicitly; --review then forces one pass at the end over
+    # everything that accumulated, which is the comparable thing to look at.
+    lc.setdefault("review", {})["enabled"] = False
+
+    rows: dict = {}
+    order: list = []
+    trace: list = []
+    live = not getattr(args, "quiet", False)
+    # Events arrive from the ASR / MT / refine / speaker threads, so printing
+    # needs serialising or lines interleave mid-character.
+    out_lock = threading.Lock()
+
+    def _say(line: str) -> None:
+        if live:
+            with out_lock:
+                print(line, flush=True)
+
+    def on_event(ev):
+        t = ev.get("type")
+        trace.append(ev)
+        if t == "final":
+            sid = ev["id"]
+            rows[sid] = {"src": ev.get("text", ""), "dst": "",
+                         "role": ev.get("role"), "speaker": None,
+                         "revisions": 0}
+            order.append(sid)
+            _say(f"[{sid:3d}] {ev.get('text', '')}")
+        elif t == "refined" and ev.get("id") in rows:
+            rows[ev["id"]]["src"] = ev.get("text", "")
+            rows[ev["id"]]["revisions"] += 1
+            _say(f"[{ev['id']:3d}] ↻ {ev.get('text', '')}")
+        elif t == "translation" and ev.get("id") in rows:
+            rows[ev["id"]]["dst"] = ev.get("text", "")
+            _say(f"[{ev['id']:3d}]   → {ev.get('text', '')}")
+        elif t == "speaker" and ev.get("id") in rows:
+            rows[ev["id"]]["speaker"] = ev.get("speaker")
+            _say(f"[{ev['id']:3d}]   ⇢ 说话人{ev.get('speaker')}")
+        elif t == "error":
+            print(f"[字幕] 错误: {ev.get('message')}", file=sys.stderr)
+
+    engine = LiveCaptionEngine(cfg, on_event)
+    fast = bool(getattr(args, "fast", False))
+    print(f"[字幕] 回放 {path.name} — {total_secs:.1f} 秒，"
+          f"声源 {list(tracks)}，{'超实时（分句会与实况不同）' if fast else '实时速度'}",
+          flush=True)
+    if fast:
+        # The ASR worker drains on a 250 ms WALL-CLOCK pacer, so feeding 10x
+        # hands it 2.5 s per accept() — and `is_endpoint()` is checked once per
+        # call, so sentence boundaries inside a batch collapse. Measured on the
+        # same 104 s passage: 3 long run-on segments instead of 6. Fine for a
+        # smoke test, useless for judging segmentation or comparing runs.
+        print("[字幕] 提示：超实时模式下识别器每次收到的音频块变大，"
+              "断句会明显变少变长；对比字幕质量请用默认的实时速度。", flush=True)
+    engine.start()
+    step = int(_CAPTION_PACER_INTERVAL * sr)
+    n_samples = max(len(v) for v in tracks.values())
+    next_note = _CAPTIONS_PROGRESS_EVERY_SEC
+    try:
+        for off in range(0, n_samples, step):
+            for role, samples in tracks.items():
+                chunk = samples[off:off + step]
+                if chunk.size:
+                    engine.feed(role, chunk, sr)
+            fed = off / sr
+            if fed >= next_note:
+                next_note = fed + _CAPTIONS_PROGRESS_EVERY_SEC
+                with out_lock:
+                    print(f"[字幕] … 已喂入 {fed:.0f}/{total_secs:.0f} 秒，"
+                          f"定稿 {len(order)} 行", flush=True)
+            if fast:
+                # Feeding faster than the ASR consumes would only pile audio
+                # into the ring buffer (and past _CAPTION_RING_SECONDS it gets
+                # dropped), so pace against the backlog rather than blindly.
+                _captions_pace(engine)
+            else:
+                time.sleep(_CAPTION_PACER_INTERVAL)
+
+        with out_lock:
+            print(f"[字幕] 音频喂完，等待后台修正落地（上限 {args.wait:.0f} 秒）...",
+                  flush=True)
+        _captions_drain(engine, args.wait)
+        if getattr(args, "review", False):
+            _captions_force_review(engine)
+    finally:
+        engine.stop()
+
+    _captions_report(rows, order, trace, verbose=getattr(args, "trace", False))
+
+
+_CAPTIONS_PROGRESS_EVERY_SEC = 30.0
+
+
+def _captions_pace(engine) -> None:
+    """Yield to the workers, backing off while the ASR is behind.
+
+    The replay can push samples far faster than the recognizer consumes them.
+    `feed()` caps each source's backlog at `_CAPTION_RING_SECONDS` and DROPS
+    the excess, so an unpaced replay would silently transcribe a fraction of
+    the file.
+    """
+    for _ in range(400):                    # ≈ 10 s ceiling per chunk
+        if engine.backlog_secs() < _CAPTION_RING_SECONDS / 2:
+            return
+        time.sleep(_CAPTION_PACER_INTERVAL / 10)
+
+
+def _captions_drain(engine, timeout: float) -> None:
+    """Wait for the async workers to catch up before tearing the engine down."""
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        pending = (engine._mt_queue.qsize() + engine._refine_queue.qsize()
+                   + engine._spk_queue.qsize())
+        if pending == 0:
+            time.sleep(0.5)          # let the in-flight item finish
+            if (engine._mt_queue.qsize() + engine._refine_queue.qsize()
+                    + engine._spk_queue.qsize()) == 0:
+                return
+        time.sleep(0.25)
+    _log("CAPTION", "replay drain timed out; some corrections may be missing")
+
+
+def _captions_force_review(engine) -> None:
+    """Run the batch re-check once over everything, ignoring its timer."""
+    engine._review_enabled = True
+    batch = engine._take_review_batch()
+    if not batch:
+        print("[字幕] 复核：没有可复核的行")
+        return
+    print(f"[字幕] 复核 {len(batch)} 行（一次 LLM 调用）...")
+    prompt = (
+        _resolve_prompt(engine.cfg, "caption_review")
+        .replace("{hotwords}", _cfg_hotword(engine.cfg) or "（无）")
+        .replace("{lines}", _format_caption_review_lines(batch))
+    )
+    try:
+        fixes = _parse_caption_review(engine._review_llm(prompt), batch)
+    except Exception as e:
+        print(f"[字幕] 复核失败: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    for row in batch:
+        got = fixes.get(row["id"])
+        if not got:
+            continue
+        text, dst = got
+        if text != row["text"]:
+            engine._emit(type="refined", id=row["id"], text=text)
+        if dst and dst != row["dst"]:
+            engine._emit(type="translation", id=row["id"], text=dst)
+
+
+def _captions_report(rows: dict, order: list, trace: list, verbose: bool) -> None:
+    """Emit the settled state as ONE flushed write.
+
+    Built as a single string on purpose: the per-line prints were lost when
+    the process ended before stdout's block buffer was flushed, so a long
+    replay could finish having printed nothing at all.
+    """
+    out: list = []
+    if verbose:
+        out.append("\n── 事件轨迹 ──")
+        for ev in trace:
+            if ev.get("type") in ("partial", "partial_translation"):
+                continue          # too noisy to diff; several per second
+            body = {k: v for k, v in ev.items() if k != "type"}
+            out.append(f"  {ev.get('type'):12s} {body}")
+
+    out.append(f"\n── 字幕 ({len(order)} 行) ──")
+    for sid in order:
+        r = rows[sid]
+        tag = ""
+        if r["speaker"] is not None:
+            tag = f"[说话人{r['speaker']}] "
+        elif r["role"]:
+            tag = f"[{r['role']}] "
+        mark = f" ×{r['revisions']}" if r["revisions"] else ""
+        out.append(f"[{sid:3d}]{mark} {tag}{r['src']}")
+        out.append(f"      → {r['dst'] or '（无译文）'}")
+
+    src_chars = sum(len(r["src"]) for r in rows.values())
+    revised = sum(1 for r in rows.values() if r["revisions"])
+    translated = sum(1 for r in rows.values() if r["dst"])
+    speakers = {r["speaker"] for r in rows.values() if r["speaker"] is not None}
+    out.append("\n── 汇总 ──")
+    out.append(f"  定稿行数    : {len(order)}")
+    out.append(f"  原文总字数  : {src_chars}")
+    out.append(f"  被修正的行  : {revised}")
+    out.append(f"  有译文的行  : {translated}/{len(order)}")
+    out.append(f"  识别出说话人: {len(speakers)}")
+    print("\n".join(out), flush=True)
+    sys.stdout.flush()
+
+
+def cmd_hotwords(args, cfg):
+    _, restore = _setup_log_file()
+    try:
+        _cmd_hotwords_body(args, cfg)
+    finally:
+        restore()
+
+
+def _cmd_hotwords_body(args, cfg):
+    """`hotwords` 子命令：存量回填。
+
+    扫描 recordings 下已有的 .polish.txt（方案 A 规则提取）与
+    .meeting.md / .interview.md / .sharing.md（方案 B LLM 提取，纪要文本
+    紧凑、分块并发调用），合并写回 config.jsonc 的 stt.funasr.hotword。
+    日常增量由纪要流水线在每次生成后自动完成，无需手动跑本命令。
+    """
+    current = ((cfg.get("stt") or {}).get("funasr") or {}).get("hotword", "") or ""
+    if getattr(args, "show", False):
+        print(f"当前热词（{len(current.split())} 个）：")
+        print(current or "（空）")
+        return
+
+    hw_cfg = _deep_merge(DEFAULT_CONFIG["hotwords"], cfg.get("hotwords") or {})
+    recordings_dir = CONFIG_DIR / "recordings"
+    if not recordings_dir.exists():
+        print(f"[热词] 录音目录不存在：{recordings_dir}")
+        return
+
+    candidates: "list[str]" = []
+
+    polish_files = sorted(recordings_dir.glob("*.polish.txt"))
+    print(f"[热词] 规则扫描 {len(polish_files)} 个 .polish.txt ...")
+    for p in polish_files:
+        try:
+            candidates += _extract_hotword_candidates(p.read_text(encoding="utf-8"))
+        except OSError as e:
+            print(f"[热词] 跳过 {p.name}：{e}")
+
+    note_files = sorted(
+        f for suffix in _NOTES_SUFFIX.values()
+        for f in recordings_dir.glob(f"*{suffix}"))
+    if (not getattr(args, "no_llm", False)
+            and hw_cfg.get("llm_extract", True) and note_files):
+        import concurrent.futures
+        provider = cfg.get("meeting_notes_provider", "claude")
+        texts = []
+        for f in note_files:
+            try:
+                texts.append(f.read_text(encoding="utf-8"))
+            except OSError as e:
+                print(f"[热词] 跳过 {f.name}：{e}")
+        blob = "\n\n".join(texts)
+        chunks = [blob[i:i + 12000] for i in range(0, len(blob), 12000)]
+        print(f"[热词] LLM 提取（{provider}）：{len(note_files)} 份纪要 / "
+              f"{len(chunks)} 块并发 ...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(_extract_hotwords_llm, c, provider, cfg)
+                    for c in chunks]
+            for fut in futs:
+                try:
+                    candidates += fut.result()
+                except (Exception, SystemExit) as e:
+                    print(f"[热词] LLM 提取块失败：{type(e).__name__}: {e}")
+
+    if not candidates:
+        print("[热词] 未提取到候选热词")
+        return
+    added = _persist_hotwords(candidates, cfg, int(hw_cfg.get("max_count", 100)))
+    total = len(((cfg.get("stt") or {}).get("funasr") or {})
+                .get("hotword", "").split())
+    if added:
+        print(f"✅ 新增 {len(added)} 个热词（共 {total} 个），已写入 config.jsonc：")
+        print("   " + " ".join(added))
+    else:
+        print(f"[热词] 无新增（共 {total} 个）")
 
 
 # ── 桌面 UI (PyQt6 + PyQt6-Fluent-Widgets) ──────────────────────────────────
@@ -4423,7 +7253,7 @@ def _cmd_ui_body(args, cfg):
         from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QPoint, QSize
         from PyQt6.QtGui import (
             QFont, QAction, QColor, QSyntaxHighlighter, QTextCharFormat,
-            QTextCursor, QTextFormat,
+            QTextCursor, QTextFormat, QGuiApplication,
         )
         from PyQt6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
@@ -4437,7 +7267,7 @@ def _cmd_ui_body(args, cfg):
             TextEdit, ProgressBar, SegmentedWidget, BodyLabel,
             StrongBodyLabel, TitleLabel, SubtitleLabel, CaptionLabel,
             SearchLineEdit, TextBrowser, ScrollArea, SpinBox,
-            InfoBar, InfoBarPosition,
+            InfoBar, InfoBarPosition, SwitchButton,
         )
     except ImportError as e:
         print(
@@ -4742,6 +7572,16 @@ def _cmd_ui_body(args, cfg):
             "rec.no_file": "未选择录音文件",
             "rec.selected_prefix": "已选择：",
             "rec.history_title": "会议历史",
+            "rec.captions.title": "实时双语字幕",
+            "rec.captions.idle_hint": "开始录音后，此处实时显示中英双语字幕",
+            "rec.captions.disabled_hint": "字幕已关闭",
+            "rec.captions.status.loading": "字幕模型加载中…（首次使用需下载模型）",
+            "rec.captions.status.ready": "字幕运行中",
+            "rec.captions.status.stopped": "字幕已停止",
+            "rec.captions.error_prefix": "字幕出错：",
+            "rec.captions.role_mic": "我方",
+            "rec.captions.role_system": "对方",
+            "rec.captions.speaker_n": "说话人{n}",
             "rec.search_placeholder": "按文件名搜索…（子串匹配）",
             # ── History view
             "hist.search_placeholder": "按文件名搜索…（子串匹配）",
@@ -4783,6 +7623,7 @@ def _cmd_ui_body(args, cfg):
             "ctx.rename_dialog_prompt": "为 {ts} 设置一个可读的名字（留空则去掉自定义名字）：",
             # ── Pipeline log lines + warnings (shown in the in-UI log_view)
             "pipe.log.done": "✓ 完成 → {path}",
+            "pipe.info.done_title": "已完成",
             "pipe.log.failed": "✗ 失败：{err}",
             "pipe.log.cancelling": "[提示] 正在终止后台任务…",
             "pipe.log.cancelled": "[已停止] 后台任务已终止",
@@ -4871,6 +7712,16 @@ def _cmd_ui_body(args, cfg):
             "rec.no_file": "No recording selected",
             "rec.selected_prefix": "Selected: ",
             "rec.history_title": "Meeting history",
+            "rec.captions.title": "Live bilingual captions",
+            "rec.captions.idle_hint": "Bilingual captions appear here once recording starts",
+            "rec.captions.disabled_hint": "Captions are off",
+            "rec.captions.status.loading": "Loading caption models… (first use downloads them)",
+            "rec.captions.status.ready": "Captions live",
+            "rec.captions.status.stopped": "Captions stopped",
+            "rec.captions.error_prefix": "Caption error: ",
+            "rec.captions.role_mic": "Us",
+            "rec.captions.role_system": "Them",
+            "rec.captions.speaker_n": "Speaker {n}",
             "rec.search_placeholder": "Search by filename… (substring)",
             "hist.search_placeholder": "Search by filename… (substring)",
             "hist.tab.all": "All",
@@ -4909,6 +7760,7 @@ def _cmd_ui_body(args, cfg):
             "ctx.rename_dialog_title": "Rename meeting",
             "ctx.rename_dialog_prompt": "Pick a readable name for {ts} (leave blank to drop the custom name):",
             "pipe.log.done": "✓ Done → {path}",
+            "pipe.info.done_title": "Done",
             "pipe.log.failed": "✗ Failed: {err}",
             "pipe.log.cancelling": "[info] Cancelling background task…",
             "pipe.log.cancelled": "[stopped] Background task cancelled",
@@ -5156,6 +8008,10 @@ def _cmd_ui_body(args, cfg):
                 notes = generate_notes(polished, np_, self.cfg, self.mode)
                 _pipeline_check_cancelled()
                 note_path = save_minutes(notes, audio_path, self.mode)
+                added_hw = _auto_update_hotwords(polished, np_, self.cfg)
+                if added_hw:
+                    self.log.emit(f"[热词] 新增 {len(added_hw)} 个："
+                                  f"{' '.join(added_hw)}（下次录音生效）")
                 self.progress.emit(100)
                 self.done.emit(str(note_path))
             except _PipelineCancelled:
@@ -5191,6 +8047,9 @@ def _cmd_ui_body(args, cfg):
         status_changed = pyqtSignal(str)   # 'idle' | 'recording' | 'processing'
         elapsed_changed = pyqtSignal(int)  # seconds
         warning = pyqtSignal(str)
+        # LiveCaptionEngine events, re-emitted onto the Qt thread (queued
+        # connection — the engine calls .emit from its worker threads).
+        caption_event = pyqtSignal(dict)
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -5199,6 +8058,11 @@ def _cmd_ui_body(args, cfg):
             self._plan: "AudioPlan | None" = None
             self._start_time = 0.0
             self._status = "idle"
+            # Whether the NEXT session runs captions; set by
+            # RecordingInterface before start_recording(). There is only one
+            # recognition path, so this is a plain on/off.
+            self.captions_enabled = False
+            self._caption_engine: "LiveCaptionEngine | None" = None
             self._tick = QTimer(self)
             self._tick.setInterval(1000)
             self._tick.timeout.connect(self._on_tick)
@@ -5236,12 +8100,20 @@ def _cmd_ui_body(args, cfg):
                 return False
             recorder = MultiStreamRecorder(wanted, cfg["sample_rate"], role_labels=role_labels)
             recorder.on_warning = lambda code: self.warning.emit(code)
+            engine = None
+            if self.captions_enabled:
+                engine = LiveCaptionEngine(cfg, self.caption_event.emit)
+                engine.start()
+                recorder.on_audio_chunk = engine.feed
             try:
                 recorder.start()
             except Exception as e:
                 _log("ERR", f"Qt recorder.start: {type(e).__name__}: {e}")
                 self.warning.emit(f"录音设备启动失败: {e}")
+                if engine:
+                    engine.stop()
                 return False
+            self._caption_engine = engine
             self._recorder = recorder
             self._audio_path = audio_path
             self._plan = plan
@@ -5257,6 +8129,12 @@ def _cmd_ui_body(args, cfg):
                 self._recorder.stop()
             except Exception as e:
                 _log("ERR", f"Qt recorder.stop: {type(e).__name__}: {e}")
+            if self._caption_engine:
+                try:
+                    self._caption_engine.stop()
+                except Exception as e:
+                    _log("ERR", f"Qt caption stop: {type(e).__name__}: {e}")
+                self._caption_engine = None
             self._tick.stop()
             saved_path = None
             if self._audio_path and self._recorder.save(self._audio_path):
@@ -5290,8 +8168,36 @@ def _cmd_ui_body(args, cfg):
             # i18n: each callback re-applies its widget's text on lang switch.
             self._lang_callbacks: list = []
             self._current_status = "idle"
+            # Live-caption view model: finalized rows + the in-flight partial
+            # (and its opportunistic translation).
+            self._caption_rows: list = []
+            self._caption_partial = ""
+            self._caption_partial_en = ""
+            _lc_cfg = cfg.get("live_captions") or {}
+            self._caption_merge_gap = max(0, int(
+                _lc_cfg.get("merge_gap_ms", 2500)
+            )) / 1000.0
+            # Scroll-back retention for the caption panel: primarily a TIME
+            # window (history_minutes), with history_max as a memory backstop
+            # for pathological cadence. Older rows drop from the panel;
+            # on-disk transcripts are untouched.
+            self._caption_history_secs = max(
+                0, int(_lc_cfg.get("history_minutes", 180))) * 60
+            self._caption_row_cap = max(80, int(_lc_cfg.get("history_max", 12000)))
+            # Debounce window for document re-renders. Bursts of translation /
+            # refined events collapse into one render per window. A fixed
+            # window is enough now that _CaptionDocRenderer patches only the
+            # changed tail — cost no longer scales with retained history.
+            self._caption_render_debounce_ms = max(
+                0, int(_lc_cfg.get("render_debounce_ms", 120)))
+            self._caption_render_pending = False
+            self._caption_status_key: "str | None" = None
             self._build_ui()
+            # Needs caption_view, so it is created after _build_ui().
+            self._caption_renderer = _CaptionDocRenderer(self.caption_view)
             self._wire()
+            self._sync_caption_enabled_to_state()
+            self._render_captions()
             self._refresh_history()
             self._refresh_action_buttons()
             # Startup default: mute the active output device and park the
@@ -5318,6 +8224,9 @@ def _cmd_ui_body(args, cfg):
                 cb()
             # Re-render dynamic strings whose text depends on state.
             self._on_status_changed(self._current_status)
+            if self._caption_status_key:
+                self.caption_status.setText(_t(self._caption_status_key))
+            self._render_captions()
             if self._last_recorded:
                 self.chosen_label.setText(
                     f"{_t('rec.selected_prefix')}{self._last_recorded.name}")
@@ -5358,7 +8267,9 @@ def _cmd_ui_body(args, cfg):
             self.rec_btn = QPushButton(self)
             self.rec_btn.setFixedSize(132, 132)
             self.rec_btn.setIcon(FluentIcon.MICROPHONE.icon())
-            self.rec_btn.setIconSize(QSize(56, 56))
+            # Icon deliberately smaller than the 132 px disc: at 56 px it
+            # crowded the circle's edge.
+            self.rec_btn.setIconSize(QSize(40, 40))
             self.rec_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self._apply_rec_btn_style("idle")
 
@@ -5535,10 +8446,50 @@ def _cmd_ui_body(args, cfg):
             lv.addWidget(self.log_view)
             lv.addStretch(1)
 
-            # Right column — history sidebar
+            # Right column — live bilingual captions, full height.
+            right_col = QWidget(self)
+            right_col.setMinimumWidth(420)
+            rc = QVBoxLayout(right_col)
+            rc.setContentsMargins(0, 0, 0, 0)
+            rc.setSpacing(16)
+
+            # ── Caption card
+            captions = QFrame(self)
+            cv = QVBoxLayout(captions)
+            cv.setContentsMargins(0, 0, 0, 0)
+            cv.setSpacing(10)
+
+            cap_header = QHBoxLayout()
+            self._captions_title = SubtitleLabel("", self)
+            self._i18n(self._captions_title, "rec.captions.title")
+            cap_header.addWidget(self._captions_title)
+            cap_header.addStretch(1)
+            self.caption_switch = SwitchButton(self)
+            lc_cfg = _deep_merge(
+                DEFAULT_CONFIG["live_captions"], cfg.get("live_captions", {}))
+            self.caption_switch.setChecked(bool(lc_cfg.get("enabled", True)))
+            cap_header.addWidget(self.caption_switch)
+            cv.addLayout(cap_header)
+
+
+            self.caption_status = CaptionLabel("", self)
+            self.caption_status.setWordWrap(True)
+            cv.addWidget(self.caption_status)
+
+            self.caption_view = TextBrowser(self)
+            self.caption_view.setMinimumHeight(140)
+            cv.addWidget(self.caption_view, stretch=1)
+
+            # In-flight ("still being spoken") line: its own widget, NOT part
+            # of the caption document — see _render_caption_partial.
+            self.caption_partial_label = CaptionLabel("", self)
+            self.caption_partial_label.setWordWrap(True)
+            self.caption_partial_label.setTextFormat(Qt.TextFormat.RichText)
+            self.caption_partial_label.setVisible(False)
+            cv.addWidget(self.caption_partial_label)
+
+            # ── History card (below the record controls in the LEFT column)
             right = QFrame(self)
-            right.setMinimumWidth(320)
-            right.setMaximumWidth(420)
             rv = QVBoxLayout(right)
             rv.setContentsMargins(0, 0, 0, 0)
             rv.setSpacing(12)
@@ -5555,13 +8506,25 @@ def _cmd_ui_body(args, cfg):
             self.history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             rv.addWidget(self.history_list, stretch=1)
 
-            # Wrap each column in a soft rounded card so the two regions
-            # read as visually separate panels.
+            # Wrap each region in a soft rounded card so the three panels
+            # read as visually separate surfaces.
             _style_as_card(left, padding=20, name="recordingCardLeft")
+            _style_as_card(captions, padding=16, name="recordingCardCaptions")
             _style_as_card(right, padding=16, name="recordingCardRight")
 
-            root.addWidget(left, stretch=2)
-            root.addWidget(right, stretch=1)
+            # Left column stacks the controls card on top of the meeting
+            # history card; the caption panel owns the whole right column.
+            left_col = QWidget(self)
+            lcol = QVBoxLayout(left_col)
+            lcol.setContentsMargins(0, 0, 0, 0)
+            lcol.setSpacing(16)
+            lcol.addWidget(left, stretch=0)
+            lcol.addWidget(right, stretch=1)
+
+            rc.addWidget(captions, stretch=1)
+
+            root.addWidget(left_col, stretch=2)
+            root.addWidget(right_col, stretch=3)
 
         # ── Wiring
         def _wire(self):
@@ -5577,14 +8540,182 @@ def _cmd_ui_body(args, cfg):
             self.state.status_changed.connect(self._on_status_changed)
             self.state.elapsed_changed.connect(self._on_elapsed_changed)
             self.state.warning.connect(self._on_warning)
+            self.state.caption_event.connect(self._on_caption_event)
+            self.caption_switch.checkedChanged.connect(self._on_caption_prefs_changed)
 
             self.search_sidebar.textChanged.connect(lambda _t: self._refresh_history())
             self.history_list.itemClicked.connect(self._on_history_pick)
             self.history_list.customContextMenuRequested.connect(
                 self._on_history_context_menu)
+            _get_audio_monitor().on_recording_plan_change = self._on_plan_change
 
-            monitor = _get_audio_monitor()
-            monitor.on_recording_plan_change = self._on_plan_change
+        # ── Live captions
+        def _sync_caption_enabled_to_state(self):
+            """Push the panel's switch into _RecorderState for the NEXT session."""
+            self.state.captions_enabled = self.caption_switch.isChecked()
+
+        def _on_caption_prefs_changed(self, *_a):
+            self._sync_caption_enabled_to_state()
+            self._render_captions()
+            lc = cfg.setdefault("live_captions", {})
+            lc["enabled"] = self.caption_switch.isChecked()
+            try:
+                # In-place JSONC patch; silently skipped if the block is
+                # absent from config.jsonc (prefs then live for this run only).
+                _save_config_preserving_comments(cfg)
+            except Exception as e:
+                _log("ERR", f"persist caption prefs: {type(e).__name__}: {e}")
+
+        def _on_caption_event(self, ev: dict):
+            t = ev.get("type")
+            if t == "partial":
+                self._caption_partial = ev.get("text", "")
+                self._render_caption_partial()
+                return          # document untouched: no re-render needed
+            elif t == "partial_translation":
+                self._caption_partial_en = ev.get("text", "")
+                self._render_caption_partial()
+                return
+            elif t == "final":
+                self._caption_partial = ""
+                self._caption_partial_en = ""
+                self._render_caption_partial()
+                self._caption_rows.append(
+                    {"id": ev.get("id"), "src": ev.get("text", ""),
+                     "dst": "", "t": time.time(), "role": ev.get("role"),
+                     "speaker": None, "side": None})
+                _prune_caption_rows(
+                    self._caption_rows, time.time(),
+                    self._caption_history_secs, self._caption_row_cap)
+            elif t == "refined":
+                for row in reversed(self._caption_rows):
+                    if row["id"] == ev.get("id"):
+                        row["src"] = ev.get("text", row["src"])
+                        # Old translation no longer matches the refined
+                        # source — show "…" until the re-translation lands.
+                        row["dst"] = ""
+                        break
+            elif t == "translation":
+                for row in reversed(self._caption_rows):
+                    if row["id"] == ev.get("id"):
+                        row["dst"] = ev.get("text", "")
+                        break
+            elif t == "speaker":
+                # Voice print beats the channel-energy guess: it arrives
+                # ~60 ms later and can tell two remote people apart, which
+                # the single system-audio stream cannot.
+                for row in reversed(self._caption_rows):
+                    if row["id"] == ev.get("id"):
+                        row["speaker"] = ev.get("speaker")
+                        row["side"] = ev.get("side")
+                        break
+            elif t == "status":
+                self._caption_status_key = (
+                    f"rec.captions.status.{ev.get('state', 'stopped')}")
+                self.caption_status.setText(_t(self._caption_status_key))
+                return
+            elif t == "error":
+                self._caption_status_key = None
+                self.caption_status.setText(
+                    _t("rec.captions.error_prefix") + str(ev.get("message", "")))
+                return
+            else:
+                return
+            self._schedule_caption_render()
+
+        def _schedule_caption_render(self):
+            """Debounce setHtml() so caption event bursts don't flicker the
+            scrollbar. All event-driven renders funnel through here; direct
+            renders (init / language toggle) still call _render_captions()."""
+            delay = self._caption_render_debounce_ms
+            if delay <= 0:
+                self._render_captions()
+                return
+            if self._caption_render_pending:
+                return
+            self._caption_render_pending = True
+            QTimer.singleShot(delay, self._do_caption_render)
+
+        def _do_caption_render(self):
+            self._caption_render_pending = False
+            self._render_captions()
+
+        def _render_captions(self):
+            groups_html = []
+            # Display-layer paragraph merging: rapid-fire short finals show
+            # as one paragraph (data rows stay 1:1 with engine segments).
+            # One entry per group, each exactly two paragraphs — the unit
+            # `_CaptionDocRenderer` diffs and patches, so a new line touches
+            # only the tail no matter how long the retained history is.
+            for group in _group_caption_rows(
+                    self._caption_rows, self._caption_merge_gap):
+                src = _join_caption_texts([r["src"] for r in group])
+                dsts = [r["dst"] for r in group]
+                dst = _join_caption_texts([d for d in dsts if d])
+                if dst and any(not d for d in dsts):
+                    dst += " …"  # part of the paragraph still translating
+                # Speaker tag: mic = me, system audio = the other side. None
+                # when the engine can't attribute (single active source).
+                head = group[0]
+                role, speaker = head.get("role"), head.get("speaker")
+                label, colour = "", "#e0782c"
+                if speaker is not None:
+                    # Voice print = identity. Every speaker gets a number,
+                    # including several people sharing one microphone; the
+                    # channel only tints the tag (blue = our side).
+                    label = _t("rec.captions.speaker_n").format(n=speaker)
+                    if head.get("side") == "mic":
+                        colour = "#0a84ff"
+                elif role:
+                    # Still only the channel-energy guess (or speaker id off).
+                    key = f"rec.captions.role_{role}"
+                    # _t echoes unknown keys; a raw device name is a better
+                    # tag than "rec.captions.role_BlackHole 2ch".
+                    label = _t(key)
+                    label = role if label == key else label
+                    colour = "#0a84ff" if role == "mic" else "#e0782c"
+                tag = ""
+                if label:
+                    tag = (f'<span style="color:{colour}; font-weight:600;">'
+                           f'[{html.escape(label)}]</span> ')
+                groups_html.append(
+                    f'<p style="margin:6px 0 0 0; color:#1f1f1f;">'
+                    f'{tag}{html.escape(src)}</p>'
+                    f'<p style="margin:1px 0 0 0; color:#0066d6;">'
+                    f'{html.escape(dst) or "…"}</p>'
+                )
+            hint = (
+                _t("rec.captions.idle_hint")
+                if self.caption_switch.isChecked()
+                else _t("rec.captions.disabled_hint"))
+            mode = self._caption_renderer.render(
+                groups_html, f'<p style="color:#8a8a8a;">{hint}</p>')
+            # A "full" path means the incremental bookkeeping bailed out — fine
+            # occasionally (first paint, language toggle, history eviction),
+            # but a steady stream of them means every caption event is paying
+            # a whole-document re-layout again.
+            if mode == "full" and len(groups_html) > 200:
+                _log("CAPTION", f"caption pane full re-render "
+                                f"({len(groups_html)} groups)")
+
+        def _render_caption_partial(self):
+            """The in-flight line lives OUTSIDE the document.
+
+            It refreshes ~2×/s (partial_interval_ms) and used to drag the
+            whole pane through a re-render each time — ~70 % of all caption
+            events. As its own widget it costs one setText and the document
+            stays untouched between finalized lines."""
+            if not self._caption_partial:
+                self.caption_partial_label.setText("")
+                self.caption_partial_label.setVisible(False)
+                return
+            body = (f'<span style="color:#8a8a8a; font-style:italic;">'
+                    f'{html.escape(self._caption_partial)}</span>')
+            if self._caption_partial_en:
+                body += (f'<br/><span style="color:#7fa8d9; font-style:italic;">'
+                         f'{html.escape(self._caption_partial_en)}</span>')
+            self.caption_partial_label.setText(body)
+            self.caption_partial_label.setVisible(True)
 
         def _refresh_history(self):
             self.history_list.clear()
@@ -5686,10 +8817,30 @@ def _cmd_ui_body(args, cfg):
                 self._refresh_history()
                 self._refresh_action_buttons()
 
-            act_rename.triggered.connect(_do_rename)
-            act_reveal.triggered.connect(_do_reveal)
-            act_delete.triggered.connect(_do_delete)
-            menu.exec(self.history_list.mapToGlobal(pos))
+            # No nested exec() loop: show the menu asynchronously with
+            # popup() and defer the chosen handler to the next event-loop
+            # iteration. exec() from inside the context-menu event crashed
+            # in the Cocoa popup-show path (Python .ips crash reports:
+            # QMenu::exec → QWidgetPrivate::show_sys → libqcocoa SIGSEGV),
+            # and modal dialogs opened mid-teardown left ghost menus stuck
+            # on screen.
+            menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+            def _defer(fn):
+                return lambda: QTimer.singleShot(0, fn)
+
+            act_rename.triggered.connect(_defer(_do_rename))
+            act_reveal.triggered.connect(_defer(_do_reveal))
+            act_delete.triggered.connect(_defer(_do_delete))
+            global_pos = self.history_list.mapToGlobal(pos)
+            # Pin the popup to the screen actually under the cursor —
+            # a stale screen handle after monitor hot-unplug is another
+            # known cocoa popup crasher.
+            screen = QGuiApplication.screenAt(global_pos)
+            if screen is not None:
+                menu.setScreen(screen)
+            self._ctx_menu = menu  # keep the wrapper alive while shown
+            menu.popup(global_pos)
 
         # ── Volume slider
         def _on_vol_changed(self, val: int):
@@ -5829,6 +8980,18 @@ def _cmd_ui_body(args, cfg):
             audio_path = RECORDINGS_DIR / f"{ts}.wav"
 
             self._vol_device = plan.restore_output_name
+            # Fresh caption session: clear the transcript pane and hand the
+            # panel's current switch+mode to the recorder state.
+            self._caption_rows = []
+            self._caption_partial = ""
+            self._caption_partial_en = ""
+            # The renderer's committed-HTML bookkeeping must forget the old
+            # session, or the next render would diff against a document that
+            # is about to be replaced.
+            self._caption_renderer.reset()
+            self._render_caption_partial()
+            self._sync_caption_enabled_to_state()
+            self._render_captions()
             ok = self.state.start_recording(plan, audio_path)
             if ok:
                 QTimer.singleShot(300, self._sync_vol_slider)
@@ -5881,6 +9044,10 @@ def _cmd_ui_body(args, cfg):
 
         def _on_status_changed(self, s: str):
             self._current_status = s
+            # Caption prefs are session-scoped: lock the switch while a
+            # recording (or pipeline) is active.
+            caption_idle = s == "idle"
+            self.caption_switch.setEnabled(caption_idle)
             if s == "idle":
                 self._apply_rec_btn_style("idle")
                 self.title_label.setText(_t("rec.title.idle"))
@@ -6049,18 +9216,34 @@ def _cmd_ui_body(args, cfg):
 
         def _on_pipeline_done(self, path_str: str):
             self._reset_after_pipeline()
-            self._ui_log(_t("pipe.log.done", path=path_str))
             self._result_path = Path(path_str)
             self._refresh_action_buttons()
             self._refresh_history()
+            # The run log is transient: every line is already in the daily
+            # log file, and the action button flipping to "Open …" is the
+            # confirmation that matters. Leaving the pane parked on screen
+            # after a successful run is just clutter.
+            self._hide_pipeline_log()
+            InfoBar.success(
+                title=_t("pipe.info.done_title"),
+                content=Path(path_str).name,
+                isClosable=True, position=InfoBarPosition.TOP,
+                duration=4000, parent=self,
+            )
 
         def _on_pipeline_failed(self, msg: str):
             self._reset_after_pipeline()
+            # Failures KEEP the log: it is the only place the traceback and
+            # the step it died on are visible without opening the log file.
             self._ui_log(_t("pipe.log.failed", err=msg))
 
         def _on_pipeline_cancelled(self):
             self._reset_after_pipeline()
-            self._ui_log(_t("pipe.log.cancelled"))
+            self._hide_pipeline_log()
+
+        def _hide_pipeline_log(self):
+            self.log_view.clear()
+            self.log_view.setVisible(False)
 
         def _reset_after_pipeline(self):
             self.progress_bar.setVisible(False)
@@ -6900,10 +10083,23 @@ def _cmd_ui_body(args, cfg):
                         b.setEnabled(False)
                 self.refresh()
 
-            act_rename.triggered.connect(_do_rename)
-            act_reveal.triggered.connect(_do_reveal)
-            act_delete.triggered.connect(_do_delete)
-            menu.exec(self.list_w.mapToGlobal(pos))
+            # Same async-popup pattern as RecordingInterface's history menu
+            # (see the comment there): no nested exec() loop, handlers
+            # deferred past the menu teardown, screen pinned explicitly.
+            menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+            def _defer(fn):
+                return lambda: QTimer.singleShot(0, fn)
+
+            act_rename.triggered.connect(_defer(_do_rename))
+            act_reveal.triggered.connect(_defer(_do_reveal))
+            act_delete.triggered.connect(_defer(_do_delete))
+            global_pos = self.list_w.mapToGlobal(pos)
+            screen = QGuiApplication.screenAt(global_pos)
+            if screen is not None:
+                menu.setScreen(screen)
+            self._ctx_menu = menu  # keep the wrapper alive while shown
+            menu.popup(global_pos)
 
         # ── Pipeline (transcribe / meeting / interview) ────────────────
         # Re-runs the transcribe/polish/notes pipeline on a previously-
@@ -6954,7 +10150,15 @@ def _cmd_ui_body(args, cfg):
 
         def _on_pipeline_done(self, path_str: str):
             self._reset_after_pipeline()
-            self.h_log_view.append(_t("pipe.log.done", path=path_str))
+            # Same as the recording view: the run log is transient on success
+            # (it all lives in the daily log file), a toast reports the result.
+            self._hide_pipeline_log()
+            InfoBar.success(
+                title=_t("pipe.info.done_title"),
+                content=Path(path_str).name,
+                isClosable=True, position=InfoBarPosition.TOP,
+                duration=4000, parent=self,
+            )
             # Re-render: the .md / .polish.txt artifact list just changed.
             self.refresh()
             if self._current is not None:
@@ -6975,7 +10179,11 @@ def _cmd_ui_body(args, cfg):
 
         def _on_pipeline_cancelled(self):
             self._reset_after_pipeline()
-            self.h_log_view.append(_t("pipe.log.cancelled"))
+            self._hide_pipeline_log()
+
+        def _hide_pipeline_log(self):
+            self.h_log_view.clear()
+            self.h_log_view.setVisible(False)
 
         def _reset_after_pipeline(self):
             self.h_progress.setVisible(False)
@@ -7266,33 +10474,26 @@ def _cmd_ui_body(args, cfg):
                                 "nav.history")
             self._register_view(self.config_view, FluentIcon.SETTING,
                                 "nav.config")
+            # 中文/EN toggle lives at the BOTTOM of the left nav (under 配置).
+            # It's an action, not a view — hence selectable=False. Registered
+            # in _nav_items so apply-language relabels it like the others.
+            self._nav_items["topbar.lang_zh"] = self.nav.addItem(
+                routeKey="langToggle",
+                icon=FluentIcon.LANGUAGE,
+                text=_t("topbar.lang_zh"),
+                onClick=lambda _checked=False: self._toggle_language(),
+                selectable=False,
+                position=NavigationItemPosition.BOTTOM,
+            )
             # Start on recording view.
             self.stack.setCurrentWidget(self.recording_view)
             self.nav.setCurrentItem(self.recording_view.objectName())
             self.stack.currentChanged.connect(self._on_view_changed)
 
-            # ── Top language-switch bar ──────────────────────────────────
-            # Right-aligned 中文/EN toggle above the stacked views. Label is
-            # the literal "中文/EN" in both modes (so the button advertises
-            # both options regardless of which one is active). Clicking it
-            # flips `_LANG["current"]` to the other language and calls
-            # `apply_language()` on every view + the nav.
-            self.topbar = QWidget(self)
-            self.topbar.setObjectName("langTopbar")
-            tb = QHBoxLayout(self.topbar)
-            tb.setContentsMargins(16, 8, 16, 8)
-            tb.setSpacing(6)
-            tb.addStretch(1)
-            self.lang_toggle_btn = PushButton("", self.topbar)
-            self.lang_toggle_btn.setMinimumWidth(72)
-            self.lang_toggle_btn.clicked.connect(self._toggle_language)
-            tb.addWidget(self.lang_toggle_btn)
-
             right_col = QWidget(self)
             rc = QVBoxLayout(right_col)
             rc.setContentsMargins(0, 0, 0, 0)
             rc.setSpacing(0)
-            rc.addWidget(self.topbar)
             rc.addWidget(self.stack, stretch=1)
 
             # Thin light-gray vertical rule between the nav rail and the
@@ -7316,8 +10517,6 @@ def _cmd_ui_body(args, cfg):
             h.addWidget(right_col, stretch=1)
             self.setCentralWidget(central)
 
-            self._apply_lang_button_style()
-
         def _register_view(self, widget: QWidget, icon, text_key: str):
             """`text_key` is a `_LABELS` key (e.g. ``nav.recording``) so the
             label flips on language switch via `apply_language()`."""
@@ -7334,17 +10533,15 @@ def _cmd_ui_body(args, cfg):
             self._nav_items[text_key] = item
 
         def _toggle_language(self):
-            """Flip between zh ↔ en on every click of the single toggle
-            button. Called from the topbar button's `clicked` signal."""
+            """Flip between zh ↔ en on every click of the nav's bottom
+            中文/EN item."""
             self._set_language("en" if _LANG["current"] == "zh" else "zh")
 
         def _set_language(self, lang: str):
             """Flip the process-wide language and re-render every label."""
             if lang not in ("zh", "en") or lang == _LANG["current"]:
-                self._apply_lang_button_style()
                 return
             _LANG["current"] = lang
-            self._apply_lang_button_style()
             # Update nav labels.
             for text_key, item in self._nav_items.items():
                 if item is not None and hasattr(item, "setText"):
@@ -7365,24 +10562,6 @@ def _cmd_ui_body(args, cfg):
                 except Exception as e:
                     _log("ERR", f"Qt apply_language {view.objectName()}: "
                                 f"{type(e).__name__}: {e}")
-
-        def _apply_lang_button_style(self):
-            """Render the single toggle button: label is the literal
-            "中文/EN" in both modes (advertises both options regardless of
-            which is active) with the accent-blue fill. Clicking flips to
-            the other language via `_toggle_language`."""
-            self.lang_toggle_btn.setText(_t("topbar.lang_zh"))
-            self.lang_toggle_btn.setStyleSheet(
-                "PushButton {"
-                "  background-color: #0066d2;"
-                "  color: white;"
-                "  border: 1px solid #0066d2;"
-                "  border-radius: 6px;"
-                "  padding: 4px 14px;"
-                "}"
-                "PushButton:hover { background-color: #1577e0; }"
-                "PushButton:pressed { background-color: #004fa5; }"
-            )
 
         def _on_view_changed(self, _idx):
             w = self.stack.currentWidget()
@@ -7473,6 +10652,25 @@ def main():
         help="打开桌面图形界面（PyQt6 + Fluent；需要 python3 -m pip install PyQt6 PyQt6-Fluent-Widgets）",
     )
 
+    p_cap = sub.add_parser(
+        "captions",
+        help="把已有录音回放进实时字幕引擎（不经声卡，用于对比字幕改动）")
+    p_cap.add_argument("file", help="录音文件路径（.wav）")
+    p_cap.add_argument("--start", type=float, default=0,
+                       metavar="SEC", help="从第几秒开始（默认 0）")
+    p_cap.add_argument("--seconds", type=float, default=0,
+                       metavar="SEC", help="只回放这么多秒（默认整段）")
+    p_cap.add_argument("--fast", action="store_true",
+                       help="超实时喂音频（快但断句会与实况不同，仅适合冒烟测试）")
+    p_cap.add_argument("--review", action="store_true",
+                       help="结束后强制跑一次大模型批量复核（会调用 LLM）")
+    p_cap.add_argument("--trace", action="store_true",
+                       help="额外打印事件轨迹")
+    p_cap.add_argument("--quiet", action="store_true",
+                       help="过程中不打字幕，只在结束时输出汇总（便于 diff）")
+    p_cap.add_argument("--wait", type=float, default=60, metavar="SEC",
+                       help="等待后台修正落地的上限（默认 60 秒）")
+
     p_dev = sub.add_parser("devices", help="列出可用音频设备")
     p_dev.add_argument(
         "--raw",
@@ -7482,6 +10680,13 @@ def main():
 
     p_cfg = sub.add_parser("config", help="查看或修改配置")
     p_cfg.add_argument("--set", metavar="key=value", help="设置配置项")
+
+    p_hw = sub.add_parser(
+        "hotwords",
+        help="扫描已有转写/纪要提取 ASR 热词，写入 config.jsonc 的 stt.funasr.hotword",
+    )
+    p_hw.add_argument("--no-llm", action="store_true", help="只用规则提取，不调用 LLM")
+    p_hw.add_argument("--show", action="store_true", help="仅显示当前热词列表")
 
     args = parser.parse_args()
 
@@ -7497,6 +10702,8 @@ def main():
         "ui": cmd_ui,
         "devices": cmd_devices,
         "config": cmd_config,
+        "hotwords": cmd_hotwords,
+        "captions": cmd_captions,
     }
 
     if args.cmd in dispatch:
