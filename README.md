@@ -177,7 +177,7 @@ python3 meetingscribe.py ui
 
 The desktop GUI is a PyQt6 + Fluent Widgets app (single window, three views in the left navigation):
 
-1. **录音 / Recording** — click the big circular mic button to start; click again to stop. Pick a previously recorded meeting from the right-side history sidebar to act on it. Three pipeline buttons below the timer:
+1. **录音 / Recording** — click the big circular mic button to start; click again to stop. The meeting-history sidebar sits below the record controls in the left column, and the **live bilingual caption panel** owns the full-height right column: while recording, speech is transcribed and translated locally in real time (Chinese ↔ English). One local engine: sherpa-onnx streaming zipformer + opus-mt (~0.3 s latency), with each finalized line re-decoded by the offline FunASR model in the background. Each finalized line is tagged with the speaker, identified by voice print (`live_captions.speaker_id`): everyone gets a **[Speaker N]**, on both the microphone and the call audio, so colleagues sharing one mic are told apart too. Until the voice print lands (~60 ms) the line shows its audio side, **[Us]** or **[Them]**. Caption translation ships on the built-in engines (opus-mt for Fast, NLLB for Accurate). Setting `live_captions.mt_provider: "qwen"` switches to a local **Qwen 1.5B** model (llama.cpp) instead, which keeps `stt.funasr.hotword` terms verbatim in the translation and additionally repairs ASR errors on finalized lines; if `llama-cpp-python` isn't installed it falls back automatically. Models download automatically on first use (≈ 700 MB, plus ≈ 1 GB if you switch to Qwen); captions are optional and never affect the recording itself. Pick a previously recorded meeting from the history list to act on it. Three pipeline buttons below the timer:
    - **Transcribe** — runs FunASR + LLM polish, produces `.polish.txt`
    - **Generate meeting notes** — full pipeline → `.meeting.md`
    - **Generate interview report** — full pipeline → `.interview.md`
@@ -185,7 +185,7 @@ The desktop GUI is a PyQt6 + Fluent Widgets app (single window, three views in t
 2. **历史 / History** — full meeting list with four filter tabs (all / summarized / transcribed / pending), inline detail pane, and the same three pipeline buttons for rerunning steps on an old recording. Right-click any row to rename or delete (with confirmation).
 3. **配置 / Settings** — quick concurrency slider + a raw JSONC editor for `config.jsonc` (syntax highlighted; the editor is the canonical way to customise pipeline prompts, see `cfg["prompts"]`).
 
-A 中文 / EN toggle in the top right flips every label, dialog and message in real time.
+A 中文 / EN item at the bottom of the left navigation (below Settings) flips every label, dialog and message in real time.
 
 ### Command Line
 
@@ -199,6 +199,16 @@ python3 meetingscribe.py record --mode interview
 # Process an existing recording
 python3 meetingscribe.py transcribe /path/to/audio.wav
 python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
+
+# Replay a recording through the live caption engine (no sound card involved) —
+# the way to compare caption quality across changes; --review adds the LLM pass
+python3 meetingscribe.py captions /path/to/audio.wav
+python3 meetingscribe.py captions /path/to/audio.wav --start 60 --seconds 120 --review
+
+# Backfill ASR hotwords from existing transcripts/notes into config.jsonc
+# (afterwards hotwords maintain themselves after every notes generation)
+python3 meetingscribe.py hotwords          # rule-based + LLM extraction
+python3 meetingscribe.py hotwords --show   # print the current list
 ```
 
 ---
@@ -210,7 +220,7 @@ Recordings are saved to `~/Documents/meetingscribe/recordings/`. All output file
 | Extension | Content |
 |-----------|---------|
 | `.wav` | Recording (system audio + microphone, dual stream) |
-| `.raw.txt` | Raw transcript (with timestamps) |
+| `.raw.txt` | Raw transcript (with timestamps; also `[说话人N]` speaker labels when `stt.funasr.spk_model` is on) |
 | `.polish.txt` | AI-polished transcript |
 | `.meeting.md` | Meeting notes (Markdown), generated when `mode=meeting` |
 | `.interview.md` | Interview report (Markdown), generated when `mode=interview` |
@@ -231,7 +241,12 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | `transcribe_provider` | `funasr` | `funasr` (local, default) / `openai` / `gemini` |
 | `polish_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | `claude` / `openai` / `gemini` |
-| `stt.funasr.hotword` | `""` | Space-separated hotwords to boost recognition accuracy |
+| `stt.funasr.hotword` | `""` | Space-separated hotwords to boost recognition accuracy — **auto-maintained**: after every notes generation, new terms are extracted (rule-based + LLM, see the `hotwords` block) and merged here; `python3 meetingscribe.py hotwords` backfills from existing recordings |
+| `hotwords.auto_update` | `true` | Toggle the automatic hotword extraction (schemes A rule-based + B LLM) |
+| `live_captions.mt_provider` | `default` | Caption translation engine: `default`/`marian` (opus-mt), `nllb`, or `qwen` — local Qwen 1.5B via llama.cpp, which adds a line-scoped hotword glossary and ASR error correction on finalized lines (GBNF-constrained, ~1.8 s per line) |
+| `live_captions.history_minutes` | `180` | How far back the caption panel can be scrolled (minutes). Retention is by time, so the window holds regardless of speech cadence; `history_max` (12000 rows) is only a memory backstop |
+| `live_captions.speaker_id.enabled` | `true` | Voice-print speaker identification (cam++, ~27 MB auto-download, ~60 ms per line, own thread). Separates individual people by voice, on BOTH channels — several colleagues sharing one microphone in a meeting room are told apart just like the people on the call. Everyone gets a Speaker N; the channel only tints the tag. `threshold` (0.5) trades merging against splitting |
+| `live_captions.review.enabled` | `true` | Periodic batch re-check: every `interval_minutes` (5) the captions from that window, with their translations, go to a full-size LLM (`polish_provider`) which re-checks them with the whole window as context — the only pass that can fix a term from how it was said later. Costs one LLM call per interval while recording |
 
 **FunASR models (configured in `stt.funasr`):**
 
@@ -240,8 +255,9 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | `model` | `paraformer-zh` | ASR model — downloaded automatically on first run (~400 MB) |
 | `vad_model` | `fsmn-vad` | Voice activity detection — enables long-audio support |
 | `punc_model` | `ct-punc` | Punctuation restoration |
+| `spk_model` | `""` | Speaker diarization; `"cam++"` turns it on and transcript lines become `[12.3s] [说话人1] …`, which the polish + notes steps carry through to the summary. **Cost:** speaker ids are only consistent within a single pass, so enabling this disables chunked parallel transcription — a long recording runs single-pass and takes roughly `workers`× longer |
 | `hotword` | `""` | Domain-specific terms (space-separated) to improve accuracy |
-| `chunk_secs` | `300` | Split audio into chunks of this length (seconds) for parallel transcription; `0` = always serial |
+| `chunk_secs` | `300` | Split audio into chunks of this length (seconds) for parallel transcription; `0` = always serial. Ignored when `spk_model` is set |
 | `workers` | `0` | Parallel FunASR instances; `0` = auto (`max(2, cpu_count / 2)`); memory scales with this value |
 
 ---
@@ -454,7 +470,7 @@ python3 meetingscribe.py ui
 
 桌面界面基于 PyQt6 + Fluent Widgets，单窗口三个视图（左侧导航切换）：
 
-1. **录音** — 点中间的大麦克风按钮开始录音，再点一次停止。右侧历史侧栏可以挑一条已有录音作为操作对象。计时器下方三个按钮：
+1. **录音** — 点中间的大麦克风按钮开始录音，再点一次停止。会议历史在左列录音控制的下方；右列整列是**实时双语字幕面板**：录音过程中本地实时转写并翻译（中英互译）。识别链路只有一条：sherpa-onnx 流式 zipformer + opus-mt（延迟约 0.3 秒），每条定稿字幕再由离线 FunASR 模型后台重解码一遍。每条定稿字幕会用声纹标注说话人（`live_captions.speaker_id`）：麦克风侧和会议对端一视同仁，所有人各自编号为 **[说话人N]**，会议室里共用一支麦克风的同事也能分开；声纹结果落地前（约 60ms）先显示声道侧 **[我方]** / **[对方]**。字幕翻译默认走内置 opus-mt；把 `live_captions.mt_provider` 改成 `"qwen"` 则换成本地 **Qwen 1.5B** 小模型（llama.cpp），它会让命中 `stt.funasr.hotword` 的术语在译文里原样保留，并对定稿行做 ASR 纠错；未安装 `llama-cpp-python` 时自动回退。模型首次使用时自动下载（约 700MB；改用 Qwen 再加约 1GB）；字幕是可选功能，任何故障都不影响录音本体。从会议历史列表挑一条已有录音作为操作对象。计时器下方三个按钮：
    - **语音转文字** — 跑 FunASR + LLM 校对，生成 `.polish.txt`
    - **生成会议纪要** — 整条流水线 → `.meeting.md`
    - **生成面试报告** — 整条流水线 → `.interview.md`
@@ -462,7 +478,7 @@ python3 meetingscribe.py ui
 2. **历史** — 完整会议列表，四个筛选 tab（全部 / 已总结 / 已录音转文字 / 待处理），右侧详情面板，并复用同三个按钮以对旧录音重新跑流水线。任一会议右键可以重命名或删除（带二次确认）。
 3. **配置** — 一键调整三个并发参数 + 一个带语法高亮的 `config.jsonc` 原文编辑器（直接在这里改 `cfg["prompts"]` 自定义流水线 prompt）。
 
-右上角有 **中文 / EN** 切换按钮，实时翻转所有界面文字、对话框和提示。
+左侧导航底部（「配置」下方）有 **中文 / EN** 切换项，实时翻转所有界面文字、对话框和提示。
 
 ### 命令行
 
@@ -476,6 +492,11 @@ python3 meetingscribe.py record --mode interview
 # 处理已有录音文件
 python3 meetingscribe.py transcribe /path/to/audio.wav
 python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
+
+# 扫描已有转写/纪要，把热词回填进 config.jsonc
+# （之后每次生成纪要都会自动增量维护热词，无需再手动跑）
+python3 meetingscribe.py hotwords          # 规则 + LLM 提取
+python3 meetingscribe.py hotwords --show   # 查看当前热词列表
 ```
 
 ---
@@ -487,7 +508,7 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | 文件后缀 | 内容 |
 |----------|------|
 | `.wav` | 录音文件（系统音频 + 麦克风双路） |
-| `.raw.txt` | 原始转写文本（含时间戳） |
+| `.raw.txt` | 原始转写文本（含时间戳；开启 `stt.funasr.spk_model` 时还带 `[说话人N]` 发言人标注） |
 | `.polish.txt` | AI 校对后的文本 |
 | `.meeting.md` | 会议纪要（Markdown），`mode=meeting` 时生成 |
 | `.interview.md` | 面试报告（Markdown），`mode=interview` 时生成 |
@@ -508,7 +529,12 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `openai` / `gemini` |
 | `polish_provider` | `claude` | 校对模型：`claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | 纪要模型：`claude` / `openai` / `gemini` |
-| `stt.funasr.hotword` | `""` | 热词（空格分隔），提升专有名词识别率 |
+| `stt.funasr.hotword` | `""` | 热词（空格分隔），提升专有名词识别率——**自动维护**：每次生成纪要后自动提取新术语（规则 + LLM，见 `hotwords` 配置块）并合并到这里；`python3 meetingscribe.py hotwords` 可从已有录音一次性回填 |
+| `hotwords.auto_update` | `true` | 热词自动提取总开关（方案 A 规则 + 方案 B LLM） |
+| `live_captions.mt_provider` | `default` | 字幕翻译引擎：`default`/`marian`（opus-mt）、`nllb`，或 `qwen` —— 本地 Qwen 1.5B（llama.cpp），额外提供按行命中的热词术语表和定稿行 ASR 纠错（GBNF 约束输出，每行约 1.8 秒） |
+| `live_captions.history_minutes` | `180` | 字幕面板可回看的时长（分钟）。按时间保留，与语速无关；`history_max`（12000 行）只是内存兜底 |
+| `live_captions.speaker_id.enabled` | `true` | 声纹说话人识别（cam++，约 27MB 自动下载，每行约 60ms，独立线程）。两个声道一视同仁地按声纹区分人——会议室里几个人共用一支麦克风也能分开，所有人统一编号为 说话人1 / 说话人2 …，声道只决定标签颜色。`threshold`（0.5）在「并成同一个人」和「拆成多个人」之间取舍 |
+| `live_captions.review.enabled` | `true` | 定期批量复核：每 `interval_minutes`（5 分钟）把这段时间的字幕连同译文整批交给大模型（`polish_provider`），带整段上下文重新校对重译——这是唯一能「用后文修正前文」的一层。代价是录音期间每个周期一次 LLM 调用 |
 
 **FunASR 配置项（`stt.funasr` 下）：**
 
@@ -517,8 +543,9 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 | `model` | `paraformer-zh` | ASR 模型，首次运行自动下载（约 400 MB） |
 | `vad_model` | `fsmn-vad` | 语音活动检测，支持长音频分句 |
 | `punc_model` | `ct-punc` | 标点恢复模型 |
+| `spk_model` | `""` | 说话人区分（声纹聚类）；填 `"cam++"` 开启后转写行变成 `[12.3s] [说话人1] …`，校对与纪要环节会把发言人区分带进总结。**代价**：说话人编号只在单次推理内一致，因此开启后放弃分块并发、单趟转写，长录音耗时约为原来的 `workers` 倍 |
 | `hotword` | `""` | 热词（空格分隔），提升领域专有词识别率 |
-| `chunk_secs` | `300` | 超过此时长自动分块并发转写（秒），`0` = 始终串行 |
+| `chunk_secs` | `300` | 超过此时长自动分块并发转写（秒），`0` = 始终串行；设置了 `spk_model` 时此项被忽略 |
 | `workers` | `0` | 并发实例数，`0` = 自动（`max(2, CPU核数/2)`），内存随之线性增长 |
 
 ---
