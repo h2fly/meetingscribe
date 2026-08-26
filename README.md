@@ -241,7 +241,7 @@ Edit `config.jsonc` in the project directory (supports `//` comments). Common op
 | `transcribe_provider` | `funasr` | `funasr` (local, default) / `openai` / `gemini` |
 | `polish_provider` | `claude` | `claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | `claude` / `openai` / `gemini` |
-| `stt.funasr.hotword` | `""` | Space-separated hotwords to boost recognition accuracy — **auto-maintained**: after every notes generation, new terms are extracted (rule-based + LLM, see the `hotwords` block) and merged here; `python3 meetingscribe.py hotwords` backfills from existing recordings |
+| `stt.funasr.hotword` | `""` | Leave empty — the live list lives in **`hotword.jsonc`**, which is gitignored because it accumulates colleague and customer names. `cp hotword.jsonc.example hotword.jsonc` to start; after every notes generation new terms are mined (rule-based + LLM, see the `hotwords` block) and merged there, and `python3 meetingscribe.py hotwords` backfills from existing recordings |
 | `hotwords.auto_update` | `true` | Toggle the automatic hotword extraction (schemes A rule-based + B LLM) |
 | `live_captions.mt_provider` | `default` | Caption translation engine: `default`/`marian` (opus-mt), `nllb`, or `qwen` — local Qwen 1.5B via llama.cpp, which adds a line-scoped hotword glossary and ASR error correction on finalized lines (GBNF-constrained, ~1.8 s per line) |
 | `live_captions.history_minutes` | `180` | How far back the caption panel can be scrolled (minutes). Retention is by time, so the window holds regardless of speech cadence; `history_max` (12000 rows) is only a memory backstop |
@@ -529,7 +529,7 @@ python3 meetingscribe.py hotwords --show   # 查看当前热词列表
 | `transcribe_provider` | `funasr` | 转写引擎：`funasr`（本地，默认）/ `openai` / `gemini` |
 | `polish_provider` | `claude` | 校对模型：`claude` / `openai` / `gemini` |
 | `meeting_notes_provider` | `claude` | 纪要模型：`claude` / `openai` / `gemini` |
-| `stt.funasr.hotword` | `""` | 热词（空格分隔），提升专有名词识别率——**自动维护**：每次生成纪要后自动提取新术语（规则 + LLM，见 `hotwords` 配置块）并合并到这里；`python3 meetingscribe.py hotwords` 可从已有录音一次性回填 |
+| `stt.funasr.hotword` | `""` | 保持为空——实际热词表在 **`hotword.jsonc`**，该文件不入版本库（它会累积同事姓名与客户名）。`cp hotword.jsonc.example hotword.jsonc` 即可开始；每次生成纪要后自动提取新术语（规则 + LLM，见 `hotwords` 配置块）并合并到那里，`python3 meetingscribe.py hotwords` 可从已有录音一次性回填 |
 | `hotwords.auto_update` | `true` | 热词自动提取总开关（方案 A 规则 + 方案 B LLM） |
 | `live_captions.mt_provider` | `default` | 字幕翻译引擎：`default`/`marian`（opus-mt）、`nllb`，或 `qwen` —— 本地 Qwen 1.5B（llama.cpp），额外提供按行命中的热词术语表和定稿行 ASR 纠错（GBNF 约束输出，每行约 1.8 秒） |
 | `live_captions.history_minutes` | `180` | 字幕面板可回看的时长（分钟）。按时间保留，与语速无关；`history_max`（12000 行）只是内存兜底 |

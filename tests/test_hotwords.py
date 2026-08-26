@@ -132,24 +132,61 @@ _CONFIG_TEMPLATE = """{
 
 @pytest.fixture
 def tmp_config(monkeypatch, tmp_path):
+    """Redirect BOTH config files into tmp_path.
+
+    HOTWORD_FILE matters as much as CONFIG_FILE: `_persist_hotwords` writes
+    the hotword list, so a test that forgot to redirect it clobbered the
+    developer's real hotword.jsonc with two-word test fixtures.
+    """
     cfg_file = tmp_path / "config.jsonc"
     cfg_file.write_text(_CONFIG_TEMPLATE % "", encoding="utf-8")
     monkeypatch.setattr(ms, "CONFIG_FILE", cfg_file)
+    monkeypatch.setattr(ms, "HOTWORD_FILE", tmp_path / "hotword.jsonc")
     monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
     return cfg_file
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_hotword_file(monkeypatch, tmp_path):
+    """Belt and braces: no test in this module may write the repo's own
+    hotword.jsonc, whether or not it asked for `tmp_config`."""
+    monkeypatch.setattr(ms, "HOTWORD_FILE",
+                        tmp_path / "autouse-hotword.jsonc", raising=False)
+
+
 class TestPersistHotwords:
-    def test_writes_merged_hotword_and_keeps_comments(self, tmp_config):
+    def test_writes_to_hotword_file_not_config(self, tmp_config):
+        """The list lives in its own gitignored file: it accumulates colleague
+        and customer names, which must not land in a version-controlled
+        config."""
         cfg = {"stt": {"funasr": {"hotword": "Kong"}}}
         added = ms._persist_hotwords(["GKE", "kong"], cfg)
         assert added == ["GKE"]
-        text = tmp_config.read_text(encoding="utf-8")
-        assert "// hotword comment survives" in text
-        on_disk = json.loads(ms._strip_jsonc_comments(text))
-        assert on_disk["stt"]["funasr"]["hotword"] == "Kong GKE"
+        assert ms._load_hotword_file() == "Kong GKE"
+        on_disk = json.loads(
+            ms._strip_jsonc_comments(tmp_config.read_text(encoding="utf-8")))
+        assert on_disk["stt"]["funasr"]["hotword"] == ""     # stays empty
         # runtime cfg updated in place too
         assert cfg["stt"]["funasr"]["hotword"] == "Kong GKE"
+
+    def test_hotword_file_keeps_its_header_comment(self, tmp_config):
+        ms._persist_hotwords(["GKE"], {"stt": {"funasr": {"hotword": ""}}})
+        text = ms.HOTWORD_FILE.read_text(encoding="utf-8")
+        assert text.lstrip().startswith("//")
+        assert json.loads(ms._strip_jsonc_comments(text))["hotword"] == "GKE"
+
+    def test_inline_legacy_value_is_migrated_out(self, tmp_config):
+        """An existing setup keeps working and gets cleaned up on the next
+        extraction, instead of leaving a stale copy in a tracked file."""
+        tmp_config.write_text(_CONFIG_TEMPLATE % "OldTerm AnotherTerm",
+                              encoding="utf-8")
+        cfg = {"stt": {"funasr": {"hotword": "OldTerm AnotherTerm"}}}
+        ms._persist_hotwords(["GKE"], cfg)
+        assert "OldTerm" in ms._load_hotword_file()
+        on_disk = json.loads(
+            ms._strip_jsonc_comments(tmp_config.read_text(encoding="utf-8")))
+        assert on_disk["stt"]["funasr"]["hotword"] == ""
+        assert "// hotword comment survives" in tmp_config.read_text(encoding="utf-8")
 
     def test_no_change_returns_empty_and_leaves_file(self, tmp_config):
         before = tmp_config.read_text(encoding="utf-8")
@@ -445,9 +482,7 @@ class TestCmdHotwordsBody:
         ms._cmd_hotwords_body(args, cfg)
         merged = cfg["stt"]["funasr"]["hotword"].split()
         assert "GKE" in merged and "Terraform" in merged
-        on_disk = json.loads(
-            ms._strip_jsonc_comments(ms.CONFIG_FILE.read_text(encoding="utf-8")))
-        assert on_disk["stt"]["funasr"]["hotword"] == cfg["stt"]["funasr"]["hotword"]
+        assert ms._load_hotword_file() == cfg["stt"]["funasr"]["hotword"]
 
     def test_show_does_not_write(self, tmp_config):
         before = tmp_config.read_text(encoding="utf-8")
