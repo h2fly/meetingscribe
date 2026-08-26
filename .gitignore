@@ -28,3 +28,6 @@ env/
 .claude/
 .nezha/
 openspec/
+
+# 本地热词（自动挖掘，含同事/客户名等本地数据；模板见 hotword.jsonc.example）
+hotword.jsonc

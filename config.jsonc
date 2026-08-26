@@ -266,12 +266,16 @@
       "spk_model": "",
       // Hotwords (space-separated); boosts recognition of proper nouns
       // (e.g. "sandbox API网关 AI agent Kong GKE"). Shared by batch
-      // transcription AND live captions (fast-mode captions pick up
-      // changes after an app restart). AUTO-MAINTAINED: the "hotwords"
-      // block above appends newly extracted terms here after every notes
-      // generation (and `python3 meetingscribe.py hotwords` backfills from
-      // existing recordings). Manual edits are kept — entries are only
-      // deduplicated, never rewritten.
+      // transcription AND live captions (captions pick up changes after an
+      // app restart).
+      //
+      // LEAVE THIS EMPTY. The live list lives in hotword.jsonc, which is
+      // NOT in version control: the "hotwords" block above mines new terms
+      // from every meeting, so the list accumulates colleague names,
+      // customer names and internal codenames — local data that must not
+      // ship with the project. Copy hotword.jsonc.example to hotword.jsonc
+      // and it takes over from here; a value left inline below still works
+      // but gets moved out automatically on the next extraction.
       "hotword": ""
     },
     "openai": {

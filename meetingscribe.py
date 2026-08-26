@@ -305,6 +305,12 @@ def _purge_old_logs(log_dir: Path, days: int = 7) -> None:
 CONFIG_DIR = Path.home() / "Documents" / "meetingscribe"
 LOG_DIR    = CONFIG_DIR / "logs"
 CONFIG_FILE = Path(__file__).parent / "config.jsonc"
+# ASR hotwords live in their OWN file, gitignored. They are auto-mined from
+# every meeting, so the list fills up with colleague names, customer names and
+# internal codenames — personal data that has no business in a config file
+# that ships with the project (this repo is public). config.jsonc keeps the
+# key as an empty default; hotword.jsonc overrides it when present.
+HOTWORD_FILE = Path(__file__).parent / "hotword.jsonc"
 
 
 def _setup_log_file():
@@ -1185,6 +1191,41 @@ def _strip_jsonc_comments(text: str) -> str:
     return pattern.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", text)
 
 
+def _load_hotword_file() -> str:
+    """Read `stt.funasr.hotword` out of hotword.jsonc, or "" if absent.
+
+    Never raises: a hand-broken hotword file must not stop the tool from
+    recording — it just means no contextual biasing this run.
+    """
+    if not HOTWORD_FILE.exists():
+        return ""
+    try:
+        data = json.loads(
+            _strip_jsonc_comments(HOTWORD_FILE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        _log("WARN", f"hotword file unreadable, ignoring: "
+                     f"{type(e).__name__}: {e}")
+        return ""
+    if isinstance(data, dict):
+        hw = data.get("hotword")
+        if isinstance(hw, list):          # tolerate a list of terms
+            hw = " ".join(str(t) for t in hw)
+        return (hw or "").strip()
+    return ""
+
+
+def _save_hotword_file(hotword: str) -> None:
+    """Write hotword.jsonc, keeping the header comment that explains why the
+    file is separate (and gitignored)."""
+    body = json.dumps({"hotword": hotword}, ensure_ascii=False, indent=2)
+    header = "\n".join((
+        "// ASR 热词（空格分隔），由每次纪要生成后自动维护。",
+        "// 单独成文件、且不入版本库：热词会累积同事姓名、客户名、内部代号，",
+        "// 属于本地数据，不该随项目发布。模板见 hotword.jsonc.example。",
+    ))
+    HOTWORD_FILE.write_text(f"{header}\n{body}\n", encoding="utf-8")
+
+
 def load_config() -> dict:
     CONFIG_DIR.mkdir(exist_ok=True)
     if CONFIG_FILE.exists():
@@ -1193,6 +1234,12 @@ def load_config() -> dict:
         cfg = _deep_merge(DEFAULT_CONFIG, on_disk)
     else:
         cfg = copy.deepcopy(DEFAULT_CONFIG)
+    # hotword.jsonc wins when it has content; an inline config.jsonc value
+    # still works so an existing setup keeps its list until the next
+    # extraction migrates it out (see _persist_hotwords).
+    hw = _load_hotword_file()
+    if hw:
+        cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = hw
     _apply_audio_overrides(cfg)
     return cfg
 
@@ -6063,9 +6110,14 @@ def _extract_hotwords_llm(text: str, provider: str, cfg: dict) -> "list[str]":
 
 def _persist_hotwords(new_terms: "list[str]", cfg: dict,
                       max_count: int = 100) -> "list[str]":
-    """Merge `new_terms` into stt.funasr.hotword, update the runtime cfg
-    in place, and write config.jsonc (comment-preserving in-place patch
-    via save_config). Returns the terms actually added."""
+    """Merge `new_terms` into stt.funasr.hotword, update the runtime cfg in
+    place, and write hotword.jsonc. Returns the terms actually added.
+
+    Also clears any leftover inline `stt.funasr.hotword` in config.jsonc:
+    that is how an existing setup migrates off the old single-file layout,
+    and leaving a stale copy behind in a version-controlled file is exactly
+    the footgun this split exists to remove.
+    """
     existing = ((cfg.get("stt") or {}).get("funasr") or {}).get("hotword", "") or ""
     merged = _merge_hotwords(existing, new_terms, max_count)
     if merged == _merge_hotwords(existing, [], max_count):
@@ -6074,17 +6126,32 @@ def _persist_hotwords(new_terms: "list[str]", cfg: dict,
     added = [t for t in merged.split() if t.lower() not in known]
     cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = merged
     try:
-        on_disk: dict = {}
-        if CONFIG_FILE.exists():
-            on_disk = json.loads(
-                _strip_jsonc_comments(CONFIG_FILE.read_text(encoding="utf-8")))
-        on_disk.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = merged
-        save_config(on_disk)
+        _save_hotword_file(merged)
         _log("STT", f"hotword updated: +{len(added)} "
-                    f"({' '.join(added)}) → {len(merged.split())} total")
+                    f"({' '.join(added)}) → {len(merged.split())} total "
+                    f"→ {HOTWORD_FILE.name}")
+        _migrate_inline_hotword()
     except (OSError, json.JSONDecodeError, ValueError) as e:
         _log("WARN", f"hotword persist failed: {type(e).__name__}: {e}")
     return added
+
+
+def _migrate_inline_hotword() -> None:
+    """Blank a legacy inline hotword list in config.jsonc, comment-preserving."""
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        on_disk = json.loads(
+            _strip_jsonc_comments(CONFIG_FILE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return
+    inline = ((on_disk.get("stt") or {}).get("funasr") or {}).get("hotword") or ""
+    if not inline.strip():
+        return
+    on_disk.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = ""
+    save_config(on_disk)
+    _log("STT", f"moved {len(inline.split())} inline hotword(s) out of "
+                f"{CONFIG_FILE.name} into {HOTWORD_FILE.name}")
 
 
 def _auto_update_hotwords(transcript: str, provider: str, cfg: dict) -> "list[str]":

@@ -1,0 +1,18 @@
+// ASR 热词（空格分隔）——本文件是模板，复制成 hotword.jsonc 后使用。
+//
+// 为什么单独成文件：热词由每次纪要生成后自动挖掘并写回，日积月累会攒下
+// 同事姓名、客户名、内部项目代号。这些是本地数据，不该随项目一起发布，
+// 所以 hotword.jsonc 不入版本库（见 .gitignore），只有本模板入库。
+//
+// 用法：
+//   cp hotword.jsonc.example hotword.jsonc
+// 之后无需手动维护 —— `hotwords.auto_update` 开启时（默认）每次生成纪要
+// 都会把新术语并进来，超出 `hotwords.max_count` 时淘汰最早加入的。
+// 也可以用 `python3 meetingscribe.py hotwords` 从已有录音一次性回填。
+//
+// 留空即可开始；填了也行，手工加的词只会被去重，不会被改写。
+// 示例：
+//   "hotword": "GKE ChatOps Spanner BigQuery CockroachDB 灰度发布"
+{
+  "hotword": ""
+}
