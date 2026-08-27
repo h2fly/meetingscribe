@@ -221,7 +221,19 @@
     // runs in the offline notes phase, never in the realtime path).
     "llm_extract": true,
     // Hotword list cap; oldest entries are evicted first (rolling vocabulary).
-    "max_count": 100
+    //
+    // Measured cost of a bigger list (same audio, padded with random Chinese
+    // names up to each size):
+    //   streaming sherpa: init unchanged (~1 s), decode 20x -> 15.6x realtime
+    //   offline FunASR:   30 s of audio takes 11.6 s -> 14.2 s -> 15.2 s
+    //                     at 100 / 1000 / 5000 terms
+    // Speed is not the limit; ACCURACY is. At 5000 two-character Chinese
+    // names the biasing started stealing ordinary speech: 「分眼都在那边」
+    // came out as 「分眼都郑娜边」. Short pure-CJK terms are the dangerous
+    // ones — entries containing ASCII, or 3+ characters, are far safer.
+    // 1000 is the measured-safe ceiling; before going higher, A/B it with
+    // `python3 meetingscribe.py captions <wav>`.
+    "max_count": 1000
   },
 
   // ── Recording devices ───────────────────────────────────────────────────────
