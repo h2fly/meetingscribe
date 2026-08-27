@@ -28,6 +28,29 @@ class TestCandidates:
         out = ms._notion_hotword_candidates(["Aaron Chen"], [])
         assert out == ["Aaron", "Chen"]
 
+    def test_bilingual_name_keeps_both_scripts(self):
+        """Measured on a real 212-person engineering directory against a real
+        transcript of the same team: the English given name was the spoken form
+        for Aaron / Peter / Oliver — their Chinese names never appeared in the
+        transcript at all — while 李雷 and 韩梅 were spoken in Chinese. Keeping
+        only the CJK run threw away the useful half 3 times out of 5."""
+        assert ms._notion_hotword_candidates(
+            ["王小明 Aaron Wang (ENG - CN)"], []) == ["王小明", "Aaron", "Wang"]
+        assert ms._notion_hotword_candidates(
+            ["李雷 Ethan Zhang (ENG - SRE - CN)"], []) == ["李雷", "Ethan", "Zhang"]
+
+    def test_two_letter_latin_tokens_dropped(self):
+        """Romanised surname syllables (Li / Wu / Ma / Su / Ou / Ni) collide
+        with ordinary speech and nobody says them alone."""
+        assert ms._notion_hotword_candidates(["Bob Li"], []) == ["Bob"]
+        assert ms._notion_hotword_candidates(["Kate Wu"], []) == ["Kate"]
+
+    def test_digit_bearing_tokens_are_dropped(self):
+        """Display names have no digits; digit-bearing terms like N4D come
+        from the TITLE miner, not from the name path."""
+        assert ms._notion_hotword_candidates(["Deploy 12345"], []) == ["Deploy"]
+        assert ms._notion_hotword_candidates(["Agent007 Smith"], []) == ["Smith"]
+
     def test_parenthetical_alias_dropped(self):
         out = ms._notion_hotword_candidates(["黄河 (Kevin)"], [])
         assert out == ["黄河"]
@@ -51,7 +74,9 @@ class TestCandidates:
         assert out == ["Aaron"]
 
     def test_limit_is_respected(self):
-        names = [f"Name{i}" for i in range(50)]
+        # Alphabetic on purpose: a digit in a display name is noise and is
+        # dropped, so "Name0" would never become a candidate.
+        names = [f"Person{chr(65 + i % 26)}{chr(97 + i // 26)}" for i in range(50)]
         assert len(ms._notion_hotword_candidates(names, [], limit=10)) == 10
 
     def test_empty_inputs(self):

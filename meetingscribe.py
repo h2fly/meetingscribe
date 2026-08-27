@@ -7518,9 +7518,22 @@ def _notion_hotword_candidates(names: "list[str]", titles: "list[str]",
                                limit: int = 400) -> "list[str]":
     """Turn Notion names + titles into hotword candidates.
 
-    Names become the form people SAY: a CJK name stays whole (`李雷`), while
-    "Aaron Chen" splits into tokens because nobody says the full name mid
-    sentence. Titles go through the existing rule-based miner
+    Names become the form people SAY, and for a bilingual workspace that is
+    BOTH halves of 「王小明 Aaron Wang」 — measured on a real 212-person
+    engineering directory against a real transcript of the same team: the
+    English given name was the spoken form for Aaron / Peter / Oliver (whose
+    Chinese names never appear in the transcript at all), while 李雷 and 韩梅
+    were spoken in Chinese. Keeping only the CJK run, as this did originally,
+    threw away the useful half for three of the five names checked.
+
+    Latin tokens must start capitalised and be at least 3 characters. An email
+    login splits into lowercase fragments ("he.huang" → he / huang) which are
+    common syllables that would bias real speech, and 2-letter tokens are
+    romanised surname syllables (Li / Wu / Ma / Su / Ou / Ni) that collide
+    with ordinary speech for no benefit — nobody says them alone. This keeps
+    Aaron / Peter / Oliver / Zhang / Chen and drops the debris.
+
+    Titles go through the existing rule-based miner
     (`_extract_hotword_candidates`) instead of being added verbatim — a title
     like 「2026 Q3 运维体系规划」 is a sentence, not a hotword.
     """
@@ -7529,16 +7542,11 @@ def _notion_hotword_candidates(names: "list[str]", titles: "list[str]",
         name = re.sub(r"[（(\[].*?[)）\]]", " ", raw)       # drop "(Kevin)" etc.
         if "@" in name:                                     # an email, not a name
             name = name.split("@", 1)[0].replace(".", " ")
-        if any("一" <= c <= "鿿" for c in name):
-            out.extend(t for t in re.findall(r"[一-鿿]{2,6}", name))
-        else:
-            # Latin tokens must start capitalised. An email login splits into
-            # lowercase fragments ("he.huang" → he / huang) and those are
-            # common syllables that would bias real speech; a display name is
-            # capitalised, so this keeps Aaron / Bella / Zhang and drops the
-            # debris. ("he" is already a stopword; "huang" would not be.)
-            out.extend(t for t in re.split(r"[\s_./-]+", name)
-                       if len(t) >= 2 and t[:1].isupper())
+        # Both scripts, not one or the other: a bilingual display name carries
+        # the Chinese name AND the English name people actually use.
+        out.extend(re.findall(r"[一-鿿]{2,6}", name))
+        out.extend(t for t in re.split(r"[\s_./-]+", re.sub(r"[一-鿿]", " ", name))
+                   if len(t) >= 3 and t[:1].isupper() and t.isalpha())
     if titles:
         out.extend(_extract_hotword_candidates("。".join(titles)))
     seen, uniq = set(), []
