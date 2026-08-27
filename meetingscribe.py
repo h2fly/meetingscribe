@@ -7638,7 +7638,6 @@ def _cmd_ui_body(args, cfg):
             "rec.import.no_ffmpeg_msg": "未在 PATH 中找到 ffmpeg。\n在 macOS 上可执行：brew install ffmpeg",
             "rec.no_file": "未选择录音文件",
             "rec.selected_prefix": "已选择：",
-            "rec.history_title": "会议历史",
             "rec.captions.title": "实时双语字幕",
             "rec.captions.idle_hint": "开始录音后，此处实时显示中英双语字幕",
             "rec.captions.disabled_hint": "字幕已关闭",
@@ -7649,7 +7648,6 @@ def _cmd_ui_body(args, cfg):
             "rec.captions.role_mic": "我方",
             "rec.captions.role_system": "对方",
             "rec.captions.speaker_n": "说话人{n}",
-            "rec.search_placeholder": "按文件名搜索…（子串匹配）",
             # ── History view
             "hist.search_placeholder": "按文件名搜索…（子串匹配）",
             "hist.tab.all": "全部",
@@ -7778,7 +7776,6 @@ def _cmd_ui_body(args, cfg):
             "rec.import.no_ffmpeg_msg": "ffmpeg not found on PATH.\nOn macOS: brew install ffmpeg",
             "rec.no_file": "No recording selected",
             "rec.selected_prefix": "Selected: ",
-            "rec.history_title": "Meeting history",
             "rec.captions.title": "Live bilingual captions",
             "rec.captions.idle_hint": "Bilingual captions appear here once recording starts",
             "rec.captions.disabled_hint": "Captions are off",
@@ -7789,7 +7786,6 @@ def _cmd_ui_body(args, cfg):
             "rec.captions.role_mic": "Us",
             "rec.captions.role_system": "Them",
             "rec.captions.speaker_n": "Speaker {n}",
-            "rec.search_placeholder": "Search by filename… (substring)",
             "hist.search_placeholder": "Search by filename… (substring)",
             "hist.tab.all": "All",
             "hist.tab.done": "Summarized",
@@ -8265,7 +8261,6 @@ def _cmd_ui_body(args, cfg):
             self._wire()
             self._sync_caption_enabled_to_state()
             self._render_captions()
-            self._refresh_history()
             self._refresh_action_buttons()
             # Startup default: mute the active output device and park the
             # slider at 0%. Forces the user to deliberately drag the slider
@@ -8299,7 +8294,6 @@ def _cmd_ui_body(args, cfg):
                     f"{_t('rec.selected_prefix')}{self._last_recorded.name}")
             else:
                 self.chosen_label.setText(_t("rec.no_file"))
-            self._refresh_history()
             # Action button labels depend on (current language) × (artifact
             # exists on disk) — refresh after the static callbacks so the
             # "open X" override wins over the default "generate X" text.
@@ -8311,9 +8305,49 @@ def _cmd_ui_body(args, cfg):
             root.setContentsMargins(28, 28, 28, 28)
             root.setSpacing(24)
 
-            # Left column — recording controls
+            # Left column — recording controls.
+            #
+            # Layout shape (same as the history view's detail pane):
+            #   left (QFrame, "recordingCardLeft")   ← rounded background
+            #     └── left_scroll (ScrollArea, transparent)
+            #           └── left_inner (QWidget, transparent)  ← `lv`
+            #
+            # The scroll area is load-bearing, not cosmetic. This column's
+            # content is mostly fixed-size (132 px mic disc, a TitleLabel
+            # timer, five buttons) and grows by ~200 px once 停止任务 +
+            # progress + log_view appear. When the total exceeded the card
+            # height Qt resolved the deficit by shrinking children BELOW
+            # their minimums — `mic_block`'s setFixedHeight(180) included —
+            # so the timer painted outside its block and over the volume
+            # row, and the hint landed on the mic disc. Verified offscreen
+            # at 1100x560: overlapping before, clean after. Budgeting
+            # pixels in comments had been tried three times; scrolling ends
+            # the class of bug.
             left = QFrame(self)
-            lv = QVBoxLayout(left)
+            left_outer = QVBoxLayout(left)
+            left_outer.setContentsMargins(0, 0, 0, 0)
+            left_scroll = ScrollArea(left)
+            left_scroll.setWidgetResizable(True)
+            left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            # Horizontal scrolling stays ENABLED on purpose: with it off, a
+            # window too narrow for the three notes buttons clipped their
+            # labels silently ("生成分享总结" → "生成分享"). A scrollbar that
+            # only shows up in genuinely cramped windows beats truncated text.
+            left_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            left_scroll.setStyleSheet(
+                "QScrollArea { background: transparent; border: none; }"
+                "QScrollArea > QWidget > QWidget { background: transparent; }"
+            )
+            left_scroll.viewport().setAutoFillBackground(False)
+            left_inner = QWidget()
+            left_inner.setObjectName("recordingLeftInner")
+            left_inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            left_inner.setStyleSheet(
+                "#recordingLeftInner { background: transparent; }")
+            left_outer.addWidget(left_scroll)
+            left_scroll.setWidget(left_inner)
+            lv = QVBoxLayout(left_inner)
             lv.setContentsMargins(0, 0, 0, 0)
             lv.setSpacing(16)
 
@@ -8357,7 +8391,9 @@ def _cmd_ui_body(args, cfg):
             # spacing + timer ~36 → 176; rounded up to 180 for breathing
             # room around the TitleLabel.
             mic_block = QWidget(self)
-            mic_block.setFixedHeight(180)
+            # Minimum, not fixed: the scroll area guarantees the space now, so
+            # the block only needs to refuse to shrink below its contents.
+            mic_block.setMinimumHeight(180)
             mic_block_v = QVBoxLayout(mic_block)
             mic_block_v.setContentsMargins(0, 0, 0, 0)
             mic_block_v.setSpacing(8)
@@ -8555,38 +8591,23 @@ def _cmd_ui_body(args, cfg):
             self.caption_partial_label.setVisible(False)
             cv.addWidget(self.caption_partial_label)
 
-            # ── History card (below the record controls in the LEFT column)
-            right = QFrame(self)
-            rv = QVBoxLayout(right)
-            rv.setContentsMargins(0, 0, 0, 0)
-            rv.setSpacing(12)
-
-            self._history_title = SubtitleLabel("", self)
-            self._i18n(self._history_title, "rec.history_title")
-            rv.addWidget(self._history_title)
-            self.search_sidebar = SearchLineEdit(self)
-            self._i18n(self.search_sidebar, "rec.search_placeholder",
-                       attr="setPlaceholderText")
-            rv.addWidget(self.search_sidebar)
-
-            self.history_list = ListWidget(self)
-            self.history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            rv.addWidget(self.history_list, stretch=1)
 
             # Wrap each region in a soft rounded card so the three panels
             # read as visually separate surfaces.
             _style_as_card(left, padding=20, name="recordingCardLeft")
             _style_as_card(captions, padding=16, name="recordingCardCaptions")
-            _style_as_card(right, padding=16, name="recordingCardRight")
 
-            # Left column stacks the controls card on top of the meeting
-            # history card; the caption panel owns the whole right column.
+            # Left column is the record-controls card alone; the caption
+            # panel owns the whole right column. The meeting-history card
+            # that used to sit below the controls is gone — the left nav
+            # already has a 历史 view with the same list and the same
+            # pipeline buttons, and duplicating it here was what squeezed
+            # this column until the timer painted over the mic disc.
             left_col = QWidget(self)
             lcol = QVBoxLayout(left_col)
             lcol.setContentsMargins(0, 0, 0, 0)
             lcol.setSpacing(16)
-            lcol.addWidget(left, stretch=0)
-            lcol.addWidget(right, stretch=1)
+            lcol.addWidget(left, stretch=1)
 
             rc.addWidget(captions, stretch=1)
 
@@ -8610,10 +8631,6 @@ def _cmd_ui_body(args, cfg):
             self.state.caption_event.connect(self._on_caption_event)
             self.caption_switch.checkedChanged.connect(self._on_caption_prefs_changed)
 
-            self.search_sidebar.textChanged.connect(lambda _t: self._refresh_history())
-            self.history_list.itemClicked.connect(self._on_history_pick)
-            self.history_list.customContextMenuRequested.connect(
-                self._on_history_context_menu)
             _get_audio_monitor().on_recording_plan_change = self._on_plan_change
 
         # ── Live captions
@@ -8784,130 +8801,7 @@ def _cmd_ui_body(args, cfg):
             self.caption_partial_label.setText(body)
             self.caption_partial_label.setVisible(True)
 
-        def _refresh_history(self):
-            self.history_list.clear()
-            q = (self.search_sidebar.text() or "").strip().lower()
-            for m in _list_recordings():
-                # Case-insensitive substring match against the full stem
-                # (timestamp + optional custom name) so the user can type
-                # either "0518" or "客户访谈" to filter.
-                if q and q not in m["stem"].lower():
-                    continue
-                label = _format_timestamp_label(m["stem"])
-                if m["has_md"]:
-                    badge = _t("hist.badge.done")
-                elif m["has_raw"] or m["has_polish"]:
-                    badge = _t("hist.badge.pending_summary")
-                else:
-                    badge = _t("hist.badge.audio_only")
-                item = QListWidgetItem(f"{label}\n{badge}")
-                item.setData(Qt.ItemDataRole.UserRole, m)
-                self.history_list.addItem(item)
 
-        # Right-click on a history list item → rename / open enclosing folder
-        # / refresh. Renames cascade across every sibling file sharing the
-        # same stem, via the module-level _rename_meeting_files helper.
-        def _on_history_context_menu(self, pos: "QPoint"):
-            item = self.history_list.itemAt(pos)
-            if item is None:
-                return
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if not data:
-                return
-            menu = QMenu(self.history_list)
-            act_rename = QAction(_t("ctx.rename"), menu)
-            act_delete = QAction(_t("ctx.delete"), menu)
-            act_reveal = QAction(_t("ctx.reveal"), menu)
-            menu.addAction(act_rename)
-            menu.addAction(act_delete)
-            menu.addAction(act_reveal)
-
-            def _do_rename():
-                ts, current_custom = _split_meeting_stem(data["stem"])
-                if not ts:
-                    QMessageBox.warning(self, _t("ctx.rename_failed_title"),
-                                        _t("ctx.rename_failed_format"))
-                    return
-                new_name, ok = QInputDialog.getText(
-                    self, _t("ctx.rename_dialog_title"),
-                    _t("ctx.rename_dialog_prompt", ts=ts),
-                    text=current_custom or "",
-                )
-                if not ok:
-                    return
-                clean = _sanitize_meeting_custom_name(new_name)
-                if clean == (current_custom or ""):
-                    return  # no change
-                new_wav = _rename_meeting_files(data["wav_path"], clean)
-                if new_wav is None:
-                    QMessageBox.warning(self, _t("ctx.rename_failed_title"),
-                                        _t("ctx.rename_failed_collision"))
-                    return
-                # If the renamed file is currently the chosen target for
-                # pipeline / open-result actions, follow it.
-                if self._last_recorded == data["wav_path"]:
-                    self._last_recorded = new_wav
-                    self.chosen_label.setText(f"{_t('rec.selected_prefix')}{new_wav.name}")
-                self._refresh_history()
-                self._refresh_action_buttons()
-
-            def _do_reveal():
-                _open_path(data["wav_path"].parent)
-
-            def _do_delete():
-                wav = data["wav_path"]
-                # Guard: if a pipeline is currently writing files for this
-                # meeting (or any meeting from this view's worker), deletion
-                # would yank files from under the worker → crash.
-                if self._pipeline_thread is not None:
-                    QMessageBox.warning(
-                        self, _t("ctx.delete_blocked_title"),
-                        _t("ctx.delete_blocked_msg"),
-                    )
-                    return
-                if not _confirm_dialog(
-                    self, _t("ctx.delete_title"),
-                    _t("ctx.delete_confirm", name=wav.name),
-                ):
-                    return
-                _deleted, errors = _delete_meeting_files(wav)
-                if errors:
-                    QMessageBox.warning(
-                        self, _t("ctx.delete_failed_title"),
-                        _t("ctx.delete_failed_msg", err="\n".join(errors)),
-                    )
-                # If the deleted file was the chosen target, clear selection.
-                if self._last_recorded == wav:
-                    self._last_recorded = None
-                    self._result_path = None
-                    self.chosen_label.setText(_t("rec.no_file"))
-                self._refresh_history()
-                self._refresh_action_buttons()
-
-            # No nested exec() loop: show the menu asynchronously with
-            # popup() and defer the chosen handler to the next event-loop
-            # iteration. exec() from inside the context-menu event crashed
-            # in the Cocoa popup-show path (Python .ips crash reports:
-            # QMenu::exec → QWidgetPrivate::show_sys → libqcocoa SIGSEGV),
-            # and modal dialogs opened mid-teardown left ghost menus stuck
-            # on screen.
-            menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-
-            def _defer(fn):
-                return lambda: QTimer.singleShot(0, fn)
-
-            act_rename.triggered.connect(_defer(_do_rename))
-            act_reveal.triggered.connect(_defer(_do_reveal))
-            act_delete.triggered.connect(_defer(_do_delete))
-            global_pos = self.history_list.mapToGlobal(pos)
-            # Pin the popup to the screen actually under the cursor —
-            # a stale screen handle after monitor hot-unplug is another
-            # known cocoa popup crasher.
-            screen = QGuiApplication.screenAt(global_pos)
-            if screen is not None:
-                menu.setScreen(screen)
-            self._ctx_menu = menu  # keep the wrapper alive while shown
-            menu.popup(global_pos)
 
         # ── Volume slider
         def _on_vol_changed(self, val: int):
@@ -9106,7 +9000,6 @@ def _cmd_ui_body(args, cfg):
                 self.chosen_label.setText(f"{_t('rec.selected_prefix')}{saved.name}")
                 self._result_path = None
             self._refresh_action_buttons()
-            self._refresh_history()
             QTimer.singleShot(200, self._sync_vol_slider)
 
         def _on_status_changed(self, s: str):
@@ -9285,7 +9178,6 @@ def _cmd_ui_body(args, cfg):
             self._reset_after_pipeline()
             self._result_path = Path(path_str)
             self._refresh_action_buttons()
-            self._refresh_history()
             # The run log is transient: every line is already in the daily
             # log file, and the action button flipping to "Open …" is the
             # confirmation that matters. Leaving the pane parked on screen
@@ -9340,15 +9232,6 @@ def _cmd_ui_body(args, cfg):
             self._ui_log(_t("pipe.log.cancelling"))
             self.cancel_btn.setEnabled(False)
             worker.cancel()
-
-        def _on_history_pick(self, item: QListWidgetItem):
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if not data:
-                return
-            self._last_recorded = data["wav_path"]
-            self.chosen_label.setText(f"{_t('rec.selected_prefix')}" + data['wav_path'].name)
-            self._result_path = data.get("md_path")
-            self._refresh_action_buttons()
 
         def _on_import_clicked(self):
             """Pick an external audio file (iPhone .m4a, .mp3, etc.) and
@@ -9410,7 +9293,6 @@ def _cmd_ui_body(args, cfg):
             self._result_path = None
             self.chosen_label.setText(
                 _t("rec.import.done_fmt").format(name=dst.name))
-            self._refresh_history()
             self._refresh_action_buttons()
 
         # ── Action buttons — toggle between "generate" and "open" based on
@@ -10634,10 +10516,10 @@ def _cmd_ui_body(args, cfg):
             w = self.stack.currentWidget()
             if w is self.history_view:
                 self.history_view.refresh()
-            elif w is self.recording_view:
-                self.recording_view._refresh_history()
             elif w is self.config_view:
                 self.config_view._load_into_widgets()
+            # The recording view has nothing to refresh on entry any more —
+            # its meeting-history card moved out to the history view.
             # Keep the nav highlight in sync with programmatic stack changes.
             if w is not None:
                 self.nav.setCurrentItem(w.objectName())
