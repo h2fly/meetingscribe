@@ -107,7 +107,8 @@ def fake_engine(monkeypatch):
 
 def _args(file, **kw):
     base = dict(file=str(file), start=0, seconds=0, fast=True,
-                review=False, trace=False, wait=0, quiet=False)
+                review=False, trace=False, wait=0, quiet=False,
+                rule1=None, rule2=None, rule3=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -264,3 +265,92 @@ class TestCliWiring:
         for flag in ("--start", "--seconds", "--fast", "--review",
                      "--trace", "--wait", "--quiet"):
             assert flag in r.stdout
+
+
+class TestOutputSurvivesQuietCapture:
+    """The refine worker wraps every FunASR call in `_QuietCapture`, which
+    swaps the PROCESS-GLOBAL sys.stdout for an in-memory buffer. A plain
+    print() from the replay thread during one of those windows is diverted
+    into that buffer and forwarded to the file-only logger.
+
+    Measured before the fix: a 4-minute replay wrote its header line and then
+    nothing at all — no progress, no report — while exiting 0. Fatal for a
+    command whose only job is printing a comparable report.
+    """
+
+    def test_report_still_reaches_stdout_while_a_capture_is_active(
+            self, tmp_path, fake_engine, capsys):
+        p = _write_wav(tmp_path / "r.wav", [np.zeros(1600, dtype=np.float32)] * 2)
+
+        class _Hijacker(_FakeEngine):
+            """Installs a capture and never exits it, as a stuck refine call
+            would look from the replay thread's point of view."""
+
+            def stop(self):
+                self._cap = ms._QuietCapture("CAPTION")
+                self._cap.__enter__()
+                super().stop()
+
+        import meetingscribe as m
+        fake_engine.instances.clear()
+        m.LiveCaptionEngine = _Hijacker
+        try:
+            ms._cmd_captions_body(_args(p), {})
+        finally:
+            inst = fake_engine.instances[-1]
+            getattr(inst, "_cap", None) and inst._cap.__exit__(None, None, None)
+            m.LiveCaptionEngine = _FakeEngine
+        out = capsys.readouterr().out
+        assert "── 字幕 (" in out          # the report, not swallowed
+        assert "第一句修正后的原文" in out
+
+    def test_quiet_capture_restores_only_its_own_stream(self):
+        """Two overlapping captures: the inner one must not strand the outer
+        one's buffer as the process stdout when it exits."""
+        import io
+        real = sys.stdout
+        outer = ms._QuietCapture("A")
+        outer.__enter__()
+        inner_buf = io.StringIO()
+        sys.stdout = inner_buf            # a third party swaps it underneath
+        outer.__exit__(None, None, None)  # must NOT clobber inner_buf
+        assert sys.stdout is inner_buf
+        sys.stdout = real
+
+    def test_header_and_progress_use_the_saved_stream(self, tmp_path,
+                                                      fake_engine, capsys):
+        p = _write_wav(tmp_path / "r.wav", [np.zeros(1600, dtype=np.float32)] * 2)
+        ms._cmd_captions_body(_args(p), {})
+        out = capsys.readouterr().out
+        assert "[字幕] 回放" in out
+        assert "等待后台修正落地" in out
+
+
+class TestSegmentationReport:
+    """The numbers a threshold A/B is decided on."""
+
+    def test_endpoint_block_reports_the_thresholds_in_effect(
+            self, tmp_path, fake_engine, capsys):
+        p = _write_wav(tmp_path / "r.wav",
+                       [np.zeros(16000 * 2, dtype=np.float32)] * 2)
+        ms._cmd_captions_body(_args(p, rule2=1.6), {})
+        out = capsys.readouterr().out
+        assert "── 断句 ──" in out
+        assert "rule2=1.6" in out
+        assert "行/分钟" in out and "平均行长" in out and "复核批次" in out
+
+    def test_cli_flags_override_the_config(self, tmp_path, fake_engine):
+        p = _write_wav(tmp_path / "r.wav", [np.zeros(1600, dtype=np.float32)] * 2)
+        cfg = {"live_captions": {"endpoint": {
+            "rule2_min_trailing_silence": 0.8}}}
+        ms._cmd_captions_body(_args(p, rule2=1.6), cfg)
+        got = fake_engine.instances[-1].cfg["live_captions"]["endpoint"]
+        assert got["rule2_min_trailing_silence"] == 1.6
+
+    def test_unset_flags_leave_the_config_alone(self, tmp_path, fake_engine):
+        p = _write_wav(tmp_path / "r.wav", [np.zeros(1600, dtype=np.float32)] * 2)
+        cfg = {"live_captions": {"endpoint": {
+            "rule2_min_trailing_silence": 0.9}}}
+        ms._cmd_captions_body(_args(p), cfg)
+        got = fake_engine.instances[-1].cfg["live_captions"]["endpoint"]
+        assert got["rule2_min_trailing_silence"] == 0.9

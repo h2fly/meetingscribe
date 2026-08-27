@@ -251,7 +251,17 @@ class _QuietCapture:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stdout, sys.stderr = self._saved_out, self._saved_err
+        # Restore ONLY what we installed. sys.stdout is process-global, so a
+        # concurrent capture on another thread may have replaced ours in the
+        # meantime; overwriting it here would strand that capture's buffer as
+        # the process's stdout and silently swallow everything printed
+        # afterwards. Anything that must reach the terminal regardless should
+        # hold its own stream handle (see `_cmd_captions_body`) rather than
+        # trust sys.stdout — this class cannot make a global safe for threads.
+        if sys.stdout is self._sio_out:
+            sys.stdout = self._saved_out
+        if sys.stderr is self._sio_err:
+            sys.stderr = self._saved_err
         for buf in (self._sio_out, self._sio_err):
             text = buf.getvalue()
             for raw in text.splitlines():
@@ -7612,11 +7622,24 @@ def _cmd_captions_body(args, cfg):
     # Events arrive from the ASR / MT / refine / speaker threads, so printing
     # needs serialising or lines interleave mid-character.
     out_lock = threading.Lock()
+    # Hold our OWN stream handle instead of using print(). The refine worker
+    # wraps every FunASR call in `_QuietCapture`, which swaps the
+    # process-global sys.stdout for an in-memory buffer — so a plain print()
+    # from this thread during one of those windows (seconds at a time, many
+    # times a run) is diverted into that buffer and forwarded to the
+    # file-only logger. Measured: a 4-minute replay emitted its header and
+    # then nothing at all, report included, which is fatal for a command
+    # whose entire purpose is printing a comparable report.
+    stdout = sys.stdout
+
+    def _emit_line(line: str) -> None:
+        with out_lock:
+            stdout.write(line + "\n")
+            stdout.flush()
 
     def _say(line: str) -> None:
         if live:
-            with out_lock:
-                print(line, flush=True)
+            _emit_line(line)
 
     def on_event(ev):
         t = ev.get("type")
@@ -7643,17 +7666,17 @@ def _cmd_captions_body(args, cfg):
 
     engine = LiveCaptionEngine(cfg, on_event)
     fast = bool(getattr(args, "fast", False))
-    print(f"[字幕] 回放 {path.name} — {total_secs:.1f} 秒，"
-          f"声源 {list(tracks)}，{'超实时（分句会与实况不同）' if fast else '实时速度'}",
-          flush=True)
+    _emit_line(f"[字幕] 回放 {path.name} — {total_secs:.1f} 秒，"
+               f"声源 {list(tracks)}，"
+               f"{'超实时（分句会与实况不同）' if fast else '实时速度'}")
     if fast:
         # The ASR worker drains on a 250 ms WALL-CLOCK pacer, so feeding 10x
         # hands it 2.5 s per accept() — and `is_endpoint()` is checked once per
         # call, so sentence boundaries inside a batch collapse. Measured on the
         # same 104 s passage: 3 long run-on segments instead of 6. Fine for a
         # smoke test, useless for judging segmentation or comparing runs.
-        print("[字幕] 提示：超实时模式下识别器每次收到的音频块变大，"
-              "断句会明显变少变长；对比字幕质量请用默认的实时速度。", flush=True)
+        _emit_line("[字幕] 提示：超实时模式下识别器每次收到的音频块变大，"
+                   "断句会明显变少变长；对比字幕质量请用默认的实时速度。")
     engine.start()
     step = int(_CAPTION_PACER_INTERVAL * sr)
     n_samples = max(len(v) for v in tracks.values())
@@ -7667,9 +7690,8 @@ def _cmd_captions_body(args, cfg):
             fed = off / sr
             if fed >= next_note:
                 next_note = fed + _CAPTIONS_PROGRESS_EVERY_SEC
-                with out_lock:
-                    print(f"[字幕] … 已喂入 {fed:.0f}/{total_secs:.0f} 秒，"
-                          f"定稿 {len(order)} 行", flush=True)
+                _emit_line(f"[字幕] … 已喂入 {fed:.0f}/{total_secs:.0f} 秒，"
+                           f"定稿 {len(order)} 行")
             if fast:
                 # Feeding faster than the ASR consumes would only pile audio
                 # into the ring buffer (and past _CAPTION_RING_SECONDS it gets
@@ -7678,9 +7700,8 @@ def _cmd_captions_body(args, cfg):
             else:
                 time.sleep(_CAPTION_PACER_INTERVAL)
 
-        with out_lock:
-            print(f"[字幕] 音频喂完，等待后台修正落地（上限 {args.wait:.0f} 秒）...",
-                  flush=True)
+        _emit_line(f"[字幕] 音频喂完，等待后台修正落地"
+                   f"（上限 {args.wait:.0f} 秒）...")
         _captions_drain(engine, args.wait)
         if getattr(args, "review", False):
             _captions_force_review(engine)
@@ -7688,6 +7709,7 @@ def _cmd_captions_body(args, cfg):
         engine.stop()
 
     _captions_report(rows, order, trace, verbose=getattr(args, "trace", False),
+                     stream=stdout,
                      audio_secs=total_secs,
                      endpoint=_caption_endpoint_rules(lc),
                      review_cfg=_deep_merge(
@@ -7758,12 +7780,18 @@ def _captions_force_review(engine) -> None:
 
 def _captions_report(rows: dict, order: list, trace: list, verbose: bool,
                      audio_secs: float = 0.0, endpoint: "dict | None" = None,
-                     review_cfg: "dict | None" = None) -> None:
+                     review_cfg: "dict | None" = None, stream=None) -> None:
     """Emit the settled state as ONE flushed write.
 
     Built as a single string on purpose: the per-line prints were lost when
     the process ended before stdout's block buffer was flushed, so a long
     replay could finish having printed nothing at all.
+
+    `stream` is the caller's own stdout handle, captured before any worker
+    thread could install a `_QuietCapture` over the process-global one. Using
+    print() here loses the entire report whenever a refine call happens to be
+    in flight — measured on a 4-minute replay, which printed its header and
+    nothing else.
     """
     out: list = []
     if verbose:
@@ -7821,8 +7849,9 @@ def _captions_report(rows: dict, order: list, trace: list, verbose: bool,
         batches = max(1, math.ceil(per_min * interval / max(1, max_lines)))
         out.append(f"  复核批次    : 每 {interval:g} 分钟 {per_min * interval:.0f} 行 "
                    f"→ {batches} 批/周期（单批上限 {max_lines}）")
-    print("\n".join(out), flush=True)
-    sys.stdout.flush()
+    out_stream = stream or sys.stdout
+    out_stream.write("\n".join(out) + "\n")
+    out_stream.flush()
 
 
 def cmd_hotwords(args, cfg):
