@@ -1094,7 +1094,15 @@ DEFAULT_CONFIG = {
         "auto_update": True,       # 纪要/总结生成后自动提取热词并合并进 stt.funasr.hotword
         "rule_extract": True,      # A：规则法（英文缩写/驼峰/含数字词等，无 LLM 开销）
         "llm_extract": True,       # B：LLM 术语提取（复用 meeting_notes_provider，离线阶段执行）
-        "max_count": 100,          # 热词总量上限；超出时最早加入的先被淘汰
+        # 热词总量上限；超出时最早加入的先被淘汰。
+        # 实测放大的代价（同一段音频，填充随机中文名到指定规模）：
+        #   流式 sherpa：初始化不变(~1s)，解码 20x → 15.6x 实时（1000 时 +28%）
+        #   离线 FunASR：30s 音频 11.6s → 14.2s(1000) → 15.2s(5000)
+        # 性能不是瓶颈，但精度是：5000 个 2 字中文名会造成误替换
+        # （「分眼都在那边」→「分眼都郑娜边」——日常读音被生僻人名抢走）。
+        # 2 字纯中文热词最危险；含 ASCII 或 3 字以上的安全得多。
+        # 1000 是实测下的稳妥上限，继续放大请先用 `captions` 回放做 A/B。
+        "max_count": 1000,
     },
     # ── 录音设备 ──────────────────────────────────────────────────────────
     "sample_rate": 48000,
@@ -6940,6 +6948,150 @@ def cmd_config(args, cfg):
         print(json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
+_NOTION_API = "https://api.notion.com/v1"
+_NOTION_VERSION = "2022-06-28"
+
+
+def _notion_request(path: str, token: str, payload: "dict | None" = None) -> dict:
+    """One Notion API call. GET when `payload` is None, else POST.
+
+    The token is read from the environment by the caller and never logged,
+    stored or echoed — not in errors either, since those reach the console.
+    Uses certifi's CA bundle for the same reason `_caption_download` does.
+    """
+    import json as _json
+    import ssl
+    import urllib.error
+    import urllib.request
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    data = _json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        f"{_NOTION_API}{path}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": _NOTION_VERSION,
+            "Content-Type": "application/json",
+        },
+        method="POST" if data else "GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = _json.loads(e.read().decode("utf-8")).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(f"Notion API {path} 返回 {e.code}: {detail}") from None
+
+
+def _notion_paginate(path: str, token: str, payload: "dict | None" = None,
+                     max_pages: int = 20) -> "list[dict]":
+    """Follow Notion's cursor pagination, bounded so a huge workspace can't
+    turn a one-off import into an unbounded crawl."""
+    out: "list[dict]" = []
+    cursor = None
+    for _ in range(max_pages):
+        body = dict(payload or {})
+        if payload is None and cursor:
+            page = _notion_request(f"{path}?start_cursor={cursor}", token)
+        else:
+            if cursor:
+                body["start_cursor"] = cursor
+            page = _notion_request(path, token, body if payload is not None else None)
+        out.extend(page.get("results") or [])
+        if not page.get("has_more"):
+            break
+        cursor = page.get("next_cursor")
+        if not cursor:
+            break
+    return out
+
+
+def _notion_member_names(token: str) -> "list[str]":
+    """Workspace member names — the highest-value slice for ASR hotwords,
+    since names are the error class the recognizer misses most."""
+    names = []
+    for u in _notion_paginate("/users", token):
+        if u.get("type") == "bot":
+            continue
+        name = (u.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _notion_titles(token: str) -> "list[str]":
+    """Page + database titles — where project names and internal codenames live.
+
+    Walks each result for any `title`-typed rich text rather than special-casing
+    page vs database vs database-row shapes, which differ across API versions.
+    """
+    def _titles_in(node) -> "list[str]":
+        found = []
+        if isinstance(node, dict):
+            if node.get("type") == "title" and isinstance(node.get("title"), list):
+                found.append("".join(
+                    part.get("plain_text", "") for part in node["title"]))
+            elif isinstance(node.get("title"), list):
+                found.append("".join(
+                    part.get("plain_text", "") for part in node["title"]
+                    if isinstance(part, dict)))
+            for v in node.values():
+                found.extend(_titles_in(v))
+        elif isinstance(node, list):
+            for v in node:
+                found.extend(_titles_in(v))
+        return found
+
+    out = []
+    for item in _notion_paginate("/search", token, {"page_size": 100}):
+        out.extend(t.strip() for t in _titles_in(item) if t.strip())
+    return out
+
+
+def _notion_hotword_candidates(names: "list[str]", titles: "list[str]",
+                               limit: int = 400) -> "list[str]":
+    """Turn Notion names + titles into hotword candidates.
+
+    Names become the form people SAY: a CJK name stays whole (`陈涛`), while
+    "Mason Chen" splits into tokens because nobody says the full name mid
+    sentence. Titles go through the existing rule-based miner
+    (`_extract_hotword_candidates`) instead of being added verbatim — a title
+    like 「2026 Q3 运维体系规划」 is a sentence, not a hotword.
+    """
+    out: "list[str]" = []
+    for raw in names:
+        name = re.sub(r"[（(\[].*?[)）\]]", " ", raw)       # drop "(Kevin)" etc.
+        if "@" in name:                                     # an email, not a name
+            name = name.split("@", 1)[0].replace(".", " ")
+        if any("一" <= c <= "鿿" for c in name):
+            out.extend(t for t in re.findall(r"[一-鿿]{2,6}", name))
+        else:
+            # Latin tokens must start capitalised. An email login splits into
+            # lowercase fragments ("he.huang" → he / huang) and those are
+            # common syllables that would bias real speech; a display name is
+            # capitalised, so this keeps Mason / Jimmy / Zhang and drops the
+            # debris. ("he" is already a stopword; "huang" would not be.)
+            out.extend(t for t in re.split(r"[\s_./-]+", name)
+                       if len(t) >= 2 and t[:1].isupper())
+    if titles:
+        out.extend(_extract_hotword_candidates("。".join(titles)))
+    seen, uniq = set(), []
+    for t in out:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(t)
+    return uniq[:max(1, limit)]
+
+
 def _wav_channels_by_role(path: Path) -> "tuple[dict, int]":
     """Split a recording into {role: samples}, mirroring how it was captured.
 
@@ -7195,6 +7347,70 @@ def cmd_hotwords(args, cfg):
         restore()
 
 
+def _hotwords_from_notion(args, cfg, hw_cfg: dict) -> None:
+    """`hotwords --notion`: one-off import of member names, project names and
+    terminology from a Notion workspace.
+
+    Deliberately on demand rather than a background sync — the workspace does
+    not change per meeting, and a scheduled crawl would be a standing network
+    dependency for a tool that otherwise only talks to localhost and model
+    downloads.
+
+    The token comes from NOTION_TOKEN / NOTION_API_KEY in the environment and
+    is never written to config, logged, or echoed in an error.
+    """
+    token = (os.environ.get("NOTION_TOKEN")
+             or os.environ.get("NOTION_API_KEY") or "").strip()
+    if not token:
+        print("[热词] 需要 Notion token。请先创建一个 internal integration，"
+              "把要读取的页面共享给它，然后：")
+        print("    export NOTION_TOKEN=ntn_xxx   # 只从环境变量读取，不写入配置")
+        print("    python3 meetingscribe.py hotwords --notion")
+        sys.exit(1)
+
+    limit = int(getattr(args, "notion_limit", 0) or 400)
+    try:
+        names = _notion_member_names(token)
+        print(f"[热词] Notion 成员 {len(names)} 人")
+        titles = _notion_titles(token)
+        print(f"[热词] Notion 页面/数据库标题 {len(titles)} 条")
+    except (RuntimeError, OSError) as e:
+        print(f"[热词] Notion 拉取失败：{e}")
+        sys.exit(1)
+
+    cands = _notion_hotword_candidates(names, titles, limit=limit)
+    print(f"[热词] 候选 {len(cands)} 个（上限 {limit}）")
+    if not cands:
+        print("[热词] 没有可用候选，未改动")
+        return
+
+    # Short pure-CJK terms are the measured danger: at scale they steal
+    # ordinary speech (「分眼都在那边」→「分眼都郑娜边」). Report the count so
+    # the effect is visible rather than silent, and let --min-cjk drop them.
+    min_cjk = int(getattr(args, "min_cjk", 0) or 0)
+    if min_cjk:
+        before = len(cands)
+        cands = [t for t in cands
+                 if not all("一" <= c <= "鿿" for c in t) or len(t) >= min_cjk]
+        print(f"[热词] 过滤掉 {before - len(cands)} 个短于 {min_cjk} 字的纯中文词")
+    risky = [t for t in cands if all("一" <= c <= "鿿" for c in t) and len(t) <= 2]
+    if risky:
+        print(f"[热词] 注意：其中 {len(risky)} 个是 2 字纯中文词，"
+              f"放大后容易抢走日常读音；如需剔除用 --min-cjk 3")
+
+    if getattr(args, "dry_run", False):
+        print("[热词] --dry-run，仅预览不写入：")
+        print("  " + " ".join(cands))
+        return
+
+    added = _persist_hotwords(cands, cfg, hw_cfg.get("max_count", 1000))
+    print(f"[热词] 新增 {len(added)} 个 → {HOTWORD_FILE.name}"
+          f"（共 {len(((cfg.get('stt') or {}).get('funasr') or {}).get('hotword', '').split())} 个）")
+    if added:
+        print("  " + " ".join(added))
+    print("[热词] 快速模式字幕需重启 app 才会用上新热词（识别器有缓存）")
+
+
 def _cmd_hotwords_body(args, cfg):
     """`hotwords` 子命令：存量回填。
 
@@ -7210,6 +7426,11 @@ def _cmd_hotwords_body(args, cfg):
         return
 
     hw_cfg = _deep_merge(DEFAULT_CONFIG["hotwords"], cfg.get("hotwords") or {})
+
+    if getattr(args, "notion", False):
+        _hotwords_from_notion(args, cfg, hw_cfg)
+        return
+
     recordings_dir = CONFIG_DIR / "recordings"
     if not recordings_dir.exists():
         print(f"[热词] 录音目录不存在：{recordings_dir}")
@@ -10636,6 +10857,15 @@ def main():
     )
     p_hw.add_argument("--no-llm", action="store_true", help="只用规则提取，不调用 LLM")
     p_hw.add_argument("--show", action="store_true", help="仅显示当前热词列表")
+    p_hw.add_argument("--notion", action="store_true",
+                      help="一次性从 Notion 导入成员名/项目名/术语"
+                           "（需环境变量 NOTION_TOKEN）")
+    p_hw.add_argument("--notion-limit", type=int, default=400, metavar="N",
+                      help="Notion 候选词上限（默认 400）")
+    p_hw.add_argument("--min-cjk", type=int, default=0, metavar="N",
+                      help="剔除短于 N 字的纯中文候选（推荐 3，减少误替换）")
+    p_hw.add_argument("--dry-run", action="store_true",
+                      help="只预览将导入的词，不写入")
 
     args = parser.parse_args()
 

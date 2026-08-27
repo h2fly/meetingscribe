@@ -208,6 +208,11 @@ python3 meetingscribe.py captions /path/to/audio.wav --start 60 --seconds 120 --
 # Backfill ASR hotwords from existing transcripts/notes into config.jsonc
 # (afterwards hotwords maintain themselves after every notes generation)
 python3 meetingscribe.py hotwords          # rule-based + LLM extraction
+# One-off import of member names / project names / terminology from Notion.
+# Needs an internal integration token in the environment; nothing is stored.
+export NOTION_TOKEN=ntn_xxx
+python3 meetingscribe.py hotwords --notion --dry-run     # preview first
+python3 meetingscribe.py hotwords --notion --min-cjk 3   # skip risky 2-char CJK terms
 python3 meetingscribe.py hotwords --show   # print the current list
 ```
 
@@ -496,6 +501,10 @@ python3 meetingscribe.py transcribe /path/to/audio.wav --mode interview
 # 扫描已有转写/纪要，把热词回填进 config.jsonc
 # （之后每次生成纪要都会自动增量维护热词，无需再手动跑）
 python3 meetingscribe.py hotwords          # 规则 + LLM 提取
+# 一次性从 Notion 导入成员名 / 项目名 / 术语（token 只从环境变量读，不落盘）
+export NOTION_TOKEN=ntn_xxx
+python3 meetingscribe.py hotwords --notion --dry-run     # 先预览
+python3 meetingscribe.py hotwords --notion --min-cjk 3   # 剔除易误触的 2 字中文词
 python3 meetingscribe.py hotwords --show   # 查看当前热词列表
 ```
 
