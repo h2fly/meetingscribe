@@ -58,12 +58,25 @@
     // into the refine and batch-review passes, so both correct better. The
     // cost is that the line shows up on screen later.
     //   rule2 is the main knob — trailing silence required to end a line
-    //     once some text has been decoded. sherpa's default is 1.2; this
-    //     project used to hardcode 0.8, i.e. more aggressive than stock.
+    //     once some text has been decoded.
     //   rule1 applies before any text is decoded; rule3 is the hard cap on
     //     how long one line may keep growing.
+    // rule2=1.2 was chosen by measurement on one 4-minute passage of
+    // continuous single-speaker speech (speaker count came out as 1):
+    //   0.8  (this project's old hardcoded value, more aggressive than
+    //         sherpa's own default)          18 lines / 75.8 chars mean
+    //   1.2  (sherpa's stock default)        14 lines / 97.6 chars mean
+    //   1.6                                  14 lines / 95.4 chars mean
+    // 0.8 -> 1.2 is 22% fewer lines and 29% longer ones, with total
+    // characters 1365 vs 1366 — the same content cut differently, nothing
+    // lost. 1.2 -> 1.6 changes the line count not at all: it has plateaued,
+    // so raising it further buys nothing.
+    // Fewer lines is the win that matters downstream: a review call costs a
+    // measured 41.6 s fixed plus only 3.4 s per line, so removing lines is
+    // worth far more than shortening them.
     // Changes need an app restart (the recognizer eats these at construction).
-    // A/B them on a real recording with `captions <wav> --rule2 …`, not by feel.
+    // Re-measure it yourself with:
+    //   python3 meetingscribe.py captions <wav> --rule2 1.6
     "endpoint": {
       "rule1_min_trailing_silence": 2.4,
       "rule2_min_trailing_silence": 1.2,
