@@ -20,8 +20,8 @@ import meetingscribe as ms
 
 class TestCandidates:
     def test_cjk_name_kept_whole(self):
-        out = ms._notion_hotword_candidates(["韩梅", "杨文芳"], [])
-        assert out == ["韩梅", "杨文芳"]
+        out = ms._notion_hotword_candidates(["李雷", "王小美"], [])
+        assert out == ["李雷", "王小美"]
 
     def test_latin_name_split_into_spoken_tokens(self):
         """Nobody says the full name mid-sentence, so both halves are useful."""
@@ -38,10 +38,10 @@ class TestCandidates:
         assert ms._notion_hotword_candidates(["he.huang@aftership.com"], []) == []
 
     def test_titles_are_mined_not_taken_verbatim(self):
-        titles = ["2026 Q3 运维体系规划", "CloudX 推理迁移方案",
+        titles = ["2026 Q3 运维体系规划", "Acme 推理迁移方案",
                   "GKE 集群 gVisor 兼容性测试"]
         out = ms._notion_hotword_candidates([], titles)
-        assert "CloudX" in out and "GKE" in out and "gVisor" in out
+        assert "Acme" in out and "GKE" in out and "gVisor" in out
         # the whole sentence never becomes a hotword
         assert not any(len(t) > 12 for t in out)
         assert "2026 Q3 运维体系规划" not in out
@@ -78,11 +78,11 @@ def _fake_api(monkeypatch, pages: dict):
 class TestMemberNames:
     def test_bots_skipped(self, monkeypatch):
         _fake_api(monkeypatch, {"/users": {"results": [
-            {"type": "person", "name": "韩梅"},
+            {"type": "person", "name": "李雷"},
             {"type": "bot", "name": "My Integration"},
             {"type": "person", "name": "Aaron Chen"},
         ]}})
-        assert ms._notion_member_names("tok") == ["韩梅", "Aaron Chen"]
+        assert ms._notion_member_names("tok") == ["李雷", "Aaron Chen"]
 
     def test_blank_names_skipped(self, monkeypatch):
         _fake_api(monkeypatch, {"/users": {"results": [
@@ -101,12 +101,12 @@ class TestTitles:
         _fake_api(monkeypatch, {"/search": {"results": [
             {"object": "page", "properties": {
                 "Name": {"type": "title",
-                         "title": [{"plain_text": "CloudX 迁移"}]}}},
+                         "title": [{"plain_text": "Acme 迁移"}]}}},
             {"object": "database",
              "title": [{"plain_text": "SRE 项目台账"}]},
         ]}})
         out = ms._notion_titles("tok")
-        assert "CloudX 迁移" in out and "SRE 项目台账" in out
+        assert "Acme 迁移" in out and "SRE 项目台账" in out
 
     def test_multi_part_rich_text_joined(self, monkeypatch):
         _fake_api(monkeypatch, {"/search": {"results": [
@@ -175,13 +175,13 @@ class TestCommand:
 
     def test_dry_run_writes_nothing(self, monkeypatch, capsys):
         monkeypatch.setenv("NOTION_TOKEN", "secret-token")
-        monkeypatch.setattr(ms, "_notion_member_names", lambda t: ["韩梅"])
-        monkeypatch.setattr(ms, "_notion_titles", lambda t: ["CloudX 迁移"])
+        monkeypatch.setattr(ms, "_notion_member_names", lambda t: ["李雷"])
+        monkeypatch.setattr(ms, "_notion_titles", lambda t: ["Acme 迁移"])
         monkeypatch.setattr(
             ms, "_persist_hotwords",
             lambda *a, **k: pytest.fail("dry-run must not persist"))
         ms._hotwords_from_notion(_args(dry_run=True), {}, {"max_count": 1000})
-        assert "韩梅" in capsys.readouterr().out
+        assert "李雷" in capsys.readouterr().out
 
     def test_persists_and_reports(self, monkeypatch, capsys):
         monkeypatch.setenv("NOTION_TOKEN", "secret-token")
@@ -189,8 +189,8 @@ class TestCommand:
         monkeypatch.setattr(ms, "_notion_titles", lambda t: [])
         seen = {}
 
-        def fake_persist(terms, cfg, max_count):
-            seen.update(terms=terms, max_count=max_count)
+        def fake_persist(terms, cfg, max_count, **kw):
+            seen.update(terms=terms, max_count=max_count, kw=kw)
             cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = \
                 " ".join(terms)
             return terms
@@ -200,13 +200,16 @@ class TestCommand:
         ms._hotwords_from_notion(_args(), cfg, {"max_count": 1000})
         assert seen["terms"] == ["Aaron", "Chen"]
         assert seen["max_count"] == 1000
+        # Workspace names are authoritative, not guesses mined from one
+        # meeting, so they must be pinned against rolling eviction.
+        assert seen["kw"].get("pin") is True
         assert "新增 2 个" in capsys.readouterr().out
 
     def test_token_never_printed(self, monkeypatch, capsys):
         monkeypatch.setenv("NOTION_TOKEN", "ntn_supersecret")
-        monkeypatch.setattr(ms, "_notion_member_names", lambda t: ["韩梅"])
+        monkeypatch.setattr(ms, "_notion_member_names", lambda t: ["李雷"])
         monkeypatch.setattr(ms, "_notion_titles", lambda t: [])
-        monkeypatch.setattr(ms, "_persist_hotwords", lambda *a, **k: ["韩梅"])
+        monkeypatch.setattr(ms, "_persist_hotwords", lambda *a, **k: ["李雷"])
         ms._hotwords_from_notion(_args(), {}, {"max_count": 1000})
         assert "ntn_supersecret" not in capsys.readouterr().out
 
@@ -227,18 +230,18 @@ class TestCommand:
         speech (「分眼都在那边」→「分眼都郑娜边」)."""
         monkeypatch.setenv("NOTION_TOKEN", "tok")
         monkeypatch.setattr(ms, "_notion_member_names",
-                            lambda t: ["韩梅", "杨文芳", "Aaron"])
+                            lambda t: ["李雷", "王小美", "Aaron"])
         monkeypatch.setattr(ms, "_notion_titles", lambda t: [])
         got = {}
         monkeypatch.setattr(ms, "_persist_hotwords",
-                            lambda terms, cfg, mc: got.setdefault("t", terms))
+                            lambda terms, cfg, mc, **kw: got.setdefault("t", terms))
         ms._hotwords_from_notion(_args(min_cjk=3), {}, {"max_count": 1000})
-        assert "韩梅" not in got["t"]          # 2 chars, dropped
-        assert "杨文芳" in got["t"] and "Aaron" in got["t"]
+        assert "李雷" not in got["t"]          # 2 chars, dropped
+        assert "王小美" in got["t"] and "Aaron" in got["t"]
 
     def test_risky_terms_are_reported_not_hidden(self, monkeypatch, capsys):
         monkeypatch.setenv("NOTION_TOKEN", "tok")
-        monkeypatch.setattr(ms, "_notion_member_names", lambda t: ["韩梅", "夏燕"])
+        monkeypatch.setattr(ms, "_notion_member_names", lambda t: ["李雷", "赵小雨"])
         monkeypatch.setattr(ms, "_notion_titles", lambda t: [])
         monkeypatch.setattr(ms, "_persist_hotwords", lambda *a, **k: [])
         ms._hotwords_from_notion(_args(), {}, {"max_count": 1000})

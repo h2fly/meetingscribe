@@ -52,6 +52,23 @@
     // Minimum refresh interval (ms) for the in-flight gray caption line;
     // raise it for a calmer display, lower it for snappier partials.
     "partial_interval_ms": 500,
+    // Sentence-break (endpoint detection) thresholds, forwarded to sherpa.
+    // This is THE knob for how fragmented the captions are: the less a
+    // continuous speaker gets cut up, the more context each line carries
+    // into the refine and batch-review passes, so both correct better. The
+    // cost is that the line shows up on screen later.
+    //   rule2 is the main knob — trailing silence required to end a line
+    //     once some text has been decoded. sherpa's default is 1.2; this
+    //     project used to hardcode 0.8, i.e. more aggressive than stock.
+    //   rule1 applies before any text is decoded; rule3 is the hard cap on
+    //     how long one line may keep growing.
+    // Changes need an app restart (the recognizer eats these at construction).
+    // A/B them on a real recording with `captions <wav> --rule2 …`, not by feel.
+    "endpoint": {
+      "rule1_min_trailing_silence": 2.4,
+      "rule2_min_trailing_silence": 1.2,
+      "rule3_min_utterance_length": 20.0
+    },
     // Display-layer paragraph merging: consecutive finalized lines whose
     // arrival gap is <= this many ms are shown as one paragraph (display
     // only — recognition/translation data is untouched). 0 = no merging.
@@ -110,6 +127,24 @@
       // this if your provider is slow (measured: 53 s for 6 lines through the
       // claude CLI, most of which is process startup).
       "max_lines": 120,
+      // Total cap on the pending queue (max_lines only bounds ONE batch).
+      // This is a backstop, not a tuning knob: if the provider stalls the
+      // queue would otherwise grow without limit, and a correction landing 40
+      // minutes after the line scrolled off screen has no value. Over the cap
+      // the OLDEST rows are dropped and the log says exactly which ones
+      // (seg=A..B) — no silent truncation. At the measured 5.9 lines/min
+      // ingest, 240 rows tolerates roughly a 40-minute complete stall.
+      // Never goes below max_lines.
+      "max_buffer": 240,
+      // How many already-reviewed lines to pass as read-only context. This is
+      // what makes terminology consistent ACROSS batches: if batch N settles
+      // on "ChatOps", batch N+1 should not independently pick 「拆特ops」
+      // again. They are reference only — never re-corrected, since the user
+      // already saw them corrected and rewriting them every interval would
+      // make the pane churn. Input tokens only: measured per-call cost is
+      // 41.6 s fixed + 3.4 s per line (linear fit over 80 real batches), so a
+      // dozen reference lines is noise. 0 = off.
+      "context_lines": 12,
       // A line missing from the reply (truncated answer) is put back for
       // another round, at most this many times.
       "max_tries": 2,
@@ -141,6 +176,15 @@
       // Segments shorter than this are skipped — too little audio for a
       // reliable voice print.
       "min_secs": 1.0,
+      // How many segments a voice-print cluster must accumulate before it is
+      // shown as a person and given a number. One segment is not evidence:
+      // measured on a real 34-minute meeting, 4 of 8 clusters held exactly
+      // one segment each (a cough, a keyboard tap, a one-word interjection),
+      // and they used up max_speakers so genuinely new voices later got
+      // folded into existing speakers. Unproven lines carry no speaker tag;
+      // when a second segment joins the cluster the held lines are tagged
+      // retroactively, so a real speaker loses only the delay, not the label.
+      "min_segments": 2,
       // Queue cap; excess segments keep their channel-based label.
       "max_backlog": 3
     },
@@ -493,11 +537,15 @@
       "3. 人名、产品名、技术术语优先采用术语表中的写法",
       "4. 译文必须与修正后的原文对应：中文原文译成英文，英文原文译成中文；口语化、简洁",
       "5. 无需修改的条目也要原样输出",
+      "6. 术语和人名的写法必须与【上文】保持一致——同一个词在前文已确定的写法，本批不要再换一种写法",
       "",
       "【术语表】（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）",
       "{hotwords}",
       "",
-      "【字幕】",
+      "【上文】（本场前面已经校对完成的字幕，只作理解上下文和统一术语之用；不要输出这部分，也不要修改它们）",
+      "{context}",
+      "",
+      "【字幕】（只校对并输出这一部分）",
       "{lines}",
       "",
       "严格按下面格式输出，每行一条，除此之外不要输出任何内容：",

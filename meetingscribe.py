@@ -789,11 +789,15 @@ _PROMPT_DEFAULTS: dict = {
 3. 人名、产品名、技术术语优先采用术语表中的写法
 4. 译文必须与修正后的原文对应：中文原文译成英文，英文原文译成中文；口语化、简洁
 5. 无需修改的条目也要原样输出
+6. 术语和人名的写法必须与【上文】保持一致——同一个词在前文已确定的写法，本批不要再换一种写法
 
 【术语表】（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）
 {hotwords}
 
-【字幕】
+【上文】（本场前面已经校对完成的字幕，只作理解上下文和统一术语之用；不要输出这部分，也不要修改它们）
+{context}
+
+【字幕】（只校对并输出这一部分）
 {lines}
 
 严格按下面格式输出，每行一条，除此之外不要输出任何内容：
@@ -1010,6 +1014,19 @@ DEFAULT_CONFIG = {
         # 直接跳过——迟到几十秒的修正没有价值，还会拖住后面的段。
         "refine_max_backlog": 3,
         "partial_interval_ms": 500,  # 进行中字幕的最小刷新间隔（调大 = 更稳定不闪跳）
+        # 断句（端点检测）阈值，直接透传给 sherpa。这是「字幕碎不碎」的唯一旋钮：
+        # 一个人连续讲话时断得越少，每行携带的上下文越多，后面的 refine 和批量
+        # 复核就越准；代价是这一行要更晚才出现在屏幕上。
+        #   rule2 是主要旋钮——已有文字后需要多长的静音才切句。
+        #   sherpa 默认 1.2；本项目原先硬编码 0.8（比默认更激进，切得更碎）。
+        #   rule1 是「还没出字时」的静音阈值，rule3 是单行最长时长的强制上限。
+        # 改这里需要重启（识别器在构造时吃掉这些参数），并且请用
+        # `python3 meetingscribe.py captions <wav>` 拿真实录音 A/B，不要凭感觉。
+        "endpoint": {
+            "rule1_min_trailing_silence": 2.4,
+            "rule2_min_trailing_silence": 1.2,
+            "rule3_min_utterance_length": 20.0,
+        },
         # 显示层段落合并：相邻两句定稿间隔 ≤ 此毫秒数时合并为同一段显示
         # （只影响展示，不影响识别/翻译数据）。0 = 不合并。
         "merge_gap_ms": 2500,
@@ -1039,6 +1056,18 @@ DEFAULT_CONFIG = {
             # 5.2k tok，刚好在常见的 8k 输出上限之下；而实测语速 6.1 行/分钟，
             # 一个 5 分钟周期只攒约 30 行，120 已是 4 倍余量。
             "max_lines": 120,
+            # 待复核队列的总量上限（max_lines 只约束单批）。这是兜底而不是调优
+            # 旋钮：provider 卡住时队列会无界增长，而迟到 40 分钟才修正一行
+            # 早已滚出屏幕的字幕没有价值。超限丢最旧的，并在日志里写明丢了
+            # 哪几段（seg=A..B），不做静默截断。实测摄入 5.9 行/分，240 行
+            # 约等于容忍 40 分钟的完全停摆。不会低于 max_lines。
+            "max_buffer": 240,
+            # 送进 prompt 的「上文」行数：本场前面已复核定稿的最后 N 行，
+            # 只读参考，不重新校对。跨批次术语一致性靠它——第 N 批把
+            # 「拆特ops」定成「ChatOps」，第 N+1 批不该又换回去。
+            # 只增加输入 token；实测单次调用固定开销 41.6s、每行边际 3.4s
+            # （80 批线性回归），十来行参考文本的代价可忽略。0 = 关闭。
+            "context_lines": 12,
             "max_tries": 2,          # 回复里漏掉的行最多重投几次
             "provider": "",          # 留空 = 用 polish_provider
         },
@@ -1051,6 +1080,12 @@ DEFAULT_CONFIG = {
             "threshold": 0.5,      # 余弦相似度阈值：调低=更容易并成同一个人，调高=更容易分裂
             "max_speakers": 8,     # 上限；超出后新声音并入最近的已知说话人
             "min_secs": 1.0,       # 短于此长度的片段不做声纹（太短不可靠）
+            # 一个声纹簇累计多少段才算「一个人」并分配编号。1 段不是证据：
+            # 实测一场 34 分钟会议里 8 个簇有 4 个只有 1 段（咳嗽、敲键盘、
+            # 一个字的插话），它们还占满了 max_speakers，导致后面真正的新
+            # 声音被并进已有说话人。未达标的行先不打标签，等第 2 段到达时
+            # 回溯补发——真人只是晚几秒拿到标签，不会拿不到。
+            "min_segments": 2,
             "max_backlog": 3,      # 排队上限，超出的片段跳过识别
         },
         # 仅在 mt_provider="nllb" 时使用
@@ -1222,14 +1257,118 @@ def _load_hotword_file() -> str:
     return ""
 
 
-def _save_hotword_file(hotword: str) -> None:
+def _load_hotword_store() -> dict:
+    """Read hotword.jsonc as a store: terms plus per-term bookkeeping.
+
+    Backward compatible in both directions. A flat `{"hotword": "a b c"}`
+    file — everything written before this existed, and anything a human
+    hand-edits — loads as all-rolling with no history, and the flat key is
+    still written on every save so the file stays greppable and older builds
+    keep working.
+
+    - `pinned`  terms that must never be evicted (workspace names from
+                Notion, or anything the user adds by hand). They are
+                authoritative; a one-off token mined from one meeting has no
+                business pushing a colleague's name out of the list.
+    - `hits` / `last_seen`  how often and how recently a term actually showed
+                up in a transcript. Eviction reads these instead of insertion
+                order, so a term added ten meetings ago but still in daily
+                use outranks yesterday's garbage.
+    """
+    empty = {"terms": [], "pinned": set(), "hits": {}, "last_seen": {},
+             "epoch": 0}
+    if not HOTWORD_FILE.exists():
+        return empty
+    try:
+        data = json.loads(
+            _strip_jsonc_comments(HOTWORD_FILE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        _log("WARN", f"hotword file unreadable, ignoring: "
+                     f"{type(e).__name__}: {e}")
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    hw = data.get("hotword")
+    if isinstance(hw, list):
+        hw = " ".join(str(t) for t in hw)
+    terms = (hw or "").split()
+    pinned_raw = data.get("pinned")
+    if isinstance(pinned_raw, str):
+        pinned_raw = pinned_raw.split()
+    pinned = {str(t).lower() for t in (pinned_raw or [])}
+    # Pinned terms missing from `hotword` are still part of the list: that is
+    # how a hand-edited `pinned` entry takes effect without also being typed
+    # into the flat string.
+    known = {t.lower() for t in terms}
+    for t in (pinned_raw or []):
+        if str(t).lower() not in known:
+            terms.append(str(t))
+    def _num_map(key):
+        got = data.get(key)
+        if not isinstance(got, dict):
+            return {}
+        out = {}
+        for k, v in got.items():
+            try:
+                out[str(k).lower()] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    try:
+        epoch = int(data.get("epoch") or 0)
+    except (TypeError, ValueError):
+        epoch = 0
+    return {"terms": terms, "pinned": pinned, "hits": _num_map("hits"),
+            "last_seen": _num_map("last_seen"), "epoch": epoch}
+
+
+def _load_hotword_file() -> str:
+    """Read `stt.funasr.hotword` out of hotword.jsonc, or "" if absent.
+
+    Never raises: a hand-broken hotword file must not stop the tool from
+    recording — it just means no contextual biasing this run.
+    """
+    return " ".join(_load_hotword_store()["terms"]).strip()
+
+
+def _save_hotword_file(hotword: str, store: "dict | None" = None) -> None:
     """Write hotword.jsonc, keeping the header comment that explains why the
-    file is separate (and gitignored)."""
-    body = json.dumps({"hotword": hotword}, ensure_ascii=False, indent=2)
+    file is separate (and gitignored).
+
+    `hotword` stays the first key and the source of truth for the term list,
+    so the file remains readable and hand-editable. The bookkeeping keys are
+    written only when there is something to record.
+    """
+    payload: dict = {"hotword": hotword}
+    if store:
+        kept = {t.lower() for t in hotword.split()}
+        pinned = sorted(t for t in hotword.split()
+                        if t.lower() in (store.get("pinned") or set()))
+        if pinned:
+            payload["pinned"] = pinned
+        hits = {k: v for k, v in (store.get("hits") or {}).items()
+                if k in kept and v}
+        if hits:
+            payload["hits"] = dict(sorted(hits.items()))
+        last = {k: v for k, v in (store.get("last_seen") or {}).items()
+                if k in kept and v}
+        if last:
+            payload["last_seen"] = dict(sorted(last.items()))
+        if store.get("epoch"):
+            payload["epoch"] = int(store["epoch"])
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
     header = "\n".join((
         "// ASR 热词（空格分隔），由每次纪要生成后自动维护。",
         "// 单独成文件、且不入版本库：热词会累积同事姓名、客户名、内部代号，",
         "// 属于本地数据，不该随项目发布。模板见 hotword.jsonc.example。",
+        "//",
+        "// hotword   词表本身，空格分隔；手工增删这一行即可。",
+        "// pinned    永不淘汰的词（Notion 导入的成员/项目名，或你手工钉的）。",
+        "//           手工往 pinned 里加词即可生效，不必同时写进 hotword。",
+        "// hits      该词在历次转写中出现的次数。",
+        "// last_seen 该词最近一次出现时的 epoch（下面的计数器）。",
+        "// epoch     热词更新次数；淘汰时按 (last_seen, hits) 从小到大清理，",
+        "//           所以「十次会议前加入但仍在天天用」的词优于「昨天的垃圾词」。",
     ))
     HOTWORD_FILE.write_text(f"{header}\n{body}\n", encoding="utf-8")
 
@@ -3479,6 +3618,44 @@ _CAPTION_ROLE_RMS_FLOOR = 0.002
 _CAPTION_RING_SECONDS = 30.0       # per-source backlog cap while models are loading
 _CAPTION_PACER_INTERVAL = 0.25     # seconds between drain/mix/feed iterations
 
+# Endpoint (sentence-break) rules forwarded to sherpa. Bounds are sanity
+# guards, not preferences: rule2 below ~0.3 s splits inside a normal pause and
+# above ~3 s merges two speakers' turns into one line, and rule3 is the
+# hard ceiling on how long a single caption line may keep growing.
+_CAPTION_ENDPOINT_BOUNDS = {
+    "rule1_min_trailing_silence": (0.3, 10.0),
+    "rule2_min_trailing_silence": (0.3, 5.0),
+    "rule3_min_utterance_length": (5.0, 120.0),
+}
+
+
+def _caption_endpoint_rules(lc_cfg: dict) -> dict:
+    """Endpoint thresholds for the streaming recognizer, clamped to sane range.
+
+    Longer thresholds mean fewer, longer caption lines: more context per line
+    for the refine and review passes to work with, at the cost of the line
+    appearing on screen later. A junk value in config must not silently
+    disable sentence breaking, so each key falls back to its default and is
+    clamped rather than trusted.
+    """
+    defaults = DEFAULT_CONFIG["live_captions"]["endpoint"]
+    got = (lc_cfg or {}).get("endpoint") or {}
+    out = {}
+    for key, default in defaults.items():
+        lo, hi = _CAPTION_ENDPOINT_BOUNDS[key]
+        try:
+            val = float(got.get(key, default))
+        except (TypeError, ValueError):
+            _log("CAPTION", f"endpoint {key}={got.get(key)!r} not a number, "
+                            f"using {default}")
+            val = float(default)
+        clamped = min(max(val, lo), hi)
+        if clamped != val:
+            _log("CAPTION", f"endpoint {key}={val} out of [{lo}, {hi}], "
+                            f"clamped to {clamped}")
+        out[key] = clamped
+    return out
+
 _SHERPA_ZIPFORMER_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
     "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2"
@@ -3785,6 +3962,26 @@ def _format_caption_review_lines(batch: "list[dict]") -> str:
     return "\n".join(out)
 
 
+def _format_caption_review_context(rows: "list[dict]", limit: int) -> str:
+    """Render already-reviewed lines as read-only context for the next batch.
+
+    Deliberately NOT in the numbered `N ||| … ||| …` shape the batch uses:
+    numbering in the reply is positional into `batch`, so a model that echoed
+    a context line in that format would land its text on an unrelated
+    segment. An unnumbered bullet gives it no template to copy.
+    """
+    if limit <= 0 or not rows:
+        return "（无，本批是本场第一批）"
+    out = []
+    for row in rows[-limit:]:
+        src = (row.get("text") or "").replace("\n", " ").strip()
+        dst = (row.get("dst") or "").replace("\n", " ").strip()
+        if not src:
+            continue
+        out.append(f"- {src}" + (f"（{dst}）" if dst else ""))
+    return "\n".join(out) or "（无，本批是本场第一批）"
+
+
 def _review_log_text(s: str, limit: int = 500) -> str:
     """One-line, delimited rendering of caption text for the audit log.
 
@@ -3862,12 +4059,26 @@ class _SpeakerClusterer:
     knows — via `role_votes`.
     """
 
-    def __init__(self, threshold: float = 0.6, max_speakers: int = 8):
+    def __init__(self, threshold: float = 0.6, max_speakers: int = 8,
+                 min_segments: int = 2):
         self.threshold = float(threshold)
         self.max_speakers = max(1, int(max_speakers))
+        # Segments a cluster must accumulate before it is shown as a person.
+        # One segment is not evidence of a speaker: on a real 34-minute
+        # meeting, 4 of 8 clusters held exactly one segment each — a cough, a
+        # keyboard tap, a one-word interjection — and they consumed
+        # max_speakers, so genuinely new voices later got folded into
+        # existing ones. `_caption_is_noise` catches the junk that decodes to
+        # a stray letter or particle; this catches the rest.
+        self.min_segments = max(1, int(min_segments))
         self._centroids: "list[np.ndarray]" = []
         self._counts: "list[int]" = []
         self.role_votes: "list[dict]" = []
+        # Display numbers are handed out in QUALIFICATION order, not discovery
+        # order: numbering by discovery would leave gaps (说话人1, then 说话人3
+        # because cluster 1 never earned a number) which reads as a bug.
+        self._numbers: "dict[int, int]" = {}
+        self._next_number = 1
 
     @staticmethod
     def _unit(vec: "np.ndarray") -> "np.ndarray":
@@ -3920,14 +4131,35 @@ class _SpeakerClusterer:
             return None
         return max(votes.items(), key=lambda kv: kv[1])[0]
 
-    def display_number(self, idx: int) -> int:
-        """1-based speaker number in discovery order, across BOTH channels.
+    def display_number(self, idx: int) -> "int | None":
+        """1-based speaker number, or None while the cluster is unproven.
 
-        Numbering is global on purpose. Reserving 我 for the mic side broke
-        as soon as two people shared one microphone: they both scored a mic
-        majority and both got labelled 我.
+        Numbering is global across BOTH channels on purpose. Reserving 我 for
+        the mic side broke as soon as two people shared one microphone: they
+        both scored a mic majority and both got labelled 我.
+
+        None means "not enough evidence yet" — the caller should hold the
+        segment rather than tag it. A cluster earns its number on reaching
+        `min_segments`, and keeps it for the rest of the session.
         """
-        return idx + 1 if idx >= 0 else 1
+        if not (0 <= idx < len(self._counts)):
+            return None
+        got = self._numbers.get(idx)
+        if got is not None:
+            return got
+        if self._counts[idx] < self.min_segments:
+            return None
+        self._numbers[idx] = self._next_number
+        self._next_number += 1
+        return self._numbers[idx]
+
+    def numbered_count(self) -> int:
+        """How many speakers have actually earned a number."""
+        return len(self._numbers)
+
+    def segment_count(self, idx: int) -> int:
+        """Segments assigned to this cluster so far."""
+        return self._counts[idx] if 0 <= idx < len(self._counts) else 0
 
 
 class _CaptionSpeakerId:
@@ -4190,6 +4422,7 @@ class _SherpaCaptionASR:
             ) from e
         cfg_dir = (lc_cfg.get("asr_model_dir") or "")
         model_dir = Path(cfg_dir).expanduser() if cfg_dir else _ensure_sherpa_model()
+        ep = _caption_endpoint_rules(lc_cfg)
         kwargs = dict(
             tokens=str(model_dir / "tokens.txt"),
             encoder=_pick_model_file(model_dir, "encoder"),
@@ -4199,10 +4432,11 @@ class _SherpaCaptionASR:
             sample_rate=_CAPTION_SAMPLE_RATE,
             feature_dim=80,
             enable_endpoint_detection=True,
-            rule1_min_trailing_silence=2.4,
-            rule2_min_trailing_silence=0.8,
             decoding_method="greedy_search",
+            **ep,
         )
+        _log("CAPTION", "endpoint rules: " + " ".join(
+            f"{k.split('_min_')[0]}={v}" for k, v in sorted(ep.items())))
         # Contextual biasing for domain terms (sandbox / API 网关 / …):
         # space-separated stt.funasr.hotword phrases, one per line for
         # sherpa. Needs modified_beam_search + the model's bpe.vocab.
@@ -4754,7 +4988,11 @@ class LiveCaptionEngine:
         self._spk_dropped = 0
         self._spk_clusterer = _SpeakerClusterer(
             threshold=float(_sid.get("threshold", 0.6)),
-            max_speakers=int(_sid.get("max_speakers", 8)))
+            max_speakers=int(_sid.get("max_speakers", 8)),
+            min_segments=int(_sid.get("min_segments", 2)))
+        # Segments whose cluster has not earned a number yet, per cluster.
+        # They get tagged retroactively the moment it does.
+        self._spk_pending: "dict[int, list[int]]" = {}
         self._spk_queue: "queue.Queue" = queue.Queue()
         self._spk_thread: "threading.Thread | None" = None
         # Periodic batch re-check: every `interval_minutes` the finalized
@@ -4772,8 +5010,27 @@ class LiveCaptionEngine:
         # round, but only this many times — otherwise one stubborn line
         # would sit at the head of the buffer forever.
         self._review_max_tries = max(0, int(_rev.get("max_tries", 2)))
+        # Total backlog cap. `max_lines` bounds one BATCH; without this the
+        # buffer itself is unbounded, so a stalled provider both grows memory
+        # without limit and turns the pass useless — a correction that lands
+        # 40 minutes after the line scrolled away is not worth showing. Never
+        # below max_lines: that would throw away rows one call could handle.
+        self._review_max_buffer = max(
+            self._review_max_lines, int(_rev.get("max_buffer", 240)))
+        # Read-only context: the tail of lines this pass already corrected.
+        # Cross-batch terminology consistency needs it — batch N settling on
+        # 「ChatOps」 is useless if batch N+1 independently picks 「拆特ops」
+        # again. Read-only on purpose: those lines were already shown as
+        # corrected, and re-editing them would make the pane rewrite history
+        # every interval. Costs input tokens only, and the measured per-call
+        # cost is 41.6 s of fixed overhead against 3.4 s per line, so a dozen
+        # extra reference lines is noise.
+        self._review_context_lines = max(0, int(_rev.get("context_lines", 12)))
+        self._review_context: "collections.deque" = collections.deque(
+            maxlen=max(1, self._review_context_lines))
         self._review_lock = threading.Lock()
         self._review_buffer: "list[dict]" = []
+        self._review_depth_warned = False
         self._review_thread: "threading.Thread | None" = None
         # Rolling discourse context for the qwen correct+translate call:
         # the last few finalized (corrected) source lines.
@@ -4829,6 +5086,34 @@ class LiveCaptionEngine:
                     row["text"] = text
                     return
             self._review_buffer.append({"id": sid, "text": text, "dst": ""})
+            dropped, depth = self._trim_review_buffer()
+        # Logged outside the lock, and never silently: a bounded pass that
+        # reports "batch=8 parsed=8" while having thrown rows away reads as
+        # full coverage when it wasn't. Oldest go first — they scrolled off
+        # screen long ago, and under sustained overflow keeping the recent
+        # window is what preserves any value at all.
+        if dropped:
+            _log("CAPTION",
+                 f"review buffer full ({self._review_max_buffer}), dropped "
+                 f"{len(dropped)} unreviewed seg="
+                 f"{dropped[0]['id']}..{dropped[-1]['id']}")
+        elif depth > self._review_max_lines and not self._review_depth_warned:
+            # One full batch behind: the early warning before anything is lost.
+            self._review_depth_warned = True
+            _log("CAPTION", f"review backlog {depth} rows > one batch "
+                            f"({self._review_max_lines}) — provider behind")
+        elif depth <= self._review_max_lines:
+            self._review_depth_warned = False
+
+    def _trim_review_buffer(self) -> "tuple[list[dict], int]":
+        """Enforce the total cap. Caller must hold `_review_lock`."""
+        depth = len(self._review_buffer)
+        excess = depth - self._review_max_buffer
+        if excess <= 0:
+            return [], depth
+        dropped = self._review_buffer[:excess]
+        del self._review_buffer[:excess]
+        return dropped, len(self._review_buffer)
 
     def _review_record_translation(self, sid: int, dst: str):
         if not self._review_enabled:
@@ -5043,7 +5328,11 @@ class LiveCaptionEngine:
             DEFAULT_CONFIG["stt"], self.cfg.get("stt", {})).get("funasr", {})
 
     def _load_asr_backend(self):
-        key = ("asr",)
+        # Endpoint rules are baked into the recognizer at construction, so they
+        # belong in the cache key — otherwise an A/B run in one process would
+        # silently reuse the first set of thresholds.
+        ep = _caption_endpoint_rules(self._lc)
+        key = ("asr",) + tuple(sorted(ep.items()))
         backend = _caption_backend_cache.get(key)
         if backend is not None:
             backend.reset_session(self._emit_partial, self._finalize_segment)
@@ -5235,14 +5524,18 @@ class LiveCaptionEngine:
                 continue
             try:
                 t0 = time.time()
+                with self._review_lock:
+                    context = list(self._review_context)
                 prompt = (
                     _resolve_prompt(self.cfg, "caption_review")
                     .replace("{hotwords}",
                              _cfg_hotword(self.cfg) or "（无）")
+                    .replace("{context}", _format_caption_review_context(
+                        context, self._review_context_lines))
                     .replace("{lines}", _format_caption_review_lines(batch))
                 )
                 fixes = _parse_caption_review(self._review_llm(prompt), batch)
-                changed, dst_changed, missed = 0, 0, []
+                changed, dst_changed, missed, settled = 0, 0, [], []
                 for row in batch:
                     got = fixes.get(row["id"])
                     if not got:
@@ -5272,12 +5565,26 @@ class LiveCaptionEngine:
                              f"review seg={row['id']} dst: "
                              f"{_review_log_text(row['dst'])} → "
                              f"{_review_log_text(dst)}")
+                    # Settled state feeds the next batch's read-only context,
+                    # so terminology decided here carries forward.
+                    settled.append({"id": row["id"], "text": text,
+                                    "dst": dst or row["dst"]})
+                if settled:
+                    with self._review_lock:
+                        self._review_context.extend(settled)
                 if missed:
                     # Front of the queue, oldest first: retrying is bounded by
                     # `tries`, so a model that keeps ignoring a line drops it
-                    # rather than blocking the buffer forever.
+                    # rather than blocking the buffer forever. The cap is
+                    # re-checked here too — a requeue during a busy window can
+                    # push the buffer over on its own.
                     with self._review_lock:
                         self._review_buffer[:0] = missed
+                        dropped, _ = self._trim_review_buffer()
+                    if dropped:
+                        _log("CAPTION",
+                             f"review requeue over cap, dropped {len(dropped)} "
+                             f"seg={dropped[0]['id']}..{dropped[-1]['id']}")
                 _log("CAPTION",
                      f"review batch={len(batch)} parsed={len(fixes)} "
                      f"src_changed={changed} dst_changed={dst_changed} "
@@ -5319,14 +5626,29 @@ class LiveCaptionEngine:
                 idx = self._spk_clusterer.assign(emb, role)
                 if idx < 0:
                     continue
+                took = time.time() - t0
+                num = self._spk_clusterer.display_number(idx)
+                if num is None:
+                    # Unproven voice: hold the segment instead of minting a
+                    # 说话人N for what may be a cough. If a second segment
+                    # joins this cluster the held ids get tagged then, so a
+                    # real speaker loses only the delay, not the label.
+                    self._spk_pending.setdefault(idx, []).append(sid)
+                    _log("CAPTION",
+                         f"speaker seg={sid} cluster={idx} n=pending "
+                         f"(seen={self._spk_clusterer.segment_count(idx)}/"
+                         f"{self._spk_clusterer.min_segments}) role={role} "
+                         f"took={took:.2f}s")
+                    continue
                 side = self._spk_clusterer.majority_side(idx)
-                self._emit(type="speaker", id=sid,
-                           speaker=self._spk_clusterer.display_number(idx),
-                           side=side)
+                held = self._spk_pending.pop(idx, [])
+                for old in held:
+                    self._emit(type="speaker", id=old, speaker=num, side=side)
+                self._emit(type="speaker", id=sid, speaker=num, side=side)
                 _log("CAPTION",
-                     f"speaker seg={sid} cluster={idx} "
-                     f"n={self._spk_clusterer.display_number(idx)} side={side} "
-                     f"role={role} took={time.time() - t0:.2f}s")
+                     f"speaker seg={sid} cluster={idx} n={num} side={side} "
+                     f"role={role} took={took:.2f}s"
+                     + (f" backfilled={held}" if held else ""))
             except Exception as e:
                 _log("ERR", f"caption speaker id: {type(e).__name__}: {e}")
 
@@ -6070,13 +6392,56 @@ def _clean_hotword_token(tok: str) -> str:
     return tok.strip(".,;:!?，。、；：！？·\"'`()（）[]【】<>《》")
 
 
+def _hotword_hits(text: str, terms: "list[str]") -> "set[str]":
+    """Lower-cased terms that actually appear in `text`.
+
+    This is the signal eviction runs on, so a false hit is not cosmetic: it
+    protects exactly the junk the eviction exists to remove. Measured on one
+    real 15.5k-character transcript, plain substring matching scored hits for
+    `ch` (inside "check") and `ac` (inside "face") — short ASCII terms match
+    constantly inside ordinary English, inflating 53 real hits to 58.
+
+    So ASCII terms require word boundaries and CJK terms do not: Chinese is
+    written without spaces, and 「李雷」 inside 「李雷说」 is a genuine hit.
+    """
+    if not text or not terms:
+        return set()
+    low = text.lower()
+    out: "set[str]" = set()
+    for term in terms:
+        if not term:
+            continue
+        t = term.lower()
+        if any("一" <= c <= "鿿" for c in t):
+            if t in low:
+                out.add(t)
+        elif re.search(rf"(?<![0-9a-z]){re.escape(t)}(?![0-9a-z])", low):
+            # Hand-rolled instead of \b: \b sits between a letter and a CJK
+            # character too, so 「用GKE集群」 would fail a \bgke\b test.
+            out.add(t)
+    return out
+
+
 def _merge_hotwords(existing: str, new_terms: "list[str]",
-                    max_count: int = 100) -> str:
+                    max_count: int = 100,
+                    pinned: "set[str] | None" = None,
+                    rank: "dict[str, tuple] | None" = None) -> str:
     """Merge new hotword candidates into the existing space-separated
     hotword string: case-insensitive dedup, first-seen casing wins,
-    insertion order preserved. Over `max_count` the OLDEST entries are
-    evicted (rolling vocabulary), so the list keeps tracking recent
-    meetings instead of freezing at the cap."""
+    insertion order preserved.
+
+    Over `max_count`, entries are evicted. Two things protect a term:
+
+    - `pinned` (lower-cased) is never evicted. Workspace names imported from
+      Notion live here, because a token mined once from one meeting has no
+      business pushing a colleague's name out of the list.
+    - `rank` maps a lower-cased term to a sort key; the LOWEST keys are
+      evicted first. `_persist_hotwords` passes (last_seen, hits) so a term
+      still in daily use outranks yesterday's garbage.
+
+    With neither argument the behaviour is the original rolling FIFO — oldest
+    out — which is what a plain string merge should do.
+    """
     seen: "set[str]" = set()
     out: "list[str]" = []
     for tok in (existing or "").split() + list(new_terms):
@@ -6088,9 +6453,28 @@ def _merge_hotwords(existing: str, new_terms: "list[str]",
             continue
         seen.add(low)
         out.append(tok)
-    if max_count > 0 and len(out) > max_count:
-        out = out[-max_count:]
-    return " ".join(out)
+    if max_count <= 0 or len(out) <= max_count:
+        return " ".join(out)
+    pinned = pinned or set()
+    keep_pinned = [t for t in out if t.lower() in pinned]
+    rolling = [t for t in out if t.lower() not in pinned]
+    slots = max_count - len(keep_pinned)
+    if slots <= 0:
+        # Pinned alone fills the cap. Keeping them is the lesser evil:
+        # silently dropping authoritative names is worse than a list that is
+        # slightly too long, and the caller logs the overshoot.
+        return " ".join(keep_pinned)
+    if rank:
+        # Stable: index breaks ties so equal-rank terms keep insertion order.
+        order = sorted(range(len(rolling)),
+                       key=lambda i: (rank.get(rolling[i].lower(), (0, 0)), i))
+        drop = {order[i] for i in range(len(rolling) - slots)}
+        rolling = [t for i, t in enumerate(rolling) if i not in drop]
+    else:
+        rolling = rolling[-slots:]
+    # Rebuild in the original order so the file stays readable.
+    survivors = set(keep_pinned) | set(rolling)
+    return " ".join(t for t in out if t in survivors)
 
 
 def _parse_llm_hotwords(out: str) -> "list[str]":
@@ -6117,27 +6501,79 @@ def _extract_hotwords_llm(text: str, provider: str, cfg: dict) -> "list[str]":
 
 
 def _persist_hotwords(new_terms: "list[str]", cfg: dict,
-                      max_count: int = 100) -> "list[str]":
+                      max_count: int = 100, pin: bool = False,
+                      transcript: str = "") -> "list[str]":
     """Merge `new_terms` into stt.funasr.hotword, update the runtime cfg in
     place, and write hotword.jsonc. Returns the terms actually added.
+
+    `pin=True` marks the new terms as never-evictable — used by the Notion
+    import, whose terms are authoritative workspace names rather than guesses
+    mined from one meeting's transcript.
+
+    `transcript` is scanned for existing hotwords first, and every term found
+    gets its hit count and `last_seen` epoch bumped. That is what turns
+    eviction from "oldest out" into "least recently useful out": a term added
+    ten meetings ago and still said every day now outranks a token mined
+    yesterday and never heard again.
 
     Also clears any leftover inline `stt.funasr.hotword` in config.jsonc:
     that is how an existing setup migrates off the old single-file layout,
     and leaving a stale copy behind in a version-controlled file is exactly
     the footgun this split exists to remove.
     """
+    store = _load_hotword_store()
     existing = ((cfg.get("stt") or {}).get("funasr") or {}).get("hotword", "") or ""
-    merged = _merge_hotwords(existing, new_terms, max_count)
-    if merged == _merge_hotwords(existing, [], max_count):
-        return []
+    # The runtime cfg wins as the term list (it is what this process has been
+    # recognising with), but the bookkeeping only lives in the file.
+    if existing.split():
+        store["terms"] = existing.split()
+
+    epoch = int(store.get("epoch") or 0) + 1
+    store["epoch"] = epoch
+    hit = _hotword_hits(transcript, store["terms"])
+    for low in hit:
+        store["hits"][low] = store["hits"].get(low, 0) + 1
+        store["last_seen"][low] = epoch
+    if pin:
+        store["pinned"] |= {t.lower() for t in new_terms}
+    # Seed anything with no history at the CURRENT epoch, not 0. Two reasons:
+    # a new term was just mined from this transcript, so ranking it worst
+    # makes no sense; and on the first run after an upgrade the whole existing
+    # list has no history, so epoch 0 would let today's junk outrank a term
+    # like CockroachDB that simply wasn't mentioned today. Unknown history
+    # means "benefit of the doubt once" — real usage differentiates them from
+    # the next meeting onwards, since only hit terms advance after this.
+    for t in list(store["terms"]) + list(new_terms):
+        store["last_seen"].setdefault(t.lower(), epoch)
+
+    rank = {t.lower(): (store["last_seen"].get(t.lower(), 0),
+                        store["hits"].get(t.lower(), 0))
+            for t in store["terms"] + list(new_terms)}
+    merged = _merge_hotwords(existing, new_terms, max_count,
+                            pinned=store["pinned"], rank=rank)
+    baseline = _merge_hotwords(existing, [], max_count,
+                               pinned=store["pinned"], rank=rank)
     known = {t.lower() for t in existing.split()}
     added = [t for t in merged.split() if t.lower() not in known]
+    dropped = [t for t in existing.split()
+               if t.lower() not in {x.lower() for x in merged.split()}]
+    if merged == baseline and not hit:
+        return []          # nothing new and no hit history to record
     cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = merged
     try:
-        _save_hotword_file(merged)
+        _save_hotword_file(merged, store)
+        pinned_kept = sum(1 for t in merged.split()
+                          if t.lower() in store["pinned"])
         _log("STT", f"hotword updated: +{len(added)} "
-                    f"({' '.join(added)}) → {len(merged.split())} total "
-                    f"→ {HOTWORD_FILE.name}")
+                    f"({' '.join(added)}) -{len(dropped)}"
+                    + (f" ({' '.join(dropped)})" if dropped else "")
+                    + f" → {len(merged.split())} total "
+                      f"(pinned={pinned_kept}, hit={len(hit)}, epoch={epoch})"
+                      f" → {HOTWORD_FILE.name}")
+        if pinned_kept > max_count:
+            _log("WARN", f"pinned hotwords ({pinned_kept}) exceed "
+                         f"hotwords.max_count ({max_count}); keeping them, "
+                         f"but a longer list costs recognition accuracy")
         _migrate_inline_hotword()
     except (OSError, json.JSONDecodeError, ValueError) as e:
         _log("WARN", f"hotword persist failed: {type(e).__name__}: {e}")
@@ -6181,7 +6617,12 @@ def _auto_update_hotwords(transcript: str, provider: str, cfg: dict) -> "list[st
                 _log("WARN", f"hotword llm extract failed: {type(e).__name__}: {e}")
         if not candidates:
             return []
-        return _persist_hotwords(candidates, cfg, int(hw_cfg.get("max_count", 100)))
+        # The transcript doubles as the hit signal: every existing hotword
+        # found in it gets its last_seen bumped, so eviction drops the terms
+        # that stopped being useful rather than the ones added longest ago.
+        return _persist_hotwords(candidates, cfg,
+                                 int(hw_cfg.get("max_count", 100)),
+                                 transcript=transcript or "")
     except Exception as e:
         _log("WARN", f"hotword auto-update failed: {type(e).__name__}: {e}")
         return []
@@ -7060,7 +7501,7 @@ def _notion_hotword_candidates(names: "list[str]", titles: "list[str]",
                                limit: int = 400) -> "list[str]":
     """Turn Notion names + titles into hotword candidates.
 
-    Names become the form people SAY: a CJK name stays whole (`韩梅`), while
+    Names become the form people SAY: a CJK name stays whole (`李雷`), while
     "Aaron Chen" splits into tokens because nobody says the full name mid
     sentence. Titles go through the existing rule-based miner
     (`_extract_hotword_candidates`) instead of being added verbatim — a title
@@ -7150,6 +7591,19 @@ def _cmd_captions_body(args, cfg):
     # replay opts in explicitly; --review then forces one pass at the end over
     # everything that accumulated, which is the comparable thing to look at.
     lc.setdefault("review", {})["enabled"] = False
+    # Endpoint overrides: one A/B is one command, so the thresholds under test
+    # come from the flags rather than an edit to config.jsonc between runs.
+    ep_override = {
+        key: float(getattr(args, flag))
+        for flag, key in (("rule1", "rule1_min_trailing_silence"),
+                          ("rule2", "rule2_min_trailing_silence"),
+                          ("rule3", "rule3_min_utterance_length"))
+        if getattr(args, flag, None) is not None
+    }
+    if ep_override:
+        ep = dict(lc.get("endpoint") or {})
+        ep.update(ep_override)
+        lc["endpoint"] = ep
 
     rows: dict = {}
     order: list = []
@@ -7233,7 +7687,12 @@ def _cmd_captions_body(args, cfg):
     finally:
         engine.stop()
 
-    _captions_report(rows, order, trace, verbose=getattr(args, "trace", False))
+    _captions_report(rows, order, trace, verbose=getattr(args, "trace", False),
+                     audio_secs=total_secs,
+                     endpoint=_caption_endpoint_rules(lc),
+                     review_cfg=_deep_merge(
+                         DEFAULT_CONFIG["live_captions"]["review"],
+                         cfg.get("live_captions", {}).get("review", {})))
 
 
 _CAPTIONS_PROGRESS_EVERY_SEC = 30.0
@@ -7297,7 +7756,9 @@ def _captions_force_review(engine) -> None:
             engine._emit(type="translation", id=row["id"], text=dst)
 
 
-def _captions_report(rows: dict, order: list, trace: list, verbose: bool) -> None:
+def _captions_report(rows: dict, order: list, trace: list, verbose: bool,
+                     audio_secs: float = 0.0, endpoint: "dict | None" = None,
+                     review_cfg: "dict | None" = None) -> None:
     """Emit the settled state as ONE flushed write.
 
     Built as a single string on purpose: the per-line prints were lost when
@@ -7335,6 +7796,31 @@ def _captions_report(rows: dict, order: list, trace: list, verbose: bool) -> Non
     out.append(f"  被修正的行  : {revised}")
     out.append(f"  有译文的行  : {translated}/{len(order)}")
     out.append(f"  识别出说话人: {len(speakers)}")
+
+    # Segmentation block: the numbers a threshold A/B is decided on. Line
+    # LENGTH is the payload (context per line for refine / review) and lines
+    # per minute is the cost (each one is an LLM row to re-emit later), so
+    # both are reported against the audio actually fed.
+    if audio_secs > 0:
+        lens = sorted(len(r["src"]) for r in rows.values())
+        per_min = len(order) / (audio_secs / 60.0)
+        median = lens[len(lens) // 2] if lens else 0
+        out.append("\n── 断句 ──")
+        if endpoint:
+            out.append("  阈值        : " + " ".join(
+                f"{k.split('_min_')[0]}={v:g}" for k, v in sorted(endpoint.items())))
+        out.append(f"  音频时长    : {audio_secs / 60:.1f} 分钟")
+        out.append(f"  行/分钟     : {per_min:.1f}")
+        out.append(f"  平均行长    : {src_chars / max(1, len(order)):.1f} 字"
+                   f"（中位 {median}，最长 {lens[-1] if lens else 0}）")
+        # A review batch is one LLM call. At the measured 66 s median per
+        # call, batches-per-hour is what says whether the pass keeps up.
+        rc = review_cfg or {}
+        interval = float(rc.get("interval_minutes") or 5) or 5
+        max_lines = int(rc.get("max_lines") or 120)
+        batches = max(1, math.ceil(per_min * interval / max(1, max_lines)))
+        out.append(f"  复核批次    : 每 {interval:g} 分钟 {per_min * interval:.0f} 行 "
+                   f"→ {batches} 批/周期（单批上限 {max_lines}）")
     print("\n".join(out), flush=True)
     sys.stdout.flush()
 
@@ -7403,12 +7889,68 @@ def _hotwords_from_notion(args, cfg, hw_cfg: dict) -> None:
         print("  " + " ".join(cands))
         return
 
-    added = _persist_hotwords(cands, cfg, hw_cfg.get("max_count", 1000))
+    # Pinned: these are authoritative workspace names, not guesses mined from
+    # one meeting, so a rolling auto-extracted token must not evict them.
+    added = _persist_hotwords(cands, cfg, hw_cfg.get("max_count", 1000),
+                              pin=True)
     print(f"[热词] 新增 {len(added)} 个 → {HOTWORD_FILE.name}"
           f"（共 {len(((cfg.get('stt') or {}).get('funasr') or {}).get('hotword', '').split())} 个）")
     if added:
         print("  " + " ".join(added))
     print("[热词] 快速模式字幕需重启 app 才会用上新热词（识别器有缓存）")
+
+
+def _hotwords_set_pins(args, cfg) -> None:
+    """`hotwords --pin/--unpin`: mark terms as never-evictable, or release them.
+
+    A pinned term that is not yet in the list is ADDED — pinning a name you
+    know will come up is a reasonable thing to want to do in one command.
+    """
+    store = _load_hotword_store()
+    current = ((cfg.get("stt") or {}).get("funasr") or {}).get("hotword", "") or ""
+    if current.split():
+        store["terms"] = current.split()
+    known = {t.lower(): t for t in store["terms"]}
+
+    added, pinned, unpinned, missing = [], [], [], []
+    for raw in (getattr(args, "pin", None) or []):
+        term = _clean_hotword_token(raw)
+        if not 2 <= len(term) <= 32:
+            missing.append(raw)
+            continue
+        low = term.lower()
+        if low not in known:
+            store["terms"].append(term)
+            known[low] = term
+            added.append(term)
+        store["pinned"].add(low)
+        pinned.append(known[low])
+    for raw in (getattr(args, "unpin", None) or []):
+        low = _clean_hotword_token(raw).lower()
+        if low in store["pinned"]:
+            store["pinned"].discard(low)
+            unpinned.append(known.get(low, raw))
+        else:
+            missing.append(raw)
+
+    merged = " ".join(store["terms"])
+    cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = merged
+    try:
+        _save_hotword_file(merged, store)
+    except OSError as e:
+        print(f"[热词] 写入失败：{type(e).__name__}: {e}")
+        return
+    if pinned:
+        print(f"✅ 已钉住 {len(pinned)} 个词（永不淘汰）：{' '.join(pinned)}")
+    if added:
+        print(f"   其中 {len(added)} 个是新加入词表的：{' '.join(added)}")
+    if unpinned:
+        print(f"✅ 已取消钉住 {len(unpinned)} 个：{' '.join(unpinned)}")
+    if missing:
+        print(f"⚠️  忽略 {len(missing)} 个（长度不合法或本来就没钉住）："
+              f"{' '.join(str(m) for m in missing)}")
+    print(f"[热词] 共 {len(merged.split())} 个，钉住 {len(store['pinned'])} 个"
+          f" → {HOTWORD_FILE.name}")
 
 
 def _cmd_hotwords_body(args, cfg):
@@ -7421,8 +7963,31 @@ def _cmd_hotwords_body(args, cfg):
     """
     current = ((cfg.get("stt") or {}).get("funasr") or {}).get("hotword", "") or ""
     if getattr(args, "show", False):
-        print(f"当前热词（{len(current.split())} 个）：")
-        print(current or "（空）")
+        store = _load_hotword_store()
+        terms = current.split() or store["terms"]
+        print(f"当前热词（{len(terms)} 个，其中钉住 "
+              f"{sum(1 for t in terms if t.lower() in store['pinned'])} 个）：")
+        print(" ".join(terms) or "（空）")
+        if store["pinned"]:
+            print(f"\n钉住（永不淘汰）："
+                  f"{' '.join(t for t in terms if t.lower() in store['pinned'])}")
+        # Least recently used first: this is the eviction order, so it is the
+        # useful view — these are the terms that go when the cap is reached.
+        ranked = sorted(
+            (t for t in terms if t.lower() not in store["pinned"]),
+            key=lambda t: (store["last_seen"].get(t.lower(), 0),
+                           store["hits"].get(t.lower(), 0)))
+        if any(store["hits"].values()):
+            print(f"\n最可能先被淘汰的 15 个（epoch={store['epoch']}）：")
+            for t in ranked[:15]:
+                print(f"  {t:24s} last_seen={store['last_seen'].get(t.lower(), 0)}"
+                      f" hits={store['hits'].get(t.lower(), 0)}")
+        else:
+            print("\n（还没有命中历史；下一次生成纪要后开始记录）")
+        return
+
+    if getattr(args, "pin", None) or getattr(args, "unpin", None):
+        _hotwords_set_pins(args, cfg)
         return
 
     hw_cfg = _deep_merge(DEFAULT_CONFIG["hotwords"], cfg.get("hotwords") or {})
@@ -7437,14 +8002,21 @@ def _cmd_hotwords_body(args, cfg):
         return
 
     candidates: "list[str]" = []
+    # Text scanned for hit counting. Built from the rule pass, which always
+    # runs — the LLM branch is optional (--no-llm), so a blob defined only
+    # there would be undefined on that path.
+    seen_text: "list[str]" = []
 
     polish_files = sorted(recordings_dir.glob("*.polish.txt"))
     print(f"[热词] 规则扫描 {len(polish_files)} 个 .polish.txt ...")
     for p in polish_files:
         try:
-            candidates += _extract_hotword_candidates(p.read_text(encoding="utf-8"))
+            body = p.read_text(encoding="utf-8")
         except OSError as e:
             print(f"[热词] 跳过 {p.name}：{e}")
+            continue
+        candidates += _extract_hotword_candidates(body)
+        seen_text.append(body)
 
     note_files = sorted(
         f for suffix in _NOTES_SUFFIX.values()
@@ -7460,6 +8032,7 @@ def _cmd_hotwords_body(args, cfg):
             except OSError as e:
                 print(f"[热词] 跳过 {f.name}：{e}")
         blob = "\n\n".join(texts)
+        seen_text.append(blob)
         chunks = [blob[i:i + 12000] for i in range(0, len(blob), 12000)]
         print(f"[热词] LLM 提取（{provider}）：{len(note_files)} 份纪要 / "
               f"{len(chunks)} 块并发 ...")
@@ -7475,11 +8048,14 @@ def _cmd_hotwords_body(args, cfg):
     if not candidates:
         print("[热词] 未提取到候选热词")
         return
-    added = _persist_hotwords(candidates, cfg, int(hw_cfg.get("max_count", 100)))
+    # Backfill also carries the hit signal: these are the transcripts the
+    # terms came from, so existing hotwords found in them count as in use.
+    added = _persist_hotwords(candidates, cfg, int(hw_cfg.get("max_count", 100)),
+                              transcript="\n\n".join(seen_text))
     total = len(((cfg.get("stt") or {}).get("funasr") or {})
                 .get("hotword", "").split())
     if added:
-        print(f"✅ 新增 {len(added)} 个热词（共 {total} 个），已写入 config.jsonc：")
+        print(f"✅ 新增 {len(added)} 个热词（共 {total} 个），已写入 {HOTWORD_FILE.name}：")
         print("   " + " ".join(added))
     else:
         print(f"[热词] 无新增（共 {total} 个）")
@@ -10840,6 +11416,14 @@ def main():
                        help="过程中不打字幕，只在结束时输出汇总（便于 diff）")
     p_cap.add_argument("--wait", type=float, default=60, metavar="SEC",
                        help="等待后台修正落地的上限（默认 60 秒）")
+    # Endpoint overrides exist so one A/B is one command: the whole point of
+    # this subcommand is judging a threshold change on identical audio.
+    p_cap.add_argument("--rule1", type=float, metavar="SEC",
+                       help="覆盖断句阈值 rule1（出字前的静音时长）")
+    p_cap.add_argument("--rule2", type=float, metavar="SEC",
+                       help="覆盖断句阈值 rule2（已出字后的静音时长，主要旋钮）")
+    p_cap.add_argument("--rule3", type=float, metavar="SEC",
+                       help="覆盖断句阈值 rule3（单行最长时长上限）")
 
     p_dev = sub.add_parser("devices", help="列出可用音频设备")
     p_dev.add_argument(
@@ -10866,6 +11450,10 @@ def main():
                       help="剔除短于 N 字的纯中文候选（推荐 3，减少误替换）")
     p_hw.add_argument("--dry-run", action="store_true",
                       help="只预览将导入的词，不写入")
+    p_hw.add_argument("--pin", nargs="+", metavar="TERM",
+                      help="把这些词标记为永不淘汰（写入 hotword.jsonc 的 pinned）")
+    p_hw.add_argument("--unpin", nargs="+", metavar="TERM",
+                      help="取消这些词的永不淘汰标记")
 
     args = parser.parse_args()
 

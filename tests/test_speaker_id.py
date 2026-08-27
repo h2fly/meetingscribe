@@ -124,39 +124,92 @@ class TestSideVote:
 
 
 class TestDisplayNumbering:
-    def test_numbered_in_discovery_order_across_channels(self):
+    """A cluster earns a number only after `min_segments` segments.
+
+    One segment is not evidence of a speaker: on a real 34-minute meeting 4 of
+    8 clusters held exactly one segment each (cough / keyboard / one-word
+    interjection) and they consumed max_speakers, so real voices arriving
+    later were folded into existing speakers.
+    """
+
+    def _twice(self, c, emb, role):
+        c.assign(emb, role)
+        return c.display_number(c.assign(emb, role))
+
+    def test_numbered_across_channels_once_proven(self):
         c = ms._SpeakerClusterer(threshold=0.5)
+        assert self._twice(c, A, "mic") == 1
+        assert self._twice(c, B, "system") == 2
+        assert self._twice(c, C, "system") == 3
+
+    def test_single_segment_cluster_gets_no_number(self):
+        c = ms._SpeakerClusterer(threshold=0.5)
+        assert c.display_number(c.assign(A, "mic")) is None
+        assert c.numbered_count() == 0
+
+    def test_number_arrives_on_the_second_segment(self):
+        c = ms._SpeakerClusterer(threshold=0.5)
+        idx = c.assign(A, "mic")
+        assert c.display_number(idx) is None
+        assert c.display_number(c.assign(A, "mic")) == 1
+
+    def test_numbering_follows_qualification_not_discovery(self):
+        """Numbering by discovery order would leave gaps — 说话人1 then
+        说话人3 because cluster 1 never earned a number — which reads as a
+        bug. B is discovered second but proven third, so it is 说话人3."""
+        c = ms._SpeakerClusterer(threshold=0.5)
+        c.assign(A, "mic")            # discovered 1st
+        c.assign(B, "system")         # discovered 2nd, never repeats until last
+        c.assign(C, "system")         # discovered 3rd
+        assert c.display_number(c.assign(A, "mic")) == 1     # proven 1st
+        assert c.display_number(c.assign(C, "system")) == 2  # proven 2nd
+        assert c.display_number(c.assign(B, "system")) == 3  # proven 3rd
+        assert c.numbered_count() == 3
+
+    def test_min_segments_one_restores_eager_numbering(self):
+        c = ms._SpeakerClusterer(threshold=0.5, min_segments=1)
         assert c.display_number(c.assign(A, "mic")) == 1
         assert c.display_number(c.assign(B, "system")) == 2
-        assert c.display_number(c.assign(C, "system")) == 3
 
     def test_several_people_on_one_microphone_get_separate_numbers(self):
         """A meeting room sharing one mic: everyone on the mic channel must
         still be told apart, which is why numbering is global and no cluster
         is special-cased as "me"."""
         c = ms._SpeakerClusterer(threshold=0.5)
-        n1 = c.display_number(c.assign(A, "mic"))
-        n2 = c.display_number(c.assign(B, "mic"))
-        n3 = c.display_number(c.assign(C, "mic"))
+        n1 = self._twice(c, A, "mic")
+        n2 = self._twice(c, B, "mic")
+        n3 = self._twice(c, C, "mic")
         assert (n1, n2, n3) == (1, 2, 3)
         assert all(c.majority_side(i) == "mic" for i in range(3))
 
     def test_numbers_are_stable_across_repeats(self):
         c = ms._SpeakerClusterer(threshold=0.5)
         c.assign(A, "mic")
+        c.assign(B, "system")
         first = c.display_number(c.assign(B, "system"))
+        assert first is not None
         for _ in range(5):
             assert c.display_number(c.assign(B, "system")) == first
 
     def test_both_sides_multi_speaker(self):
         c = ms._SpeakerClusterer(threshold=0.5)
         seen = {}
+        # Each voice appears twice, so all three qualify. Qualification order
+        # is A (4th event), C (5th), B (6th).
         for emb, role in [(A, "mic"), (B, "mic"), (C, "system"),
                           (A, "mic"), (C, "system"), (B, "mic")]:
             idx = c.assign(emb, role)
-            seen.setdefault(c.display_number(idx), c.majority_side(idx))
+            num = c.display_number(idx)
+            if num is not None:
+                seen.setdefault(num, c.majority_side(idx))
         assert sorted(seen) == [1, 2, 3]
-        assert seen[1] == "mic" and seen[2] == "mic" and seen[3] == "system"
+        assert seen[1] == "mic" and seen[2] == "system" and seen[3] == "mic"
+
+    def test_out_of_range_index_is_none(self):
+        c = ms._SpeakerClusterer(threshold=0.5)
+        assert c.display_number(-1) is None
+        assert c.display_number(99) is None
+        assert c.segment_count(99) == 0
 
 
 # ── engine wiring ────────────────────────────────────────────────────────────
@@ -187,25 +240,51 @@ class TestEngineSpeakerWorker:
         eng._spk_thread.start()
         for sid, role in segments:
             eng._spk_queue.put((sid, np.zeros(16000, dtype=np.float32), role))
+        # Cannot wait for one event per segment any more: unproven clusters
+        # deliberately emit nothing. Wait for the queue to drain instead.
         deadline = time.time() + 5
         while time.time() < deadline:
-            if len([e for e in sink.events if e["type"] == "speaker"]) >= len(segments):
+            if eng._spk_queue.empty():
+                time.sleep(0.15)      # let the last item finish processing
                 break
             time.sleep(0.02)
         eng._spk_queue.put(None)
         eng._spk_thread.join(timeout=2)
 
     def test_emits_speaker_events(self):
+        """Segment 1 is held (one segment is not a speaker); when A returns on
+        segment 3 the cluster qualifies and BOTH lines get tagged — the held
+        one retroactively. Segment 2 stays untagged: B was heard once."""
         events = []
         sink = type("S", (), {"events": events, "__call__":
                               lambda self, ev: events.append(ev)})()
         eng = _engine([A, B, A])
         self._run(eng, sink, [(1, "mic"), (2, "system"), (3, "mic")])
         spk = [e for e in events if e["type"] == "speaker"]
-        assert [e["id"] for e in spk] == [1, 2, 3]
-        assert spk[0]["side"] == "mic" and spk[1]["side"] == "system"
-        assert spk[0]["speaker"] == 1 and spk[1]["speaker"] == 2
-        assert spk[2]["speaker"] == 1        # speaker 1 again, same voice
+        assert [e["id"] for e in spk] == [1, 3]      # 2 never proven
+        assert all(e["speaker"] == 1 for e in spk)   # same voice, same number
+        assert all(e["side"] == "mic" for e in spk)
+
+    def test_unproven_voice_never_gets_a_tag(self):
+        """The phantom-speaker case: three one-off noises must produce zero
+        speaker events rather than 说话人1/2/3."""
+        events = []
+        sink = type("S", (), {"events": events, "__call__":
+                              lambda self, ev: events.append(ev)})()
+        eng = _engine([A, B, C])
+        self._run(eng, sink, [(1, "mic"), (2, "system"), (3, "system")])
+        assert not [e for e in events if e["type"] == "speaker"]
+        assert eng._spk_clusterer.numbered_count() == 0
+
+    def test_min_segments_one_tags_immediately(self):
+        events = []
+        sink = type("S", (), {"events": events, "__call__":
+                              lambda self, ev: events.append(ev)})()
+        eng = _engine([A, B], cfg={"live_captions": {
+            "speaker_id": {"min_segments": 1}}})
+        self._run(eng, sink, [(1, "mic"), (2, "system")])
+        spk = [e for e in events if e["type"] == "speaker"]
+        assert [(e["id"], e["speaker"]) for e in spk] == [(1, 1), (2, 2)]
 
     def test_backend_failure_is_non_fatal(self):
         events = []
