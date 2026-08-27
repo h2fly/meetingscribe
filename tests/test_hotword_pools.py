@@ -330,3 +330,20 @@ class TestHitBoundaries:
     ])
     def test_cjk_term_matches_as_substring(self, text, term):
         assert ms._hotword_hits(text, [term]) == {term}
+
+    def test_newly_added_terms_earn_hits_from_the_same_transcript(
+            self, isolate_hotword_file):
+        """A name imported now that is ALREADY spoken in this transcript has
+        earned a hit. Without this the first eviction cannot separate it from
+        a name that never appears — both sit at hits=0 on the same seeded
+        last_seen. Measured on a 212-name workspace import: 0 of 427 new terms
+        showed a hit before the scan included them."""
+        cfg = _cfg("GKE")
+        ms._persist_hotwords(["Spanner", "NeverSaid"], cfg, max_count=100,
+                             transcript="今天在 Spanner 上跑了一遍")
+        store = ms._load_hotword_store()
+        assert store["hits"].get("spanner") == 1
+        assert store["hits"].get("neversaid", 0) == 0
+        # ...which is what makes the unmentioned one the eviction candidate.
+        rank = lambda t: (store["last_seen"].get(t, 0), store["hits"].get(t, 0))
+        assert rank("neversaid") < rank("spanner")

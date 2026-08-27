@@ -6547,7 +6547,13 @@ def _persist_hotwords(new_terms: "list[str]", cfg: dict,
 
     epoch = int(store.get("epoch") or 0) + 1
     store["epoch"] = epoch
-    hit = _hotword_hits(transcript, store["terms"])
+    # Scan for the NEW terms too, not just the existing ones. A name imported
+    # now that is already spoken in this transcript has earned a hit, and
+    # without it the very first eviction cannot tell it apart from one that
+    # never appears: both would sit at hits=0 with the same seeded last_seen.
+    # Measured on the 212-name workspace import: 0 of 427 new terms showed a
+    # hit before this, though several are said in the transcripts.
+    hit = _hotword_hits(transcript, list(store["terms"]) + list(new_terms))
     for low in hit:
         store["hits"][low] = store["hits"].get(low, 0) + 1
         store["last_seen"][low] = epoch
