@@ -3634,6 +3634,12 @@ _CAPTION_SAMPLE_RATE = 16000       # every caption ASR backend consumes 16 kHz m
 _CAPTION_ROLE_RMS_FLOOR = 0.002
 _CAPTION_RING_SECONDS = 30.0       # per-source backlog cap while models are loading
 _CAPTION_PACER_INTERVAL = 0.25     # seconds between drain/mix/feed iterations
+# Shutdown budgets. The ASR thread shares the cached streaming recognizer with
+# the next session, so it is worth waiting for; the others are abandoned after
+# a token wait because they can be deep inside an uninterruptible call and
+# their late events are dropped by the session gate anyway.
+_CAPTION_STOP_ASR_TIMEOUT = 5.0
+_CAPTION_STOP_TOKEN_TIMEOUT = 0.5
 
 # Endpoint (sentence-break) rules forwarded to sherpa. Bounds are sanity
 # guards, not preferences: rule2 below ~0.3 s splits inside a normal pause and
@@ -5327,17 +5333,48 @@ class LiveCaptionEngine:
         _log("CAPTION", f"engine start refine={self._refine_enabled}")
 
     def stop(self):
+        """Shut down the workers without making the caller wait on them.
+
+        The joins are budgeted per role rather than a flat 5 s each. Five
+        threads at 5 s meant a stop could block its caller for 25 s, and this
+        runs on the Qt thread — every stop risked a visibly frozen window.
+
+        The ASR thread keeps a real budget because it is the one sharing
+        mutable state with the NEXT session: the streaming recognizer is
+        cached across sessions, and audio from two sessions interleaved into
+        one decoder stream corrupts recognition rather than merely delaying
+        it. It exits within one pacer interval, so this rarely waits.
+
+        The rest are abandoned after a token wait. They are daemon threads
+        that can be deep inside an uninterruptible call — a review batch is a
+        measured 62 s median — and no amount of waiting helps. Their late
+        events are harmless because the caller gates events by session (see
+        `_RecorderState.start_recording`); what is left is logged so a
+        survivor is visible rather than mysterious.
+        """
         self._running = False
         self._mt_queue.put(None)
         self._refine_queue.put(None)
         self._spk_queue.put(None)
-        for t in (self._asr_thread, self._mt_thread, self._refine_thread,
-                  self._spk_thread, self._review_thread):
-            if t:
-                t.join(timeout=5.0)
+        survivors = []
+        for t, budget in ((self._asr_thread, _CAPTION_STOP_ASR_TIMEOUT),
+                          (self._mt_thread, _CAPTION_STOP_TOKEN_TIMEOUT),
+                          (self._refine_thread, _CAPTION_STOP_TOKEN_TIMEOUT),
+                          (self._spk_thread, _CAPTION_STOP_TOKEN_TIMEOUT),
+                          (self._review_thread, _CAPTION_STOP_TOKEN_TIMEOUT)):
+            if t is None:
+                continue
+            t.join(timeout=budget)
+            if t.is_alive():
+                survivors.append(t.name)
         self._asr_thread = self._mt_thread = self._refine_thread = None
+        self._spk_thread = self._review_thread = None
         self._emit(type="status", state="stopped")
-        _log("CAPTION", "engine stopped")
+        if survivors:
+            _log("CAPTION", f"engine stopped; still finishing: "
+                            f"{', '.join(survivors)} (events now ignored)")
+        else:
+            _log("CAPTION", "engine stopped")
 
     # ── backend selection (overridable in tests) ──
     def _stt_funasr_cfg(self) -> dict:
@@ -8973,6 +9010,11 @@ def _cmd_ui_body(args, cfg):
             # recognition path, so this is a plain on/off.
             self.captions_enabled = False
             self._caption_engine: "LiveCaptionEngine | None" = None
+            # Monotonic caption-session counter; see the gate in
+            # start_recording. Read from worker threads, so it stays a plain
+            # int — the read is atomic and a stale read only costs one dropped
+            # event on the boundary.
+            self._caption_session = 0
             self._tick = QTimer(self)
             self._tick.setInterval(1000)
             self._tick.timeout.connect(self._on_tick)
@@ -9012,7 +9054,26 @@ def _cmd_ui_body(args, cfg):
             recorder.on_warning = lambda code: self.warning.emit(code)
             engine = None
             if self.captions_enabled:
-                engine = LiveCaptionEngine(cfg, self.caption_event.emit)
+                # Session gate. A superseded engine's workers can still be
+                # mid-call when the next recording starts — a review batch is
+                # a measured 62 s median, and stop() cannot interrupt one.
+                # Their events carry segment ids that restart from 1 every
+                # session, and the pane matches `refined` / `translation` /
+                # `speaker` by id alone, so a late correction from the old
+                # session would overwrite the NEW session's row with that id.
+                # That is what made captions look like they "took a while to
+                # refresh" after a stop-then-immediately-start.
+                # The token is compared, not the running flag: the session
+                # being stopped stays current until the next one begins, so
+                # its final flush still reaches the pane.
+                self._caption_session += 1
+                sess = self._caption_session
+
+                def _emit_caption(ev, _sess=sess):
+                    if _sess == self._caption_session:
+                        self.caption_event.emit(ev)
+
+                engine = LiveCaptionEngine(cfg, _emit_caption)
                 engine.start()
                 recorder.on_audio_chunk = engine.feed
             try:
