@@ -372,6 +372,9 @@ def test_translation_coalescing():
 
 def test_refine_passes_hotword():
     sink = _EventSink()
+    # The refine pass runs the SAME FunASR model as offline transcription, so
+    # the same filter applies: "sandbox" is English and dropped, "API网关"
+    # contains CJK and survives.
     eng = ms.LiveCaptionEngine({"stt": {"funasr": {"hotword": "sandbox API网关"}}}, sink)
 
     class _AudioASR(_FakeASR):
@@ -397,7 +400,9 @@ def test_refine_passes_hotword():
         assert sink.wait_for("refined") is not None
     finally:
         eng.stop()
-    assert _KwRefine.kwargs["hotword"] == "sandbox API网关"
+    # Filtered, not raw: the refine pass shares the FunASR model with offline
+    # transcription, where English biasing is measurably inert.
+    assert _KwRefine.kwargs["hotword"] == "API网关"
 
 
 def test_refine_enabled_by_default():

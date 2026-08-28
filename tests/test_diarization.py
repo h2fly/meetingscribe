@@ -193,11 +193,23 @@ class TestTranscribeWithDiarization:
         assert len(model.calls) == 3  # 15 min / 5 min chunks
 
     def test_hotword_still_forwarded_with_diarization(self, monkeypatch, tmp_path):
+        """Forwarded through `_funasr_hotword`, so English terms are dropped
+        (measured inert for SeACo biasing) and low-frequency CJK survives."""
+        payload = [{"sentence_info": [_sent("甲说", 0, 0)]}]
+        _, model = self._run(
+            monkeypatch, tmp_path, payload,
+            {"chunk_secs": 300, "spk_model": "cam++",
+             "hotword": "GKE 巡检 容灾"})
+        assert model.calls[0]["hotword"] == "巡检 容灾"
+
+    def test_english_only_hotword_is_not_forwarded(self, monkeypatch, tmp_path):
+        """With nothing left to bias on, the kwarg is omitted entirely rather
+        than passed as an empty string."""
         payload = [{"sentence_info": [_sent("甲说", 0, 0)]}]
         _, model = self._run(
             monkeypatch, tmp_path, payload,
             {"chunk_secs": 300, "spk_model": "cam++", "hotword": "GKE Kong"})
-        assert model.calls[0]["hotword"] == "GKE Kong"
+        assert "hotword" not in model.calls[0]
 
     def test_missing_sentence_info_falls_back_to_plain_lines(
             self, monkeypatch, tmp_path):

@@ -456,8 +456,73 @@ class TestPromptGlossary:
         assert ms._cfg_hotword({}) == ""
         assert ms._cfg_hotword({"stt": {"funasr": {"hotword": ""}}}) == ""
 
-    def test_funasr_still_reads_the_raw_space_separated_string(self):
-        """The offline recognizer's own hotword format is space-separated, so
-        it must keep reading the config value directly, not this rendering."""
+    def test_funasr_reads_the_space_separated_string_not_this_rendering(self):
+        """FunASR's own hotword format is space-separated, so the transcribe
+        path must not receive the 、-joined prompt form. It reads the config
+        value through `_funasr_hotword`, which returns space-separated text."""
         src = Path(ms.__file__).read_text(encoding="utf-8")
-        assert 'hotword     = pcfg.get("hotword", "")' in src
+        assert '_funasr_hotword(pcfg.get("hotword", "")' in src
+        assert "、" not in ms._funasr_hotword("巡检 容灾")
+
+
+class TestFunasrHotwordFilter:
+    """What reaches FunASR's SeACo biasing, as opposed to sherpa and the LLM
+    prompts which get the whole list.
+
+    Measured on 11 slices (~440 s) of one real meeting, full list vs none:
+    9 byte-identical, 0 terms newly recognised, 2 with a correct word
+    corrupted. English-only scored similarity exactly 1.0000 (inert);
+    CJK-only turned 「前面」 into 「成本」.
+    """
+
+    def test_english_terms_are_dropped(self):
+        """seg_tokenize maps words outside the model's English sub-word
+        dictionary to <unk>, and the ones that do encode changed nothing."""
+        assert ms._funasr_hotword("CockroachDB GKE BigQuery") == ""
+
+    def test_cjk_terms_are_kept(self):
+        assert ms._funasr_hotword("巡检 容灾 压测") == "巡检 容灾 压测"
+
+    def test_everyday_words_are_dropped(self):
+        """成本 scores 4289 in jieba's dictionary and was the observed
+        offender — it stole the acoustically similar 前面."""
+        got = ms._funasr_hotword("成本 巡检 转化 容灾").split()
+        assert "成本" not in got and "转化" not in got
+        assert got == ["巡检", "容灾"]
+
+    def test_terms_absent_from_the_dictionary_survive(self):
+        """Names and internal terms are exactly what needs biasing."""
+        got = ms._funasr_hotword("韩梅 李雷 冷热存储 容灾").split()
+        assert got == ["韩梅", "李雷", "冷热存储", "容灾"]
+
+    def test_mixed_script_term_is_kept(self):
+        assert "集群" in ms._funasr_hotword("集群 GKE")
+
+    def test_cutoff_zero_disables_the_frequency_filter(self):
+        """English is still dropped — that is not a tuning choice, it is
+        measured to have no effect at all."""
+        got = ms._funasr_hotword("成本 巡检 GKE", cutoff=0).split()
+        assert got == ["成本", "巡检"]
+
+    def test_empty_input(self):
+        assert ms._funasr_hotword("") == ""
+        assert ms._funasr_hotword(None) == ""
+
+    def test_drop_is_logged(self, monkeypatch):
+        logged = []
+        monkeypatch.setattr(ms, "_log", lambda cat, msg: logged.append(msg))
+        ms._funasr_hotword("成本 巡检")
+        assert any("dropped 1 everyday" in m and "成本" in m for m in logged)
+
+    def test_freq_dict_failure_keeps_all_cjk(self, monkeypatch):
+        """A missing jieba dict must not break transcription."""
+        monkeypatch.setattr(ms, "_jieba_word_freq", lambda: {})
+        assert ms._funasr_hotword("成本 巡检") == "成本 巡检"
+
+    def test_sherpa_still_gets_the_full_list(self):
+        """Regression guard: the filter must not leak into the caption path,
+        where English biasing genuinely works (CockroachDB / n2d encode)."""
+        src = Path(ms.__file__).read_text(encoding="utf-8")
+        i = src.index("class _SherpaCaptionASR")
+        j = src.index("def reset_session", i)
+        assert "_funasr_hotword" not in src[i:j]

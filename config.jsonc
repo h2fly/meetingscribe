@@ -133,7 +133,7 @@
       // one line per change (unchanged lines log nothing), so a session can
       // be audited afterwards. The log is purged after 7 days.
       // Review period in minutes — also the span each batch covers.
-      "interval_minutes": 1,
+      "interval_minutes": 1.5,
       // Max lines per batch; the remainder waits for the next round. If a
       // batch takes longer than interval_minutes the worker just runs the
       // next one immediately, so it catches up rather than drifting — lower
@@ -345,7 +345,34 @@
       // ship with the project. Copy hotword.jsonc.example to hotword.jsonc
       // and it takes over from here; a value left inline below still works
       // but gets moved out automatically on the next extraction.
-      "hotword": ""
+      "hotword": "",
+      // Filter applied to hotwords BEFORE they reach FunASR's acoustic
+      // biasing (jieba word frequency cutoff). This affects the FunASR path
+      // only — offline transcription and the caption refine pass. The live
+      // captions' sherpa recognizer and every LLM prompt still get the full
+      // list, where the terms demonstrably do work.
+      //
+      // Measured on 11 slices (~440 s) of one real meeting, full 682-term
+      // list against none: 9 slices byte-identical, ZERO terms newly
+      // recognised, and 2 slices where a CORRECT word got corrupted.
+      // Splitting the list explained it — English-only scored a similarity of
+      // exactly 1.0000 (no effect at all), while CJK-only turned 「前面」 into
+      // 「成本」.
+      //
+      // So English is dropped outright: FunASR's seg_tokenize maps any word
+      // missing from the model's 305k-entry English sub-word dictionary to
+      // <unk>, which is 95 of 471 terms here and includes precisely the
+      // valuable ones (CockroachDB, ClickHouse, BigQuery, ChatOps, N4D).
+      // CJK terms encode fine character-by-character and are kept, minus
+      // everyday vocabulary: biasing cannot help there (the model already
+      // gets those right) and can only steal an acoustically similar
+      // neighbour. 成本 scores 4289 and was the observed offender; 容灾 /
+      // 压测 / 冷热存储 / colleague names are absent from jieba's dictionary
+      // entirely, which is exactly the class that needs biasing.
+      //
+      // 1000 keeps 206 of 211 CJK terms, dropping 成本 黄金 转化 合同 拦截.
+      // Lower it if you still see substitutions; 0 disables the filter.
+      "hotword_common_cutoff": 1000
     },
     "openai": {
       "api_key": "",

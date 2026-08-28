@@ -1175,7 +1175,20 @@ DEFAULT_CONFIG = {
             # [12.3s] [说话人1] …。注意：为保证说话人编号全程一致，开启后会
             # 放弃分块并发、单趟转写，长录音耗时明显变长（约 chunk 并发数倍）。
             "spk_model": "",
-            "hotword": "",              # 热词（空格分隔），提升专有名词识别率
+            "hotword": "",
+            # 传给 FunASR 声学偏置前的过滤阈值（jieba 词频）。只影响 FunASR
+            # 这一条路——实时字幕的 sherpa 和所有大模型提示词仍拿全表。
+            # 实测（同一场会议 11 段共约 440 秒，全表 vs 不传）：9 段输出逐字
+            # 相同、0 个术语被多认对、2 段把本来正确的词改错。拆开测更清楚：
+            # 只传英文相似度精确 1.0000（完全没作用），只传中文把「前面」变成
+            # 「成本」。原因是 FunASR 的 seg_tokenize 把不在模型 30.5 万条英文
+            # 子词词典里的整词编成 <unk>（471 个英文热词里 95 个如此，恰好是
+            # CockroachDB/ClickHouse/BigQuery 这些最值钱的）。
+            # 所以英文一律不传；中文逐字可编码，保留，但剔除日常高频词——
+            # 偏置帮不上（模型本来就认得）只会抢走声学相近的邻词。
+            # 成本=4289 是实测的肇事者；容灾/压测/人名根本不在 jieba 词典里。
+            # 0 = 关闭过滤（传全部中文词）。
+            "hotword_common_cutoff": 1000,              # 热词（空格分隔），提升专有名词识别率
         },
         "openai": {
             "api_key": "",
@@ -5829,7 +5842,12 @@ class LiveCaptionEngine:
                 continue
             sid, audio, before = item
             try:
-                hw = (self._stt_funasr_cfg().get("hotword") or "").strip()
+                _s = self._stt_funasr_cfg()
+                # Same model and same parameter as the offline transcribe
+                # path, so the same filter applies.
+                hw = _funasr_hotword(
+                    _s.get("hotword") or "",
+                    int(_s.get("hotword_common_cutoff", 1000))).strip()
                 kwargs = {"hotword": hw} if hw else {}
                 t0 = time.time()
                 with _QuietCapture("CAPTION"):
@@ -5881,7 +5899,11 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
     vad_model   = pcfg.get("vad_model", "fsmn-vad")
     punc_model  = pcfg.get("punc_model", "ct-punc")
     spk_model   = (pcfg.get("spk_model") or "").strip()
-    hotword     = pcfg.get("hotword", "")
+    # Filtered, not the raw list: English terms are measurably inert for
+    # SeACo biasing and everyday CJK words measurably harmful. See
+    # `_funasr_hotword`. sherpa and the LLM prompts still get the full list.
+    hotword     = _funasr_hotword(pcfg.get("hotword", ""),
+                                  int(pcfg.get("hotword_common_cutoff", 1000)))
     chunk_secs       = int(pcfg.get("chunk_secs", 300))
     _workers_cfg     = int(pcfg.get("workers", 0))
     max_workers      = _workers_cfg if _workers_cfg > 0 else max(6, (os.cpu_count() or 4) // 2)
@@ -6475,6 +6497,79 @@ one two three four five ten new old good bad big small long short high low time
 day week month year way thing things people team teams part parts lot bit end
 start next last first second per via etc app apps item items case cases
 """.split())
+
+
+_JIEBA_FREQ_CACHE: "dict[str, int] | None" = None
+
+
+def _jieba_word_freq() -> "dict[str, int]":
+    """jieba's bundled frequency dictionary (349k entries), parsed once.
+
+    Lazy because parsing costs ~0.3 s and only the FunASR hotword filter needs
+    it. jieba ships as a FunASR dependency, but a missing or unreadable dict
+    must not break transcription — the caller then keeps all CJK terms, which
+    is still better than the previous behaviour.
+    """
+    global _JIEBA_FREQ_CACHE
+    if _JIEBA_FREQ_CACHE is not None:
+        return _JIEBA_FREQ_CACHE
+    freq: "dict[str, int]" = {}
+    try:
+        import jieba
+        path = Path(jieba.__file__).parent / "dict.txt"
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        freq[parts[0]] = int(parts[1])
+                    except ValueError:
+                        continue
+    except Exception as e:
+        _log("STT", f"jieba freq dict unavailable ({type(e).__name__}: {e}); "
+                    f"keeping all CJK hotwords for FunASR")
+    _JIEBA_FREQ_CACHE = freq
+    return freq
+
+
+def _funasr_hotword(hotword: str, cutoff: int = 1000) -> str:
+    """The hotword subset worth handing to FunASR's SeACo biasing.
+
+    Measured on 11 slices (~440 s) of a real meeting, full 682-term list
+    against none: 9 slices byte-identical, ZERO terms newly recognised, and 2
+    slices where a CORRECT word was corrupted. Splitting the list explained
+    it — English-only scored a similarity of exactly 1.0000, i.e. no effect
+    whatsoever, while CJK-only turned 「前面」 into 「成本」.
+
+    English is therefore dropped outright. FunASR's `seg_tokenize` maps any
+    word missing from the model's 305k-entry English sub-word dictionary to
+    `<unk>` (95 of 471 terms here, including the most valuable ones —
+    CockroachDB, ClickHouse, BigQuery, ChatOps, N4D), and the 376 that do
+    encode changed nothing measurable. Dropping them is free.
+
+    CJK terms encode fine, character by character, so they are kept — except
+    everyday vocabulary, where biasing cannot help (the model already gets
+    those right) and can only steal an acoustically similar neighbour. jieba's
+    frequency dictionary is the signal: 成本 scores 4289 and was the observed
+    offender, while 容灾 / 压测 / 冷热存储 / colleague names are absent from it
+    entirely and are exactly what needs the help.
+
+    Deliberately NOT applied to sherpa (its own bpe vocab encodes
+    CockroachDB / n2d / `Cloud SQL` fine — English biasing genuinely works
+    there) nor to any LLM prompt, which read the full list as plain text.
+    """
+    terms = [t for t in (hotword or "").split()
+             if any("\u4e00" <= c <= "\u9fff" for c in t)]
+    if cutoff <= 0:
+        return " ".join(terms)
+    freq = _jieba_word_freq()
+    kept, dropped = [], []
+    for t in terms:
+        (dropped if freq.get(t, 0) >= cutoff else kept).append(t)
+    if dropped:
+        _log("STT", f"funasr hotwords: dropped {len(dropped)} everyday words "
+                    f"(jieba freq >= {cutoff}): {' '.join(dropped)}")
+    return " ".join(kept)
 
 
 def _cfg_hotword(cfg: dict) -> str:
