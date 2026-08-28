@@ -1292,8 +1292,8 @@ def _load_hotword_store() -> dict:
                 order, so a term added ten meetings ago but still in daily
                 use outranks yesterday's garbage.
     """
-    empty = {"terms": [], "pinned": set(), "hits": {}, "last_seen": {},
-             "epoch": 0}
+    empty = {"terms": [], "phrases": [], "pinned": set(), "hits": {},
+             "last_seen": {}, "epoch": 0}
     if not HOTWORD_FILE.exists():
         return empty
     try:
@@ -1335,8 +1335,20 @@ def _load_hotword_store() -> dict:
         epoch = int(data.get("epoch") or 0)
     except (TypeError, ValueError):
         epoch = 0
-    return {"terms": terms, "pinned": pinned, "hits": _num_map("hits"),
-            "last_seen": _num_map("last_seen"), "epoch": epoch}
+    raw_phrases = data.get("phrases")
+    if isinstance(raw_phrases, str):
+        raw_phrases = [raw_phrases]
+    phrases, seen_p = [], set()
+    for ph in (raw_phrases or []):
+        ph = " ".join(str(ph).split())
+        # A phrase with no space belongs in `hotword`; keeping it here too
+        # would just be a second place to look for the same term.
+        if ph and " " in ph and ph.lower() not in seen_p:
+            seen_p.add(ph.lower())
+            phrases.append(ph)
+    return {"terms": terms, "phrases": phrases, "pinned": pinned,
+            "hits": _num_map("hits"), "last_seen": _num_map("last_seen"),
+            "epoch": epoch}
 
 
 def _load_hotword_file() -> str:
@@ -1357,6 +1369,12 @@ def _save_hotword_file(hotword: str, store: "dict | None" = None) -> None:
     written only when there is something to record.
     """
     payload: dict = {"hotword": hotword}
+    if store and store.get("phrases"):
+        # Multi-word terms live here because the flat string above is
+        # space-separated and cannot express them. sherpa encodes a whole
+        # line, so `Cloud SQL` biases correctly (measured); most GCP service
+        # names are two words, which used to be inexpressible.
+        payload["phrases"] = list(store["phrases"])
     if store:
         kept = {t.lower() for t in hotword.split()}
         pinned = sorted(t for t in hotword.split()
@@ -1379,7 +1397,11 @@ def _save_hotword_file(hotword: str, store: "dict | None" = None) -> None:
         "// 单独成文件、且不入版本库：热词会累积同事姓名、客户名、内部代号，",
         "// 属于本地数据，不该随项目发布。模板见 hotword.jsonc.example。",
         "//",
-        "// hotword   词表本身，空格分隔；手工增删这一行即可。",
+        "// hotword   单词词表，空格分隔；手工增删这一行即可。",
+        "// phrases   多词术语（含空格），如 \"Cloud SQL\" / \"error budget\"。",
+        "//           空格分隔的 hotword 表达不了它们，所以单列一个数组。",
+        "//           注意：含标点的词（Pub/Sub、AI-Native）流式识别无法编码，",
+        "//           会被跳过并记日志；二次校验和 qwen 术语表仍然使用。",
         "// pinned    永不淘汰的词（Notion 导入的成员/项目名，或你手工钉的）。",
         "//           手工往 pinned 里加词即可生效，不必同时写进 hotword。",
         "// hits      该词在历次转写中出现的次数。",
@@ -1401,9 +1423,16 @@ def load_config() -> dict:
     # hotword.jsonc wins when it has content; an inline config.jsonc value
     # still works so an existing setup keeps its list until the next
     # extraction migrates it out (see _persist_hotwords).
-    hw = _load_hotword_file()
+    _hw_store = _load_hotword_store()
+    hw = " ".join(_hw_store["terms"]).strip()
     if hw:
         cfg.setdefault("stt", {}).setdefault("funasr", {})["hotword"] = hw
+    if _hw_store["phrases"]:
+        # Kept separate from the flat string, which is space-separated and so
+        # cannot hold a multi-word term. Only consumers that can use a phrase
+        # read this (sherpa hotwords file, qwen glossary, caption casing).
+        cfg.setdefault("stt", {}).setdefault("funasr", {})[
+            "hotword_phrases"] = list(_hw_store["phrases"])
     _apply_audio_overrides(cfg)
     return cfg
 
@@ -3641,6 +3670,41 @@ _CAPTION_PACER_INTERVAL = 0.25     # seconds between drain/mix/feed iterations
 _CAPTION_STOP_ASR_TIMEOUT = 5.0
 _CAPTION_STOP_TOKEN_TIMEOUT = 0.5
 
+# Hotwords sherpa can actually encode. Its cjkchar+bpe vocabulary has no
+# punctuation tokens, so ONE stray character makes the whole term fail and the
+# recognizer skips it — printing to C-level stderr, which the log tee never
+# captured, so the term looked configured while doing nothing. Measured
+# against the real model: letters / digits / CJK / spaces encode (including
+# multi-word phrases like `Cloud SQL` and `error budget`); `.` `+` `_` `'`
+# `-` `/` all fail (`Node.js`, `C++`, `Pub/Sub`, `blue-green`, `AI-Native`).
+_SHERPA_HOTWORD_OK_RE = re.compile(r"^[0-9A-Za-z一-鿿 ]+$")
+
+
+def _sherpa_encodable(term: str) -> bool:
+    """Whether the streaming recognizer can bias on this hotword."""
+    term = (term or "").strip()
+    return bool(term) and bool(_SHERPA_HOTWORD_OK_RE.match(term))
+
+
+def _hotword_term_list(hotword: str, phrases: "list[str] | None" = None) -> "list[str]":
+    """All hotword terms as a list: the space-separated single words plus any
+    multi-word phrases, de-duplicated case-insensitively, order preserved.
+
+    Two stores because the flat `hotword` string uses space as its separator
+    and so cannot hold a phrase. Keeping it that way means every existing
+    consumer (FunASR's `generate(hotword=…)`, the config editor, hand edits)
+    is unaffected, and only the consumers that can USE a phrase — the sherpa
+    hotwords file, the qwen glossary, caption case restoration — read both.
+    """
+    out, seen = [], set()
+    for term in list((hotword or "").split()) + list(phrases or []):
+        term = " ".join(str(term).split())          # collapse inner whitespace
+        low = term.lower()
+        if term and low not in seen:
+            seen.add(low)
+            out.append(term)
+    return out
+
 # Endpoint (sentence-break) rules forwarded to sherpa. Bounds are sanity
 # guards, not preferences: rule2 below ~0.3 s splits inside a normal pause and
 # above ~3 s merges two speakers' turns into one line, and rule3 is the
@@ -4434,7 +4498,8 @@ def _pick_model_file(model_dir: Path, stem: str) -> str:
 class _SherpaCaptionASR:
     """Fast mode: sherpa-onnx streaming zipformer (bilingual zh-en, ~320 ms)."""
 
-    def __init__(self, lc_cfg: dict, emit_partial, emit_final, hotword: str = ""):
+    def __init__(self, lc_cfg: dict, emit_partial, emit_final, hotword: str = "",
+                 phrases: "list[str] | None" = None):
         self._emit_partial = emit_partial
         self._emit_final = emit_final
         try:
@@ -4460,16 +4525,29 @@ class _SherpaCaptionASR:
         )
         _log("CAPTION", "endpoint rules: " + " ".join(
             f"{k.split('_min_')[0]}={v}" for k, v in sorted(ep.items())))
-        # Contextual biasing for domain terms (sandbox / API 网关 / …):
-        # space-separated stt.funasr.hotword phrases, one per line for
-        # sherpa. Needs modified_beam_search + the model's bpe.vocab.
-        hotword = (hotword or "").strip()
+        # Contextual biasing for domain terms. ONE TERM PER LINE, and a line
+        # may contain spaces: sherpa encodes the whole line as a token
+        # sequence, so `Cloud SQL` and `error budget` bias correctly (measured
+        # against the real model). Splitting on whitespace, as this used to
+        # do, made multi-word terms structurally inexpressible — which is most
+        # GCP service names. Needs modified_beam_search + the model's
+        # bpe.vocab.
+        terms = _hotword_term_list(hotword, phrases)
+        usable = [t for t in terms if _sherpa_encodable(t)]
+        skipped = [t for t in terms if not _sherpa_encodable(t)]
+        if skipped:
+            # Previously these failed inside the recognizer, which complained
+            # on C-level stderr that the log tee never captured — so a term
+            # looked configured while biasing nothing.
+            _log("CAPTION", f"hotwords not encodable by the streaming model, "
+                            f"skipped {len(skipped)}: {' '.join(skipped)} "
+                            f"(punctuation has no bpe token; refine + qwen "
+                            f"glossary still use them)")
         bpe_vocab = model_dir / "bpe.vocab"
-        if hotword and bpe_vocab.exists():
+        if usable and bpe_vocab.exists():
             hw_file = CONFIG_DIR / "models" / "caption_hotwords.txt"
             hw_file.parent.mkdir(parents=True, exist_ok=True)
-            hw_file.write_text(
-                "\n".join(hotword.split()) + "\n", encoding="utf-8")
+            hw_file.write_text("\n".join(usable) + "\n", encoding="utf-8")
             kwargs.update(
                 decoding_method="modified_beam_search",
                 hotwords_file=str(hw_file),
@@ -4480,7 +4558,8 @@ class _SherpaCaptionASR:
         try:
             self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
             if "hotwords_file" in kwargs:
-                _log("CAPTION", f"fast ASR hotwords active: {hotword}")
+                _log("CAPTION", f"fast ASR hotwords active: {len(usable)} terms"
+                                f" ({sum(1 for t in usable if ' ' in t)} 多词)")
         except Exception as e:
             if "hotwords_file" not in kwargs:
                 raise
@@ -4495,7 +4574,8 @@ class _SherpaCaptionASR:
             self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
         # Kept for `_caption_fix_case`: this model emits English in ALL CAPS,
         # and the configured spelling of a hotword must survive the downcase.
-        self._hotwords = [w for w in hotword.split() if len(w) >= 2]
+        # Phrases included — a multi-word term needs its casing restored too.
+        self._hotwords = [t for t in terms if len(t) >= 2]
         self._stream = self._rec.create_stream()
         self._seg_audio: list = []
         # `_raw_hyp` mirrors what the recognizer last returned (needed to
@@ -4807,7 +4887,8 @@ class _QwenCaptionMT:
     pinned by a GBNF grammar when llama.cpp supports it (qwen.grammar).
     """
 
-    def __init__(self, cfg: dict, lc_cfg: dict, hotword: str = ""):
+    def __init__(self, cfg: dict, lc_cfg: dict, hotword: str = "",
+                 phrases: "list[str] | None" = None):
         qcfg = lc_cfg.get("qwen") or {}
         try:
             from llama_cpp import Llama
@@ -4862,11 +4943,14 @@ class _QwenCaptionMT:
                 n_gpu_layers=int(qcfg.get("n_gpu_layers", -1)),
                 verbose=False,
             )
-        self.set_hotword(hotword)
+        self.set_hotword(hotword, phrases)
         _log("CAPTION", f"qwen MT ready: {model_path.name}")
 
-    def set_hotword(self, hotword: str):
-        self._hotwords = [w for w in (hotword or "").split() if len(w) >= 2]
+    def set_hotword(self, hotword: str, phrases: "list[str] | None" = None):
+        # Phrases included: the glossary matches literal substrings, so a
+        # multi-word term works here exactly like a single word.
+        self._hotwords = [t for t in _hotword_term_list(hotword, phrases)
+                          if len(t) >= 2]
 
     def _glossary_hits(self, text: str) -> "list[str]":
         """Literal hits only — the translate path must not rewrite words the
@@ -5393,20 +5477,29 @@ class LiveCaptionEngine:
             return backend
         backend = _SherpaCaptionASR(
             self._lc, self._emit_partial, self._finalize_segment,
-            hotword=self._stt_funasr_cfg().get("hotword", ""))
+            hotword=self._stt_funasr_cfg().get("hotword", ""),
+            phrases=self._stt_funasr_cfg().get("hotword_phrases") or [])
         _caption_backend_cache[key] = backend
         return backend
 
     def _load_mt_backend(self):
         provider = (self._lc.get("mt_provider") or "default").strip().lower()
-        hotword = self._stt_funasr_cfg().get("hotword", "")
+        # The glossary matches terms as literal substrings, so a phrase works
+        # there as-is; join them back into the space-separated form the
+        # backend expects, quoting nothing — `set_hotword` splits, so phrases
+        # are passed through the dedicated argument instead.
+        _stt = self._stt_funasr_cfg()
+        hotword = _stt.get("hotword", "")
+        phrases = _stt.get("hotword_phrases") or []
         if provider == "qwen":
             backend = _caption_backend_cache.get(("mt", "qwen"))
             if backend is not None:
-                backend.set_hotword(hotword)  # hotword may have grown since caching
+                # May have grown since caching — phrases included.
+                backend.set_hotword(hotword, phrases)
                 return backend
             try:
-                backend = _QwenCaptionMT(self.cfg, self._lc, hotword=hotword)
+                backend = _QwenCaptionMT(self.cfg, self._lc, hotword=hotword,
+                                         phrases=phrases)
                 _caption_backend_cache[("mt", "qwen")] = backend
                 return backend
             except Exception as e:
@@ -7987,6 +8080,60 @@ def _hotwords_from_notion(args, cfg, hw_cfg: dict) -> None:
     print("[热词] 快速模式字幕需重启 app 才会用上新热词（识别器有缓存）")
 
 
+def _hotwords_set_phrases(args, cfg) -> None:
+    """`hotwords --phrase/--unphrase`: manage multi-word terms.
+
+    They need their own store because the flat `hotword` string is
+    space-separated. sherpa encodes a whole hotwords-file line, so `Cloud SQL`
+    biases correctly — which matters because most GCP service names are two
+    words and were previously inexpressible.
+    """
+    store = _load_hotword_store()
+    have = {p.lower() for p in store["phrases"]}
+    added, rejected, removed, missing = [], [], [], []
+    for raw in (getattr(args, "phrase", None) or []):
+        ph = " ".join(str(raw).split())
+        if " " not in ph:
+            rejected.append((ph, "单个词请用 hotword 行或 --pin"))
+        elif not _sherpa_encodable(ph):
+            # Accepting it would look like it worked while the streaming model
+            # silently skipped it; the refine pass would still use it, so this
+            # is a warning rather than a hard stop.
+            rejected.append((ph, "含标点，流式识别无法编码"))
+        elif ph.lower() in have:
+            missing.append(ph)
+        else:
+            have.add(ph.lower())
+            store["phrases"].append(ph)
+            added.append(ph)
+    for raw in (getattr(args, "unphrase", None) or []):
+        ph = " ".join(str(raw).split())
+        hit = next((p for p in store["phrases"] if p.lower() == ph.lower()), None)
+        if hit:
+            store["phrases"].remove(hit)
+            removed.append(hit)
+        else:
+            missing.append(ph)
+
+    merged = " ".join(store["terms"])
+    try:
+        _save_hotword_file(merged, store)
+    except OSError as e:
+        print(f"[热词] 写入失败：{type(e).__name__}: {e}")
+        return
+    if added:
+        print(f"✅ 新增 {len(added)} 个多词术语：{' / '.join(added)}")
+    if removed:
+        print(f"✅ 移除 {len(removed)} 个：{' / '.join(removed)}")
+    for ph, why in rejected:
+        print(f"⚠️  跳过「{ph}」：{why}")
+    if missing:
+        print(f"（{len(missing)} 个已存在或本来就没有：{' / '.join(missing)}）")
+    print(f"[热词] 单词 {len(store['terms'])} 个，多词术语 "
+          f"{len(store['phrases'])} 个 → {HOTWORD_FILE.name}")
+    print("[热词] 需重启 app 才会生效（识别器有缓存）")
+
+
 def _hotwords_set_pins(args, cfg) -> None:
     """`hotwords --pin/--unpin`: mark terms as never-evictable, or release them.
 
@@ -8071,6 +8218,10 @@ def _cmd_hotwords_body(args, cfg):
                       f" hits={store['hits'].get(t.lower(), 0)}")
         else:
             print("\n（还没有命中历史；下一次生成纪要后开始记录）")
+        return
+
+    if getattr(args, "phrase", None) or getattr(args, "unphrase", None):
+        _hotwords_set_phrases(args, cfg)
         return
 
     if getattr(args, "pin", None) or getattr(args, "unpin", None):
@@ -11561,6 +11712,10 @@ def main():
                       help="剔除短于 N 字的纯中文候选（推荐 3，减少误替换）")
     p_hw.add_argument("--dry-run", action="store_true",
                       help="只预览将导入的词，不写入")
+    p_hw.add_argument("--phrase", nargs="+", metavar="PHRASE",
+                      help='加入多词术语，如 --phrase "Cloud SQL" "error budget"')
+    p_hw.add_argument("--unphrase", nargs="+", metavar="PHRASE",
+                      help="移除多词术语")
     p_hw.add_argument("--pin", nargs="+", metavar="TERM",
                       help="把这些词标记为永不淘汰（写入 hotword.jsonc 的 pinned）")
     p_hw.add_argument("--unpin", nargs="+", metavar="TERM",

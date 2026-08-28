@@ -37,8 +37,8 @@ def _write(path: Path, payload: dict) -> None:
 class TestStore:
     def test_missing_file_is_empty_not_an_error(self, isolate_hotword_file):
         store = ms._load_hotword_store()
-        assert store == {"terms": [], "pinned": set(), "hits": {},
-                         "last_seen": {}, "epoch": 0}
+        assert store == {"terms": [], "phrases": [], "pinned": set(),
+                         "hits": {}, "last_seen": {}, "epoch": 0}
 
     def test_flat_legacy_file_loads_as_all_rolling(self, isolate_hotword_file):
         """Every file written before this existed, and anything hand-edited."""
@@ -347,3 +347,90 @@ class TestHitBoundaries:
         # ...which is what makes the unmentioned one the eviction candidate.
         rank = lambda t: (store["last_seen"].get(t, 0), store["hits"].get(t, 0))
         assert rank("neversaid") < rank("spanner")
+
+
+class TestPhrases:
+    """Multi-word terms. The flat `hotword` string is space-separated and so
+    cannot hold one, yet most GCP service names are two words. sherpa encodes
+    a whole hotwords-file line, so a phrase biases correctly — verified
+    against the real model for `Cloud SQL`, `error budget`, `node pool`."""
+
+    def test_phrases_round_trip(self, isolate_hotword_file):
+        ms._save_hotword_file("GKE Spanner",
+                              {"phrases": ["Cloud SQL", "error budget"]})
+        back = ms._load_hotword_store()
+        assert back["phrases"] == ["Cloud SQL", "error budget"]
+        assert back["terms"] == ["GKE", "Spanner"]
+
+    def test_flat_key_is_untouched_by_phrases(self, isolate_hotword_file):
+        """Every existing consumer keeps reading the same space-separated
+        string; only phrase-capable ones read the new array."""
+        ms._save_hotword_file("GKE", {"phrases": ["Cloud SQL"]})
+        body = json.loads(ms._strip_jsonc_comments(
+            isolate_hotword_file.read_text(encoding="utf-8")))
+        assert body["hotword"] == "GKE"
+        assert body["phrases"] == ["Cloud SQL"]
+
+    def test_single_word_in_phrases_is_dropped_on_load(self, isolate_hotword_file):
+        """It belongs in `hotword`; two places for one term is a bug factory."""
+        _write(isolate_hotword_file, {"hotword": "GKE", "phrases": ["Spanner"]})
+        assert ms._load_hotword_store()["phrases"] == []
+
+    def test_phrases_absent_when_there_are_none(self, isolate_hotword_file):
+        ms._save_hotword_file("GKE", {"phrases": []})
+        body = json.loads(ms._strip_jsonc_comments(
+            isolate_hotword_file.read_text(encoding="utf-8")))
+        assert "phrases" not in body
+
+    def test_string_form_is_tolerated(self, isolate_hotword_file):
+        _write(isolate_hotword_file, {"hotword": "GKE", "phrases": "Cloud SQL"})
+        assert ms._load_hotword_store()["phrases"] == ["Cloud SQL"]
+
+    def test_inner_whitespace_is_collapsed(self, isolate_hotword_file):
+        _write(isolate_hotword_file,
+               {"hotword": "GKE", "phrases": ["Cloud    SQL"]})
+        assert ms._load_hotword_store()["phrases"] == ["Cloud SQL"]
+
+    def test_duplicates_dropped_case_insensitively(self, isolate_hotword_file):
+        _write(isolate_hotword_file, {"hotword": "GKE",
+                                      "phrases": ["Cloud SQL", "cloud sql"]})
+        assert ms._load_hotword_store()["phrases"] == ["Cloud SQL"]
+
+
+class TestTermList:
+    def test_words_and_phrases_combine(self):
+        assert ms._hotword_term_list("GKE Spanner", ["Cloud SQL"]) == [
+            "GKE", "Spanner", "Cloud SQL"]
+
+    def test_deduplicated_across_both_stores(self):
+        assert ms._hotword_term_list("GKE", ["gke", "Cloud SQL"]) == [
+            "GKE", "Cloud SQL"]
+
+    def test_empty_inputs(self):
+        assert ms._hotword_term_list("", None) == []
+
+
+class TestSherpaEncodable:
+    """One stray character makes the recognizer skip the WHOLE term, and it
+    complains on C-level stderr that the log tee never captured — so a term
+    looked configured while biasing nothing. All measured against the real
+    model."""
+
+    @pytest.mark.parametrize("term", [
+        "GKE", "n2d", "CockroachDB", "K8s", "P0", "巡检", "GKE 集群",
+        "Cloud SQL", "error budget", "node pool", "Spot VM", "AI Native",
+    ])
+    def test_encodable(self, term):
+        assert ms._sherpa_encodable(term)
+
+    @pytest.mark.parametrize("term", [
+        "Pub/Sub", "blue-green", "AI-Native", "Agent-Ready", "Semi-Annual",
+        "one-liner", "Node.js", "C++", "snake_case", "it's", "3.5",
+    ])
+    def test_not_encodable(self, term):
+        assert not ms._sherpa_encodable(term)
+
+    def test_blank_is_not_encodable(self):
+        assert not ms._sherpa_encodable("")
+        assert not ms._sherpa_encodable("   ")
+        assert not ms._sherpa_encodable(None)

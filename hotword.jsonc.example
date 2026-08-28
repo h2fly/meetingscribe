@@ -12,7 +12,15 @@
 //   python3 meetingscribe.py hotwords --notion   # 从 Notion 导入成员/项目名
 //
 // ── 字段 ────────────────────────────────────────────────────────────────
-// hotword    词表本身，空格分隔。手工增删这一行即可，只会被去重不会被改写。
+// hotword    单词词表，空格分隔。手工增删这一行即可，只会被去重不会被改写。
+// phrases    多词术语（含空格），如 "Cloud SQL" / "error budget" / "node pool"。
+//            空格分隔的 hotword 行表达不了它们，所以单列一个数组。sherpa 会把
+//            热词文件的一整行编码成 token 序列，所以多词术语确实生效（已用真实
+//            模型验证）。命令：
+//              python3 meetingscribe.py hotwords --phrase "Cloud SQL" "error budget"
+//            注意：含标点的词（Pub/Sub、AI-Native、Node.js、C++）流式识别无法
+//            编码——bpe 词表里没有标点 token，一个字符就会让整条被跳过。它们会
+//            被过滤并记进日志；离线二次校验和 qwen 术语表仍然使用。
 // pinned     永不淘汰的词。`--notion` 导入的成员名/项目名自动进这里，因为
 //            它们是工作区里权威的名字，不该被某次会议里挖到的一个临时词挤掉。
 //            手工往 pinned 里加词即可生效，不必同时写进 hotword。
