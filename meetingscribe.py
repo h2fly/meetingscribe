@@ -6478,9 +6478,22 @@ start next last first second per via etc app apps item items case cases
 
 
 def _cfg_hotword(cfg: dict) -> str:
-    """The current stt.funasr.hotword string ("" when unset)."""
-    return (((cfg.get("stt") or {}).get("funasr") or {})
-            .get("hotword") or "").strip()
+    """The hotword glossary as prompt text, phrases included.
+
+    Rendered 、-separated rather than space-separated because multi-word terms
+    exist: space-joining would turn 「Cloud SQL」 into two unrelated entries
+    for the reading model, which is the same boundary loss that made the
+    sherpa hotwords file useless for phrases.
+
+    This is the PROMPT-facing form only (polish, caption review). FunASR's
+    `generate(hotword=…)` reads the raw space-separated string straight from
+    the config, since its own format is space-separated and cannot express a
+    phrase either.
+    """
+    funasr = (cfg.get("stt") or {}).get("funasr") or {}
+    terms = _hotword_term_list(funasr.get("hotword") or "",
+                              funasr.get("hotword_phrases") or [])
+    return "、".join(terms)
 
 
 def _extract_hotword_candidates(text: str) -> "list[str]":

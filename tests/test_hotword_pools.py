@@ -434,3 +434,30 @@ class TestSherpaEncodable:
         assert not ms._sherpa_encodable("")
         assert not ms._sherpa_encodable("   ")
         assert not ms._sherpa_encodable(None)
+
+
+class TestPromptGlossary:
+    """`_cfg_hotword` feeds the polish and caption-review prompts. It must not
+    lose multi-word terms the way the sherpa hotwords file used to."""
+
+    def test_phrases_survive_with_their_boundaries(self):
+        cfg = {"stt": {"funasr": {"hotword": "GKE Spanner",
+                                  "hotword_phrases": ["Cloud SQL"]}}}
+        got = ms._cfg_hotword(cfg)
+        assert "Cloud SQL" in got
+        # Space-joining would make it indistinguishable from two terms.
+        assert got == "GKE、Spanner、Cloud SQL"
+
+    def test_words_only_still_works(self):
+        cfg = {"stt": {"funasr": {"hotword": "GKE Spanner"}}}
+        assert ms._cfg_hotword(cfg) == "GKE、Spanner"
+
+    def test_empty_config(self):
+        assert ms._cfg_hotword({}) == ""
+        assert ms._cfg_hotword({"stt": {"funasr": {"hotword": ""}}}) == ""
+
+    def test_funasr_still_reads_the_raw_space_separated_string(self):
+        """The offline recognizer's own hotword format is space-separated, so
+        it must keep reading the config value directly, not this rendering."""
+        src = Path(ms.__file__).read_text(encoding="utf-8")
+        assert 'hotword     = pcfg.get("hotword", "")' in src
