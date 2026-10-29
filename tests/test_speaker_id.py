@@ -330,7 +330,7 @@ class TestEngineSpeakerWorker:
 def test_english_segment_skips_refine():
     """Measured on a real session: paraformer-zh "corrected" 53 of 56 English
     segments at 1.7–2.5 s each, all of them for the worse."""
-    eng = ms.LiveCaptionEngine({}, lambda ev: None)
+    eng = ms.LiveCaptionEngine({"live_captions": {"language": "zh"}}, lambda ev: None)
     assert eng._refine_enabled
     eng._finalize_segment("Thank you everyone for joining this call",
                           np.zeros(24000, dtype=np.float32))
@@ -338,7 +338,7 @@ def test_english_segment_skips_refine():
 
 
 def test_chinese_segment_still_refines():
-    eng = ms.LiveCaptionEngine({}, lambda ev: None)
+    eng = ms.LiveCaptionEngine({"live_captions": {"language": "zh"}}, lambda ev: None)
     eng._finalize_segment("我们把流量切到新集群上",
                           np.zeros(24000, dtype=np.float32))
     assert eng._refine_queue.qsize() == 1

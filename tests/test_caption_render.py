@@ -216,3 +216,49 @@ def test_first_divergence_helper():
     assert f(["a"], ["a", "b"]) == 1
     assert f(["a", "b"], ["a"]) == 1
     assert f(["x"], ["y"]) == 0
+
+
+class TestInlinePartial:
+    """The in-flight line renders inline at the tail of the last group."""
+
+    def test_partial_appended_to_last_group_only(self):
+        out = ms._caption_groups_html(
+            [("", "第一段", "First."), ("", "our customer strength", "客户优势。")],
+            partial="Asking what to solve", partial_dst="询问要解决什么")
+        assert len(out) == 2
+        assert "Asking" not in out[0]
+        assert "our customer strength <span" in out[1]       # ASCII → space
+        assert "font-style:italic" in out[1]
+        assert "客户优势。<span" in out[1]                    # CJK → bare join
+
+    def test_space_decided_on_raw_text_not_markup(self):
+        out = ms._caption_groups_html([("", "这样就好。", "")], partial="Okay next")
+        # 「。」 + "Okay": the partial starts with ASCII alnum → space.
+        assert "这样就好。 <span" in out[0]
+
+    def test_partial_escaped(self):
+        out = ms._caption_groups_html([("", "a", "b")], partial="<b>x</b>")
+        assert "&lt;b&gt;x&lt;/b&gt;" in out[0]
+
+    def test_partial_without_rows_gets_its_own_group(self):
+        out = ms._caption_groups_html([], partial="hello")
+        assert len(out) == 1 and "hello" in out[0]
+
+    def test_no_partial_is_plain_two_paragraphs(self):
+        out = ms._caption_groups_html([("", "src", "")])
+        assert out[0].count("<p ") == 2 and "italic" not in out[0]
+        assert "…" in out[0]          # untranslated marker kept
+
+    def test_partial_update_is_a_tail_patch(self, pane):
+        view, r = pane
+        rows = [("", f"这是第 {i} 句", f"Line {i}.") for i in range(50)]
+        r.render(ms._caption_groups_html(rows))
+        for p in ("so we", "so we can", "so we can do better"):
+            groups = ms._caption_groups_html(rows, partial=p)
+            assert r.render(groups) == "tail"
+            assert_matches_full_rebuild(view, groups)
+        # Finalized: partial gone, new row appended — still no full rebuild.
+        rows.append(("", "so we can do better", ""))
+        groups = ms._caption_groups_html(rows)
+        assert r.render(groups) != "full"
+        assert_matches_full_rebuild(view, groups)

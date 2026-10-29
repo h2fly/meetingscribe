@@ -138,7 +138,7 @@ class _Sink:
 
 
 def _engine(sink, reply="", **review):
-    cfg = {"live_captions": {"review": {"interval_minutes": 0.5, **review}}}
+    cfg = {"live_captions": {"review": {"trigger_lines": 1, **review}}}
     eng = ms.LiveCaptionEngine(cfg, sink)
     eng._review_llm = lambda prompt: reply
     return eng
@@ -180,7 +180,6 @@ class TestReviewBuffer:
 class TestReviewWorker:
     def _run_once(self, eng, sink, expect, timeout=8.0):
         eng._running = True
-        eng._review_interval = 0.0          # fire on the first tick
         t = threading.Thread(target=eng._review_worker, daemon=True)
         t.start()
         deadline = time.time() + timeout
@@ -206,7 +205,7 @@ class TestReviewWorker:
         seen = {}
         sink = _Sink()
         eng = ms.LiveCaptionEngine({"stt": {"funasr": {"hotword": "ChatOps GKE"}},
-             "live_captions": {"review": {"interval_minutes": 0.5}}}, sink)
+             "live_captions": {"review": {"trigger_lines": 1}}}, sink)
         eng._review_llm = lambda p: seen.setdefault("prompt", p) and ""
         eng._finalize_segment("我们把流量切到拆特ops上面")
         self._run_once(eng, sink, "never", timeout=2.0)
@@ -214,13 +213,17 @@ class TestReviewWorker:
         assert "拆特ops" in seen["prompt"]
         assert "|||" in seen["prompt"]
 
-    def test_batch_is_consumed_once(self):
+    def test_reviewed_row_stays_in_the_buffer(self):
+        """Windows overlap by design, so a reviewed row must NOT be consumed:
+        it has to stay available for the window to slide over it again with
+        more of what came after it."""
         sink = _Sink()
         eng = _engine(sink)
         eng._finalize_segment("第一句话内容")
         eng._review_llm = lambda p: "1 ||| 第一句话内容 ||| First line."
         self._run_once(eng, sink, "translation")
-        assert eng._review_buffer == []
+        assert [r["id"] for r in eng._review_buffer] == [1]
+        assert eng._review_pending == 0
 
     def test_llm_failure_leaves_captions_alone(self):
         sink = _Sink()
@@ -244,21 +247,18 @@ class TestReviewWorker:
         assert sink.of_type("refined") == []
         assert sink.of_type("translation")[0]["text"] == "This one was fine."
 
-    def test_max_lines_splits_the_batch(self):
-        """Tested without the thread: with a 0-second interval the worker
-        would drain every batch before the assertion could see the split."""
-        eng = _engine(_Sink(), max_lines=2)
+    def test_window_is_the_tail_and_max_lines_caps_it(self):
+        eng = _engine(_Sink(), window_lines=3, max_lines=2)
         for i in range(5):
             eng._finalize_segment(f"第{i}句话的内容")
-        first = eng._take_review_batch()
-        assert len(first) == 2 and len(eng._review_buffer) == 3
-        second = eng._take_review_batch()
-        assert len(second) == 2 and len(eng._review_buffer) == 1
-        assert [r["id"] for r in first + second] == [1, 2, 3, 4]
+        # max_lines is a hard ceiling independent of window_lines.
+        assert [r["id"] for r in eng._next_review_window()] == [4, 5]
+        # Nothing was consumed.
+        assert len(eng._review_buffer) == 5
 
-    def test_empty_buffer_yields_no_batch(self):
+    def test_empty_buffer_yields_no_window(self):
         eng = _engine(_Sink())
-        assert eng._take_review_batch() == []
+        assert eng._next_review_window() == []
 
 
 class TestReviewLlmCall:
@@ -297,10 +297,10 @@ class TestReviewLlmCall:
             ms, "_llm_run",
             lambda *a, **k: (_ for _ in ()).throw(TypeError("bad signature")))
         sink = _Sink()
-        eng = ms.LiveCaptionEngine({"live_captions": {"review": {"interval_minutes": 0.5}}}, sink)
+        eng = ms.LiveCaptionEngine(
+            {"live_captions": {"review": {"trigger_lines": 1}}}, sink)
         eng._finalize_segment("第一句话内容")
         eng._running = True
-        eng._review_interval = 0.0
         t = threading.Thread(target=eng._review_worker, daemon=True)
         t.start()
         time.sleep(1.0)
@@ -309,65 +309,19 @@ class TestReviewLlmCall:
         assert sink.of_type("refined") == [] and sink.of_type("translation") == []
 
 
-class TestRequeueOnOmission:
-    """A line popped from the buffer but missing from the reply (truncated
-    answer) must not silently lose its chance at review — the exact hole a
-    larger max_lines would widen."""
+class TestOmittedLineIsCoveredByOverlap:
+    """A line missing from the reply (truncated answer) used to be requeued at
+    the head of the buffer, because rows were POPPED and would otherwise never
+    be seen again. With a sliding window the row was never removed, so the
+    next window covers it — the requeue machinery (and `max_tries`) is gone."""
 
-    def _one_round(self, eng, reply):
-        batch = eng._take_review_batch()
-        fixes = ms._parse_caption_review(reply, batch)
-        missed = []
-        for row in batch:
-            if not fixes.get(row["id"]):
-                if row.get("tries", 0) < eng._review_max_tries:
-                    row["tries"] = row.get("tries", 0) + 1
-                    missed.append(row)
-        if missed:
-            with eng._review_lock:
-                eng._review_buffer[:0] = missed
-        return batch, fixes, missed
-
-    def test_omitted_line_is_requeued(self):
+    def test_row_is_not_removed_when_the_reply_omits_it(self):
         sink = _Sink()
-        eng = _engine(sink)
-        eng._finalize_segment("第一句话的内容")
-        eng._finalize_segment("第二句话的内容")
-        # Reply covers only the first line (as if truncated).
-        _, _, missed = self._one_round(eng, "1 ||| 第一句话的内容 ||| First.")
-        assert len(missed) == 1
-        assert [r["id"] for r in eng._review_buffer] == [2]
-
-    def test_requeue_keeps_chronological_order(self):
-        eng = _engine(_Sink())
-        for i in range(3):
-            eng._finalize_segment(f"第{i}句话的内容")
-        self._one_round(eng, "2 ||| 第1句话的内容 ||| Second.")
-        assert [r["id"] for r in eng._review_buffer] == [1, 3]
-
-    def test_retries_are_bounded(self):
-        eng = _engine(_Sink())
-        eng._finalize_segment("永远被忽略的一句话")
-        for _ in range(eng._review_max_tries):
-            self._one_round(eng, "")            # model never answers
-            assert eng._review_buffer            # still queued
-        self._one_round(eng, "")
-        assert eng._review_buffer == []          # given up, not looping
-
-    def test_max_tries_zero_disables_requeue(self):
-        eng = _engine(_Sink(), max_tries=0)
-        eng._finalize_segment("只投一次的一句话")
-        self._one_round(eng, "")
-        assert eng._review_buffer == []
-
-    def test_worker_requeues_end_to_end(self):
-        sink = _Sink()
-        eng = _engine(sink)
+        eng = _engine(sink, window_lines=5, trigger_lines=1)
         eng._finalize_segment("第一句话的内容")
         eng._finalize_segment("第二句话的内容")
         eng._review_llm = lambda p: "1 ||| 第一句话的内容 ||| First."
         eng._running = True
-        eng._review_interval = 0.0
         t = threading.Thread(target=eng._review_worker, daemon=True)
         t.start()
         deadline = time.time() + 5
@@ -375,9 +329,22 @@ class TestRequeueOnOmission:
             time.sleep(0.05)
         eng._running = False
         t.join(timeout=2)
-        # Line 2 came back for another round rather than being dropped.
-        assert any(r["id"] == 2 for r in eng._review_buffer) or \
-            len(sink.of_type("translation")) >= 1
+        assert [r["id"] for r in eng._review_buffer] == [1, 2]
+
+    def test_next_window_still_contains_the_omitted_line(self):
+        eng = _engine(_Sink(), window_lines=5, trigger_lines=2)
+        for i in range(1, 5):
+            eng._finalize_segment(f"第{i}句话的内容")
+        first = [r["id"] for r in eng._next_review_window()]
+        eng._finalize_segment("第5句话的内容")
+        eng._finalize_segment("第6句话的内容")
+        second = [r["id"] for r in eng._next_review_window()]
+        # Whatever the model skipped in `first` gets another look in `second`.
+        assert set(first) & set(second), f"{first} vs {second}"
+
+    def test_max_tries_is_no_longer_a_setting(self):
+        eng = _engine(_Sink())
+        assert not hasattr(eng, "_review_max_tries")
 
 
 class TestChangeAuditLog:
@@ -400,11 +367,10 @@ class TestChangeAuditLog:
 
     def _run(self, eng, sink, logged):
         eng._running = True
-        eng._review_interval = 0.0
         t = threading.Thread(target=eng._review_worker, daemon=True)
         t.start()
         deadline = time.time() + 5
-        while time.time() < deadline and not any("review batch=" in m for m in logged):
+        while time.time() < deadline and not any("review window=" in m for m in logged):
             time.sleep(0.05)
         eng._running = False
         t.join(timeout=2)
@@ -459,6 +425,9 @@ class TestChangeAuditLog:
         eng._review_record_translation(1, "old")
         eng._review_llm = lambda p: "1 ||| 第一句需要修正的东西 ||| new translation"
         self._run(eng, sink, logged)
-        summary = [m for m in logged if m.startswith("review batch=")]
+        summary = [m for m in logged if m.startswith("review window=")]
         assert summary
         assert "src_changed=1" in summary[0] and "dst_changed=1" in summary[0]
+        # The window's id range is in the summary so an overlapping pass can
+        # be traced: which lines this call actually looked at.
+        assert "seg=1..1" in summary[0]

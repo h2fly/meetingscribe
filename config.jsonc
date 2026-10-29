@@ -17,23 +17,36 @@
   // ── Per-stage providers ─────────────────────────────────────────────────────
   // Speech-to-text: funasr (local, default) | openai | gemini
   "transcribe_provider": "funasr",
-  // Transcript polish: claude | openai | gemini
+  // Transcript polish: codex_proxy | claude | openai | gemini
   "polish_provider": "claude",
-  // Meeting notes / interview summary / sharing summary: claude | openai | gemini
+  // Meeting notes / interview summary / sharing summary: codex_proxy | claude | openai | gemini
   "meeting_notes_provider": "claude",
+  // Preferred text-completion provider order. The first provider is tried
+  // normally; the next one is used after failure. The fallback is promoted
+  // for the cooldown, then the primary is probed again.
+  "llm_priority": ["codex_proxy", "claude"],
+  // How long a failed primary provider stays out of the hot path.
+  "llm_failover_cooldown_hours": 3,
 
   // ── Live bilingual captions (GUI recording view; fully local inference) ────
   "live_captions": {
     // Default state of the caption switch in the recording view.
     "enabled": true,
-    // There is ONE recognition path: sherpa-onnx streaming zipformer (zh-en,
-    // ~320 ms) + opus-mt Marian translation, with finalized lines re-decoded
-    // by the offline FunASR stack (see "refine" below). The former "accurate
-    // mode" (FunASR streaming 2pass + NLLB) is gone — its streaming model is
-    // Chinese-only and measurably worse on English meetings, while its NLLB
-    // translation is still selectable on its own via mt_provider="nllb".
-    // Empty = auto-download the streaming zipformer bilingual model
-    // (~200 MB, one-time) into ~/Documents/meetingscribe/models/.
+    // Main spoken language of the meeting; picks the streaming ASR model.
+    //   "en" = NVIDIA Nemotron Speech Streaming EN 0.6B (sherpa-onnx int8,
+    //          ~440 MB one-time download). English-first, emits real casing
+    //          and punctuation.
+    //   "zh" = sherpa-onnx streaming zipformer bilingual zh-en (2023) plus
+    //          the FunASR refine pass below. Use it for Chinese meetings.
+    // Translation runs after either one (see mt_provider below).
+    "language": "en",
+    // Encoder chunk for "en": 80 / 160 / 560 / 1120 ms. Each is its own
+    // export (the chunk is baked into the ONNX graph). A bigger chunk is more
+    // accurate but the words appear later. NVIDIA's WER figures:
+    // 8.43 / 7.67 / 7.07 / 6.93 %.
+    "en_chunk_ms": 560,
+    // Empty = auto-download the model for "language" on first use into
+    // ~/Documents/meetingscribe/models/. A path here overrides "language".
     "asr_model_dir": "",
     "mt_zh_en": "Helsinki-NLP/opus-mt-zh-en",
     "mt_en_zh": "Helsinki-NLP/opus-mt-en-zh",
@@ -85,7 +98,20 @@
     // Display-layer paragraph merging: consecutive finalized lines whose
     // arrival gap is <= this many ms are shown as one paragraph (display
     // only — recognition/translation data is untouched). 0 = no merging.
-    "merge_gap_ms": 2500,
+    // Paragraph merging. **A speaker change is the primary break** — one
+    // person's speech flows and wraps as a single block, the way Google Meet's
+    // live captions read; these two are only safety valves.
+    // Measured on two real sessions (1121 / 264 finalized lines), share of
+    // adjacent lines that merge into the same paragraph:
+    //   2500 ms  (the old default)   35% / 55%   <- visibly choppy
+    //  15000 ms                      80% / 90%
+    //  30000 ms                     100% / 98%
+    // 0 = no merging at all (one paragraph per recognised line).
+    "merge_gap_ms": 30000,
+    // Hard cap on one paragraph's source length. Without it a long monologue
+    // becomes one unbounded paragraph, which hurts readability and makes every
+    // appended line re-render an ever-growing block.
+    "merge_max_chars": 800,
     // How far back the caption panel can be scrolled, in minutes. Retention
     // is by TIME so the guarantee holds regardless of speech cadence (a row
     // count would cover 3 hours of a slow meeting but only 1.5 of a fast
@@ -132,13 +158,38 @@
       //   [CAPTION] review seg=N dst: 「before」 → 「after」
       // one line per change (unchanged lines log nothing), so a session can
       // be audited afterwards. The log is purged after 7 days.
-      // Review period in minutes — also the span each batch covers.
-      "interval_minutes": 1.5,
-      // Max lines per batch; the remainder waits for the next round. If a
-      // batch takes longer than interval_minutes the worker just runs the
-      // next one immediately, so it catches up rather than drifting — lower
-      // this if your provider is slow (measured: 53 s for 6 lines through the
-      // claude CLI, most of which is process startup).
+      // SLIDING WINDOW, not a timer. Every `trigger_lines` newly finalized
+      // lines, the last `window_lines` are re-checked — so each line is looked
+      // at ceil(window/trigger) times, every time with MORE of what came after
+      // it. That right-context is the point: a sentence is often only
+      // resolvable from the two that follow it.
+      //
+      // Re-measured directly, with realistic line lengths, through the claude
+      // CLI: a call is 14.7 s fixed + 0.69 s per line (3/5/10/20 lines →
+      // 16.9/17.6/22.1/28.3 s). The 14.7 s floor is the `claude -p` process
+      // itself — a prompt that only answers "OK" still takes 8.5-10 s. An
+      // earlier note here claimed 41.6 s + 3.4 s per line; that came from an
+      // R²=0.17 fit over 120-line batches and badly overestimates small ones.
+      //
+      // At the measured 2.6 finalized lines/min, window=5 + trigger=2
+      // dispatches every ~46 s at ~18 s per call: a ~39 % duty cycle on one
+      // thread. Raise trigger_lines to spend less; raise window_lines to give
+      // the model more context per call (cheaper per line, but each line waits
+      // longer for its first look).
+      //
+      // Concurrency was measured (3 serial claude calls 29.6 s vs 3 concurrent
+      // 14.0 s) and deliberately NOT used: a concurrent batch dispatches before
+      // the previous one returns, so it sees no settled `context_lines`, and
+      // overlapping windows would let two in-flight calls rewrite the same row.
+      "window_lines": 5,
+      "trigger_lines": 2,
+      // Speech stopped with fewer than trigger_lines pending: flush after this
+      // many seconds, or the last few lines of every meeting go unreviewed.
+      "idle_flush_secs": 20,
+      // Hard ceiling on one call's line count, independent of window_lines.
+      // Bound by OUTPUT tokens: the model re-emits every line, measured at
+      // 42 chars/line, so 120 lines is about 5.6k in / 5.2k out — just under
+      // the common 8k output ceiling.
       "max_lines": 120,
       // Total cap on the pending queue (max_lines only bounds ONE batch).
       // This is a backstop, not a tuning knob: if the provider stalls the
@@ -154,13 +205,9 @@
       // on "ChatOps", batch N+1 should not independently pick 「拆特ops」
       // again. They are reference only — never re-corrected, since the user
       // already saw them corrected and rewriting them every interval would
-      // make the pane churn. Input tokens only: measured per-call cost is
-      // 41.6 s fixed + 3.4 s per line (linear fit over 80 real batches), so a
-      // dozen reference lines is noise. 0 = off.
+      // make the pane churn. Input tokens only, and the fixed per-call cost
+      // dominates, so a dozen reference lines is noise. 0 = off.
       "context_lines": 12,
-      // A line missing from the reply (truncated answer) is put back for
-      // another round, at most this many times.
-      "max_tries": 2,
       // Empty = use polish_provider (claude / openai / gemini).
       "provider": ""
     },
@@ -208,7 +255,17 @@
       // quality loss. Disable if translations look degraded.
       "mt_int8": true
     },
-    // Caption translation engine (Scheme C).
+    // Caption translation engine.
+    //   hymt    = Tencent HY-MT1.5-1.8B, a dedicated translation model (GGUF
+    //             via llama.cpp, ~1.1 GB auto-download, block "hymt" below).
+    //             Recommended, especially for English meetings. Measured on
+    //             the same 5-minute English support call (Nemotron ASR):
+    //             opus-mt cut the translation off midway on long lines
+    //             (9 of 25 lost their second half) and produced
+    //             「齿轮」 for "gears"; HY-MT translated every line in full,
+    //             fluently, at 1.14 s/line vs 0.94 s (max ~2.5 s).
+    //             Falls back to marian if llama-cpp-python / the model is
+    //             missing.
     //   qwen    = local Qwen small model via llama.cpp (GGUF, auto-downloaded,
     //             ~1 GB). Hotwords from stt.funasr.hotword that appear in a
     //             caption line are injected as a keep-verbatim glossary, so
@@ -226,7 +283,19 @@
     // caption lines, the 1.5B model returned the corrected ENGLISH as its
     // "translation" in 3 of 4 — it corrects well but does not reliably
     // translate en->zh at this size. Prefer marian/nllb for English audio.
-    "mt_provider": "default",
+    "mt_provider": "hymt",
+    // Translate a line sentence by sentence (split on . ? ! 。 ？ ！) and cache
+    // each finished sentence: while a line is still being spoken only its
+    // unfinished tail is re-translated, and the final reuses what the
+    // partials already translated. Also keeps every model call short —
+    // opus-mt silently truncates long lines. marian / nllb / hymt only (the
+    // qwen correction path needs the whole line).
+    // Measured gain is small: on a conversational English call Nemotron
+    // emits little sentence punctuation (run-on speech), so most lines are a
+    // single unit — 6 cache hits in 5 minutes, P90 final->translation
+    // 3.0 s -> 2.6 s, median unchanged. Harmless, and it pays off on
+    // well-punctuated speech.
+    "mt_sentence_split": true,
     "qwen": {
       "model_repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
       "model_file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
@@ -261,6 +330,30 @@
       // at most this many. Dumping all ~100 hotwords into every prompt is
       // what made the model apply unrelated terms.
       "glossary_max": 12
+    },
+    // Only consulted when mt_provider = "hymt": Tencent HY-MT1.5-1.8B, a
+    // dedicated translation model (GGUF via llama.cpp, ~1.1 GB auto-download).
+    // Translate-only (no ASR correction). Hotwords found in a line are passed
+    // through the model card's terminology block so they stay verbatim.
+    // License: Tencent HY Community License (not valid in the EU/UK/KR).
+    "hymt": {
+      "model_repo": "tencent/HY-MT1.5-1.8B-GGUF",
+      "model_file": "HY-MT1.5-1.8B-Q4_K_M.gguf",
+      // Local GGUF path; empty = auto-download into ~/Documents/meetingscribe/models/.
+      "model_path": "",
+      "n_ctx": 2048,
+      "threads": 0,
+      // -1 = full Metal offload; 0 = CPU only.
+      "n_gpu_layers": -1,
+      // Max hotwords injected per line (literal hits only).
+      "glossary_max": 12,
+      // Preceding caption sentences passed as context (the model card's
+      // contextual-translation template, prompts.caption_mt_hymt_context).
+      // 0 = off. Keep it off with the 1.8B model: measured with 2, it
+      // translated the context too — one line's translation came back
+      // carrying the previous line's content — and it was slower (median
+      // final->translation 1.12 s -> 1.53 s, partial translations 207 -> 160).
+      "context_lines": 0
     }
   },
 
@@ -291,6 +384,41 @@
     // 1000 is the measured-safe ceiling; before going higher, A/B it with
     // `python3 meetingscribe.py captions <wav>`.
     "max_count": 1000
+  },
+
+  // ── Calendar linkage (Google Calendar / Notion via Claude MCP or Codex) ────
+  // Reads today's events so a recording is NAMED at creation time instead of
+  // renamed afterwards, and stores the event's attendees / location / links in
+  // a `.meta.json` sidecar next to the .wav.
+  //
+  // No OAuth code here on purpose: Claude MCP uses the connector already
+  // authorised in Claude Code. The personal Codex fallback uses the MCP
+  // configuration already authorised in the personal Codex account.
+  //
+  // OFF by default: turning it on pulls colleague names into local files.
+  // The sidecar lives in the recordings folder (outside this repo); mined
+  // attendee names go to hotword.jsonc, which is already gitignored.
+  "calendar": {
+    // Flipping this on in the GUI runs the connection preflight first and
+    // only commits if the Google Calendar connector answers — a broken setup
+    // surfaces while you are deliberately enabling it, not before a meeting.
+    "enabled": true,
+    // Tried in order. Claude MCP receives --allowedTools; personal Codex is
+    // invoked without `-p proxy`. You can remove or reorder either provider.
+    "provider_chain": ["claude-mcp", "codex_personal"],
+    // Legacy single-provider setting, used only when provider_chain is absent.
+    "provider": "claude-mcp",
+    // How far ahead an event may start and still count as "the current
+    // meeting" when pre-selecting (minutes).
+    "match_window_min": 15,
+    // Per-call timeout (seconds) for the tool-enabled `claude -p`.
+    // Measured: calendar ~20 s, one Notion page ~86 s.
+    "timeout": 180,
+    // Fetch the Notion pages linked in the event description, in the
+    // background DURING recording. That placement is the point: ~86 s is free
+    // against a 30-minute meeting but a visible stall in front of note
+    // generation.
+    "fetch_notion": true
   },
 
   // ── Recording devices ───────────────────────────────────────────────────────
@@ -386,6 +514,18 @@
   },
 
   // ── Text-processing (LLM) provider config ───────────────────────────────────
+  // Fallback chain tried, in order, when the primary LLM provider fails with a
+  // timeout, a non-zero exit, or a usage limit. Applies to TEXT-COMPLETION
+  // calls only: transcript polish, meeting / interview / sharing notes, hotword
+  // extraction and the live-caption batch review.
+  //
+  // Calendar / Notion fetching has its own provider_chain because Claude MCP
+  // and personal Codex need different CLI invocation rules.
+  //
+  // A user-initiated cancel (停止任务) never triggers a fallback.
+  // Set to [] to restore the old behaviour of failing on the first error.
+  "llm_fallback": ["claude"],
+
   "llm": {
     "claude": {
       // claude-cli shells out to the locally installed Claude Code CLI
@@ -394,6 +534,41 @@
       // Optional: pin a specific claude-cli model
       // (empty string = use the CLI's own default).
       "model": ""
+    },
+    "codex_proxy": {
+      // The local Codex CLI (`codex -p proxy exec`), using the proxy profile
+      // in ~/.codex/proxy.config.toml.
+      // Measured: 8.8 s for a trivial prompt and 13.0 s for a real polish
+      // chunk (timestamps stripped, "big query" -> BigQuery, one clean
+      // paragraph) — the same order as `claude -p`. The answer is read from
+      // `-o <file>` because `codex exec` streams agent progress to stdout.
+      "type": "codex-cli",
+      // Primary model for text completion. Keep this explicit so fallback
+      // order does not depend on whichever model the proxy profile selects.
+      "model": "gpt-5.6-sol",
+      // If the selected model is at capacity or its usage is exhausted, try
+      // these models in order.
+      "models": ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"],
+      "profile": "proxy",
+      // Extra command-line arguments, appended verbatim.
+      "args": [],
+      // Its OWN timeout, deliberately shorter than llm_timeout: a fallback
+      // must not hold a worker for the primary's generous budget.
+      // Measured through the proxy: trivial prompt 8.4 s, polish chunk 13 s,
+      // a 5-line caption_review batch 17.2 s — so 300 s is a failure ceiling,
+      // not a working budget.
+      "timeout": 300
+    },
+    "codex_personal": {
+      // Plain `codex exec` using the personal Codex account. Do not change
+      // this to the proxy profile if Calendar / Notion should use personal
+      // MCP connections.
+      "type": "codex-cli",
+      "model": "",
+      "models": [],
+      "profile": "",
+      "args": [],
+      "timeout": 300
     },
     "openai": {
       "type": "openai",
@@ -421,7 +596,15 @@
     // name here to restore auto-detection.
     "multi_output_device_names": [
       "Multi-Output Device", "多输出设备", "多重輸出裝置"
-    ]
+    ],
+    // While recording, watch for apps that play straight into BlackHole
+    // instead of through the Multi-Output (some iPad-style apps land on the
+    // aggregate's clock-master sub-device), which leaves you hearing
+    // nothing. When one is found, BlackHole is forwarded live to your
+    // current headphones / speakers. Checked when recording starts and
+    // whenever CoreAudio reports an app starting, stopping or switching its
+    // output (no polling). macOS 14.2+.
+    "passthrough_bypass": true
   },
 
   // ── Pipeline prompt templates ───────────────────────────────────────────────
@@ -458,8 +641,14 @@
   //
   // Placeholders are case-sensitive literal substitutions; other curly
   // braces do not need escaping. `{transcript}` is the only placeholder
-  // for hotwords_extract / notes_*; polish additionally takes `{hotwords}`
-  // (the current stt.funasr.hotword list, injected automatically);
+  // for hotwords_extract; polish and notes_* additionally take `{hotwords}`
+  // (the current stt.funasr.hotword list, injected automatically — the
+  // notes step needs it to resolve the 【？】 markers polish leaves behind).
+  // With calendar linkage on, polish also takes `{roster}` (the event's
+  // attendees, which is what lets it put real names on [说话人N]) and notes_*
+  // take `{context}` (the linked Notion pages as background). Both render as
+  // 「（无）」 when there is no sidecar, so the prompts work unchanged without
+  // the calendar feature.
   // caption_mt / caption_fix_mt use `{src_lang}` / `{dst_lang}` /
   // `{glossary}` / `{text}` (+ `{context}` for caption_fix_mt) instead.
   // Delete the whole "prompts" block or any single key to fall back to
@@ -473,15 +662,23 @@
       "请在**不改变原意**的前提下：",
       "1. 去掉所有时间戳（如 [00.0s]）",
       "2. 将所有片段合并为连贯的自然段落，按语义分段",
-      "3. 纠正明显的错别字和同音字错误",
+      "3. 纠正明显的错别字和同音字错误；专有名词优先按【术语表】还原，大小写和连写方式照抄表内写法（如 sars → SaaS、拆特ops → ChatOps）",
       "4. 修复错误的断句和标点",
       "5. 删除重复内容——语音识别可能对相邻片段重复识别同一句话，检查前后句子，去掉重复的短语或句子",
-      "6. 无法确定的内容用【？】标注",
-      "7. 如能可靠区分不同发言者，请在段落前标注角色或姓名（如「面试官：」/「候选人：」/「主持人：」/具体姓名）；若无法可靠区分则不要强行标注",
-      "8. 若某行带 [说话人N] 前缀（声纹聚类结果），必须保留发言人区分：同一个 N 视为同一个人，可结合上下文把它替换成姓名或角色（如「说话人2」→「候选人」）；不要把不同 N 合并成一个人，也不要因为整理段落而丢掉发言人标注",
+      "6. 【？】只用于**结合上下文和术语表仍然无法确定**的内容。凡是已经能确定的——尤其是按术语表修正过来的词——直接写正确写法，**不要再加【？】**；一份转写里【？】越少越有价值，满篇都是标记等于没标",
+      "7. 同一个说法在全文只能有一种写法：若同一个词在不同位置被识别成不同的形式，统一成最可能正确的那一个，不要一处 SARS 一处 SaaS",
+      "8. 如能可靠区分不同发言者，请在段落前标注角色或姓名（如「面试官：」/「候选人：」/「主持人：」/具体姓名）；若无法可靠区分则不要强行标注",
+      "9. 若某行带 [说话人N] 前缀（声纹聚类结果），必须保留发言人区分：同一个 N 视为同一个人，可结合上下文把它替换成姓名或角色（如「说话人2」→「候选人」）；不要把不同 N 合并成一个人，也不要因为整理段落而丢掉发言人标注",
       "",
       "【术语表】以下是本场景常出现的专有名词（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）：",
       "{hotwords}",
+      "- 表里的**人名**只用于还原发音高度吻合的整个名字。不要给转写里已经成立的名字补字（「韩磊」不要改成「韩磊磊」），也不要把一串普通词句凑成表里的人名（「下来……继续」不是人名）。拿不准就保留转写原样。",
+      "",
+      "【本场参会人】以下名单来自日历（可能不全，也可能有人没发言）：",
+      "{roster}",
+      "- 转写里与名单中某人发音相近的人名，优先按名单写法还原。",
+      "- 若第 9 条的 [说话人N] 能结合上下文对应到名单里的某个人（例如自我介绍、被别人称呼），就把 [说话人N] 换成那个人的名字；对应不上的保持 [说话人N] 原样，**不要猜**。",
+      "- 名单是参会人，不是发言人：名单里的人不一定说过话，也不要因为名单有 N 个人就硬凑出 N 个说话人。",
       "",
       "只输出整理后的正文，不要解释修改内容。",
       "",
@@ -563,6 +760,27 @@
       "【原文】",
       "{text}"
     ],
+    // Live-caption translation prompt for the HY-MT1.5 backend
+    // (live_captions.mt_provider = "hymt"). This is Tencent's own template
+    // from the model card — HY-MT is a dedicated translation model trained on
+    // this wording, so keep edits minimal. Placeholders: {dst_lang}
+    // (中文/英文), {glossary} (「参考下面的翻译：X 翻译成 X」 block for the
+    // hotwords this line contains, may be empty), {text} (the caption line).
+    "caption_mt_hymt": [
+      "{glossary}将以下文本翻译为{dst_lang}，注意只需要输出翻译后的结果，不要额外解释：",
+      "",
+      "{text}"
+    ],
+    // Contextual variant for the HY-MT backend, used when
+    // live_captions.hymt.context_lines > 0 and there is preceding speech:
+    // the model card's own contextual-translation template. Placeholders:
+    // {glossary}, {context} (previous caption sentences, source language),
+    // {dst_lang}, {text}.
+    "caption_mt_hymt_context": [
+      "{glossary}{context}",
+      "参考上面的信息，把下面的文本翻译成{dst_lang}，注意不需要翻译上文，也不要额外解释：",
+      "{text}"
+    ],
     // Periodic batch re-check of live captions (live_captions.review).
     // Placeholders: {hotwords} (current stt.funasr.hotword list), {lines}
     // (numbered "N ||| 原文 ||| 当前译文"). Output contract parsed by
@@ -576,8 +794,9 @@
       "2. 不要改写语气或风格，不要合并或拆分条目，不要增删内容——条数必须与输入完全一致",
       "3. 人名、产品名、技术术语优先采用术语表中的写法",
       "4. 译文必须与修正后的原文对应：中文原文译成英文，英文原文译成中文；口语化、简洁",
-      "5. 无需修改的条目也要原样输出",
-      "6. 术语和人名的写法必须与【上文】保持一致——同一个词在前文已确定的写法，本批不要再换一种写法",
+      "5. 只有当一整行几乎没有标点、读起来是连成一串时，才在**行内**补上必要的逗号；不要给本来就通顺的行添加或改动标点，也绝不能跨行合并或拆分",
+      "6. 无需修改的条目也要原样输出",
+      "7. 术语和人名的写法必须与【上文】保持一致——同一个词在前文已确定的写法，本批不要再换一种写法",
       "",
       "【术语表】（转写中与其发音相近的错误词请优先修正为表内写法；表内没有的不要强行替换）",
       "{hotwords}",
@@ -599,7 +818,7 @@
         "1. **会议概要** — 2~3 句话概括核心内容",
         "2. **主要议题** — 逐条列出讨论的关键议题",
         "3. **决策事项** — 明确达成的决定或共识，整节合并为一个 `> [!important]` callout 块，条目在块内用列表罗列",
-        "4. **行动项** — 格式：负责人 · 事项 · 截止时间（无明确信息则标\"待确认\"），整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列",
+        "4. **行动项** — 格式：负责人 · 事项 · 截止时间（负责人或截止时间无明确信息则标\"待确认\"），整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列",
         "5. **关键洞察** — 值得记录的重要观点",
         "6. **风险与提醒** — 会议中提到的风险、阻塞点或需特别注意的事项，整节合并为一个 `> [!warning]` callout 块，条目在块内用列表罗列；无则省略本节",
         "",
@@ -607,6 +826,38 @@
         "> [!important]",
         "> - 确定采用方案 B，下季度上线。",
         "> - 数据迁移窗口定在 9 月第一周。",
+        "",
+        "行动项的取材与归属（这一节最容易出错，请严格遵守）：",
+        "- 每条行动项都必须能在转写里找到对应原话。找不到出处的一条都不要写——行动项少是正常的，编出来的不是。",
+        "- 顺口提到的意向或客套（如「我到时候给你过一下」）只有在会上明确约定了要做时才算行动项。",
+        "- 负责人只能是转写里**被明确点名指派**、或**本人明确认领**的人。转写没有说话人标注时，无主语的「我」「他」不得推断成任何具体的人。",
+        "- 定不下负责人就写「待确认」，不要从术语表或参会人名单里挑一个看起来合理的人补上。",
+        "",
+        "【术语表】本场景的专有名词（转写里与之发音或拼写相近的词请统一成表内写法；表内没有的不要强行替换）：",
+        "{hotwords}",
+        "- 术语表是**拼写参照，不是本场人员名单**：里面的人名大多与本场无关。不要用表里的名字去补全转写中没出现的人，也不要给转写里已经成立的名字补字（「韩磊」→「韩磊磊」）。",
+        "",
+        "【本场参会人】以下名单来自本场关联的日程（可能不全，也可能有人没发言；显示为「（无）」时表示没有关联日程，本节规则忽略）：",
+        "{roster}",
+        "- 行动项的负责人一般应出自这份名单。",
+        "- 也确实存在名单外的人被安排事项的情况：只要转写里明确点到了这个人，就照写他的名字，并在负责人后注明「（非参会人，会上被提及）」。",
+        "- 名单是参会人，不是发言人：不要因为某人在名单里就给他安排事项，更不要因为名单有 N 个人就凑出 N 个负责人。",
+        "- 名单内外都对不上，或转写没有明确指派时，负责人写「待确认」。",
+        "",
+        "术语与不确定标记：",
+        "- 转写里的【？】是上一步校对没能确定的内容。只要结合术语表、上下文或转写其他位置的写法能够确定，就直接写确定的写法并**删掉【？】**；只有确实无法确定的才保留标记。",
+        "- 同一个实体全文只用一种写法，不要一处写 SARS、一处写 SaaS。",
+        "",
+        "中文排版：",
+        "- 加粗的引导词后面接说明内容时用冒号：写「**背景：**……」，不要写「**背景。**……」；只有加粗部分本身就是一个完整句子时才用句号。",
+        "- 中文正文只用中文标点：并列用「、」，分句用「；」，句末用「。」，引述原话用「」；不要在中文里使用半角的 \" . ,。",
+        "- 中文与英文单词、数字之间留一个空格。",
+        "",
+        "【会议背景资料】以下内容来自本场日程关联的 Notion 文档，仅供你理解背景、对齐术语和人名：",
+        "{context}",
+        "- 这些是**会前材料，不是会上说过的话**。绝不能把这里的内容写成会议结论、决议或行动项。",
+        "- 只在转写本身提到某件事、而表述残缺或有歧义时，才用它来补全术语写法和上下文。",
+        "- 如果背景资料与转写内容冲突，以**转写**为准。",
         "",
         "用中文输出，格式为 Markdown，简洁清晰。若内容较短或不完整，如实说明。",
         "",
@@ -621,7 +872,7 @@
         "1. **Meeting Summary** — 2–3 sentences summarizing the core content",
         "2. **Key Topics** — list each major topic discussed",
         "3. **Decisions Made** — explicit decisions or consensus reached, merged into one `> [!important]` callout block with a bullet list inside",
-        "4. **Action Items** — format: Owner · Task · Due Date (mark \"TBD\" if unknown), merged into one `> [!tip]` callout block with a bullet list inside",
+        "4. **Action Items** — format: Owner · Task · Due Date (mark \"TBD\" for an owner or a due date the transcript does not settle), merged into one `> [!tip]` callout block with a bullet list inside",
         "5. **Key Insights** — notable observations worth recording",
         "6. **Risks & Reminders** — risks, blockers, or points needing special attention, merged into one `> [!warning]` callout block with a bullet list inside; omit this section if none",
         "",
@@ -629,6 +880,33 @@
         "> [!important]",
         "> - Adopt option B; ship next quarter.",
         "> - Data migration window: first week of September.",
+        "",
+        "Sourcing and ownership of action items (the easiest section to get wrong — follow strictly):",
+        "- Every action item must trace back to actual words in the transcript. If you cannot point to the passage, do not write the item — a short list is normal; an invented one is not.",
+        "- A passing intention or a courtesy (\"I can walk you through it sometime\") counts as an action item only if the session explicitly agreed it would be done.",
+        "- An owner may only be someone the transcript **explicitly assigns** or who **explicitly takes it on**. When the transcript carries no speaker labels, a subjectless \"I\" or \"he\" must not be resolved to any particular person.",
+        "- If the owner cannot be settled, write \"TBD\". Never pick a plausible-looking name out of the glossary or the attendee list.",
+        "",
+        "[Glossary] Domain terms for this session. Normalise transcript words that are near-homophones or misspellings of a glossary entry to the glossary spelling; do not force-replace anything absent from the list:",
+        "{hotwords}",
+        "- The glossary is a **spelling reference, not a roster for this session** — most of the names in it have nothing to do with this meeting. Never use a glossary name to fill in a person the transcript does not mention, and never extend a name the transcript already states (韩磊 → 韩磊磊).",
+        "",
+        "[Attendees] The list below comes from the calendar event linked to this session (it may be incomplete, and some invitees may never have spoken; when it reads \"（无）\" there is no linked event and this section does not apply):",
+        "{roster}",
+        "- An action item's owner should normally come from this list.",
+        "- People outside the list do occasionally get assigned something: where the transcript clearly names such a person, keep their name and append \"（非参会人，会上被提及）\" after it.",
+        "- The list is attendees, not speakers: never assign work to someone merely because they are on it, and never manufacture N owners because the list has N people.",
+        "- When nobody on or off the list can be settled on, and where the transcript makes no explicit assignment, write \"TBD\".",
+        "",
+        "Terminology and uncertainty markers:",
+        "- 【？】 in the transcript marks something the proofreading step could not confirm. Wherever the glossary, the surrounding context, or another passage settles it, write the confirmed form and **drop the marker**; keep 【？】 only where it genuinely stays unresolved.",
+        "- Use one spelling per entity throughout — never SARS in one paragraph and SaaS in another.",
+        "",
+        "[Background material] The following comes from the Notion pages linked to this session's calendar event. Use it only to understand context and to get terminology and names right:",
+        "{context}",
+        "- This is **pre-reading, not something anyone said in the session.** Never report it as a decision, conclusion or action item.",
+        "- Draw on it only where the transcript itself raises a point but states it incompletely or ambiguously.",
+        "- Where the background and the transcript disagree, the **transcript** wins.",
         "",
         "Output in English, Markdown format, concise and clear. If the content is short or incomplete, state so honestly.",
         "",
@@ -657,6 +935,29 @@
         "> - 对分布式事务的回答深入，且有真实生产案例佐证。",
         "> - 主动补充压测数据支撑方案选型。",
         "",
+        "【术语表】本场景的专有名词（转写里与之发音或拼写相近的词请统一成表内写法；表内没有的不要强行替换）：",
+        "{hotwords}",
+        "- 术语表是**拼写参照，不是本场人员名单**：里面的人名大多与本场无关。不要用表里的名字去补全转写中没出现的人，也不要给转写里已经成立的名字补字（「韩磊」→「韩磊磊」）。",
+        "",
+        "【本场参会人】以下名单来自本场关联的日程（可能不全，也可能有人没发言；显示为「（无）」时表示没有关联日程，本节规则忽略）：",
+        "{roster}",
+        "- 只用来核对人名写法。不要因为某人在名单里，就把转写里没有的发言、观点或事项安到他头上。",
+        "",
+        "术语与不确定标记：",
+        "- 转写里的【？】是上一步校对没能确定的内容。只要结合术语表、上下文或转写其他位置的写法能够确定，就直接写确定的写法并**删掉【？】**；只有确实无法确定的才保留标记。",
+        "- 同一个实体全文只用一种写法，不要一处写 SARS、一处写 SaaS。",
+        "",
+        "中文排版：",
+        "- 加粗的引导词后面接说明内容时用冒号：写「**背景：**……」，不要写「**背景。**……」；只有加粗部分本身就是一个完整句子时才用句号。",
+        "- 中文正文只用中文标点：并列用「、」，分句用「；」，句末用「。」，引述原话用「」；不要在中文里使用半角的 \" . ,。",
+        "- 中文与英文单词、数字之间留一个空格。",
+        "",
+        "【会议背景资料】以下内容来自本场日程关联的 Notion 文档，仅供你理解背景、对齐术语和人名：",
+        "{context}",
+        "- 这些是**会前材料，不是会上说过的话**。绝不能把这里的内容写成会议结论、决议或行动项。",
+        "- 只在转写本身提到某件事、而表述残缺或有歧义时，才用它来补全术语写法和上下文。",
+        "- 如果背景资料与转写内容冲突，以**转写**为准。",
+        "",
         "用中文及英文输出，格式为 Markdown，客观专业。若内容较短或不完整，如实说明。",
         "",
         "---",
@@ -682,6 +983,24 @@
         "> - Deep answer on distributed transactions, backed by a real production case.",
         "> - Proactively cited load-test numbers to support the design choice.",
         "",
+        "[Glossary] Domain terms for this session. Normalise transcript words that are near-homophones or misspellings of a glossary entry to the glossary spelling; do not force-replace anything absent from the list:",
+        "{hotwords}",
+        "- The glossary is a **spelling reference, not a roster for this session** — most of the names in it have nothing to do with this session. Never use a glossary name to fill in a person the transcript does not mention, and never extend a name the transcript already states (韩磊 → 韩磊磊).",
+        "",
+        "[Attendees] The list below comes from the calendar event linked to this session (it may be incomplete, and some invitees may never have spoken; when it reads \"（无）\" there is no linked event and this section does not apply):",
+        "{roster}",
+        "- Use it only to get name spellings right. Never attribute a statement, an opinion or a task to someone just because they appear on it.",
+        "",
+        "Terminology and uncertainty markers:",
+        "- 【？】 in the transcript marks something the proofreading step could not confirm. Wherever the glossary, the surrounding context, or another passage settles it, write the confirmed form and **drop the marker**; keep 【？】 only where it genuinely stays unresolved.",
+        "- Use one spelling per entity throughout — never SARS in one paragraph and SaaS in another.",
+        "",
+        "[Background material] The following comes from the Notion pages linked to this session's calendar event. Use it only to understand context and to get terminology and names right:",
+        "{context}",
+        "- This is **pre-reading, not something anyone said in the session.** Never report it as a decision, conclusion or action item.",
+        "- Draw on it only where the transcript itself raises a point but states it incompletely or ambiguously.",
+        "- Where the background and the transcript disagree, the **transcript** wins.",
+        "",
         "Output in English, Markdown format, objective and professional. If the content is short or incomplete, state so honestly.",
         "",
         "---",
@@ -705,20 +1024,20 @@
         "",
         "1. **分享概览** — 2~4 句，说明本次分享的主题、主讲人（如可识别）、整体定位（介绍 / 经验复盘 / 教程 / 案例剖析等）。",
         "2. **分享正文** — **这是本输出最重要的部分**。请按主讲人的讲述顺序，分小节（## 二级标题）忠实重述分享内容：",
-        "   - 保留主讲人提到的具体案例、数字、命令、代码片段、链接、人名、产品名、方法论名称等关键事实，不要为了\"简洁\"而抹掉。",
+        "   - 保留主讲人提到的具体案例、数字、命令、代码片段、链接、人名、产品名、方法论名称等关键事实，不要为了「简洁」而抹掉。",
         "   - 保留逻辑层次：主讲人怎么展开论点的（背景 → 问题 → 方案 → 验证 → 总结），就按那个顺序写。",
-        "   - 用通顺的书面中文重写口语化的表达，但**不要做主观加工或评价**；这是\"详细文字版本\"，不是\"摘要\"。",
+        "   - 用通顺的书面中文重写口语化的表达，但**不要做主观加工或评价**；这是「详细文字版本」，不是「摘要」。",
         "   - 如果分享内容较长，可以拆为多个小节，每节都用 `##` 二级标题。",
         "3. **核心要点** — 用 3~7 条要点列出分享中最重要的结论 / 主张，每条 1~2 句，整节合并为一个 `> [!important]` callout 块，条目在块内用列表罗列。",
-        "4. **最佳实践 / 可复用经验** — 列出主讲人明确推荐的做法、踩过的坑、避免的陷阱，整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列。无则写\"未明确提及\"。",
-        "5. **关键洞察** — 主讲人独到的观点或反直觉的结论；与行业常见做法的差异。无则写\"无\"。",
-        "6. **适用边界 / 前提条件** — 这些经验在什么场景下成立？依赖哪些技术 / 团队规模 / 业务特征？主讲人有没有明确说\"不适用于 X\"？",
-        "7. **风险与权衡** — 主讲人提到的限制、副作用、tradeoff，整节合并为一个 `> [!warning]` callout 块，条目在块内用列表罗列。无则写\"未明确提及\"。",
+        "4. **最佳实践 / 可复用经验** — 列出主讲人明确推荐的做法、踩过的坑、避免的陷阱，整节合并为一个 `> [!tip]` callout 块，条目在块内用列表罗列。无则写「未明确提及」。",
+        "5. **关键洞察** — 主讲人独到的观点或反直觉的结论；与行业常见做法的差异。无则写「无」。",
+        "6. **适用边界 / 前提条件** — 这些经验在什么场景下成立？依赖哪些技术 / 团队规模 / 业务特征？主讲人有没有明确说「不适用于 X」？",
+        "7. **风险与权衡** — 主讲人提到的限制、副作用、tradeoff，整节合并为一个 `> [!warning]` callout 块，条目在块内用列表罗列。无则写「未明确提及」。",
         "8. **问答（Q&A）** — 把听众提问和主讲人回答配对列出。格式：",
         "   - **问 [提问者，如已知]**：……",
         "   - **答 [主讲人，如已知]**：……",
-        "   - 如果某个问题主讲人没有正面回答或当场承认不知道，明确标注\"（未直接回答 / 待跟进）\"。",
-        "   - 若没有问答环节，写\"本次分享未包含问答环节\"。",
+        "   - 如果某个问题主讲人没有正面回答或当场承认不知道，明确标注「（未直接回答 / 待跟进）」。",
+        "   - 若没有问答环节，写「本次分享未包含问答环节」。",
         "9. **行动建议 / 后续动作** — 听众可立即落地的 2~5 条建议；如果分享中提到了延伸阅读 / 工具 / 文档链接，整理在此处。",
         "",
         "callout 语法示例（每节只用一个 callout：标记行 + 列表条目，每行都以 > 开头；不要为每个条目单独开 callout）：",
@@ -728,8 +1047,31 @@
         "",
         "发言者标注规则：",
         "- 如果上一步校对结果里已经标注了角色或姓名（如「主讲人：」「提问者 A：」「张三：」），请在「分享正文」「问答」中**保留这些标注**。",
-        "- 如果转写没有可靠区分发言者，**不要凭空捏造身份**；用\"主讲人\"、\"听众\"这样的通用称呼即可。",
+        "- 如果转写没有可靠区分发言者，**不要凭空捏造身份**；用「主讲人」「听众」这样的通用称呼即可。",
         "- 多位主讲人时分别标注，不要混为一谈。",
+        "",
+        "【术语表】本场景的专有名词（转写里与之发音或拼写相近的词请统一成表内写法；表内没有的不要强行替换）：",
+        "{hotwords}",
+        "- 术语表是**拼写参照，不是本场人员名单**：里面的人名大多与本场无关。不要用表里的名字去补全转写中没出现的人，也不要给转写里已经成立的名字补字（「韩磊」→「韩磊磊」）。",
+        "",
+        "【本场参会人】以下名单来自本场关联的日程（可能不全，也可能有人没发言；显示为「（无）」时表示没有关联日程，本节规则忽略）：",
+        "{roster}",
+        "- 只用来核对人名写法。不要因为某人在名单里，就把转写里没有的发言、观点或事项安到他头上。",
+        "",
+        "术语与不确定标记：",
+        "- 转写里的【？】是上一步校对没能确定的内容。只要结合术语表、上下文或转写其他位置的写法能够确定，就直接写确定的写法并**删掉【？】**；只有确实无法确定的才保留标记。技术分享里的通用词（Redis、VPN、CI、GitHub、prompt、endpoint 等）不需要标记。",
+        "- 同一个实体全文只用一种写法，不要一处写 SARS、一处写 SaaS。",
+        "",
+        "中文排版：",
+        "- 加粗的引导词后面接说明内容时用冒号：写「**背景：**……」，不要写「**背景。**……」；只有加粗部分本身就是一个完整句子时才用句号。",
+        "- 中文正文只用中文标点：并列用「、」，分句用「；」，句末用「。」，引述原话用「」；不要在中文里使用半角的 \" . ,。",
+        "- 中文与英文单词、数字之间留一个空格。",
+        "",
+        "【会议背景资料】以下内容来自本场日程关联的 Notion 文档，仅供你理解背景、对齐术语和人名：",
+        "{context}",
+        "- 这些是**会前材料，不是会上说过的话**。绝不能把这里的内容写成会议结论、决议或行动项。",
+        "- 只在转写本身提到某件事、而表述残缺或有歧义时，才用它来补全术语写法和上下文。",
+        "- 如果背景资料与转写内容冲突，以**转写**为准。",
         "",
         "输出语言：中文。Markdown 格式，专业、客观。若转写较短、不完整或没有问答，如实在对应小节里说明。",
         "",
@@ -769,6 +1111,24 @@
         "- If the polish step already labelled segments (e.g. \"Presenter:\", \"Audience member A:\", a specific name), **preserve those labels** in both the Walkthrough and the Q&A.",
         "- If the transcript does not reliably distinguish speakers, do **not** invent identities. Use generic terms like \"presenter\" and \"audience member\".",
         "- For multi-presenter talks, attribute each segment to the correct presenter; do not blend their voices.",
+        "",
+        "[Glossary] Domain terms for this session. Normalise transcript words that are near-homophones or misspellings of a glossary entry to the glossary spelling; do not force-replace anything absent from the list:",
+        "{hotwords}",
+        "- The glossary is a **spelling reference, not a roster for this session** — most of the names in it have nothing to do with this session. Never use a glossary name to fill in a person the transcript does not mention, and never extend a name the transcript already states (韩磊 → 韩磊磊).",
+        "",
+        "[Attendees] The list below comes from the calendar event linked to this session (it may be incomplete, and some invitees may never have spoken; when it reads \"（无）\" there is no linked event and this section does not apply):",
+        "{roster}",
+        "- Use it only to get name spellings right. Never attribute a statement, an opinion or a task to someone just because they appear on it.",
+        "",
+        "Terminology and uncertainty markers:",
+        "- 【？】 in the transcript marks something the proofreading step could not confirm. Wherever the glossary, the surrounding context, or another passage settles it, write the confirmed form and **drop the marker**; keep 【？】 only where it genuinely stays unresolved. Everyday technical vocabulary (Redis, VPN, CI, GitHub, prompt, endpoint …) needs no marker.",
+        "- Use one spelling per entity throughout — never SARS in one paragraph and SaaS in another.",
+        "",
+        "[Background material] The following comes from the Notion pages linked to this session's calendar event. Use it only to understand context and to get terminology and names right:",
+        "{context}",
+        "- This is **pre-reading, not something anyone said in the session.** Never report it as a decision, conclusion or action item.",
+        "- Draw on it only where the transcript itself raises a point but states it incompletely or ambiguously.",
+        "- Where the background and the transcript disagree, the **transcript** wins.",
         "",
         "Output language: English. Markdown format, professional and objective. If the transcript is short, incomplete, or has no Q&A, say so honestly in the relevant section.",
         "",

@@ -211,6 +211,32 @@ class TestMultiStreamRecorderSave:
         with wave.open(str(path)) as wf:
             assert wf.getnframes() == 3000
 
+    @pytest.mark.parametrize("block", [7, 100, 4800, 10_000])
+    def test_streamed_blocks_match_whole_array_conversion(self, tmp_path,
+                                                          monkeypatch, block):
+        """save() streams in blocks so a long recording never materialises
+        whole-session float copies (~7.5 GB at 83 min). The bytes must not
+        depend on where the block boundaries fall."""
+        monkeypatch.setattr(ms.MultiStreamRecorder, "_SAVE_BLOCK_FRAMES", block)
+        rng = np.random.default_rng(1)
+        sys_chunks = [rng.uniform(-1.5, 1.5, (n, 2)).astype(np.float32)
+                      for n in (480, 333, 480, 17)]
+        mic_chunks = [rng.uniform(-1.5, 1.5, (n, 1)).astype(np.float32)
+                      for n in (480, 480, 200)]
+        rec = ms.MultiStreamRecorder(["sys", "mic"], 48000, role_labels=["system", "mic"])
+        rec._frames = {"sys": list(sys_chunks), "mic": list(mic_chunks)}
+        path = tmp_path / "out.wav"
+        assert rec.save(path) is True
+        left = np.concatenate(sys_chunks).mean(axis=1)
+        right = np.concatenate(mic_chunks)[:, 0]
+        n = min(len(left), len(right))
+        want = (np.clip(np.column_stack([left[:n], right[:n]]), -1.0, 1.0)
+                * 32767).astype(np.int16)
+        with wave.open(str(path)) as wf:
+            assert wf.getnframes() == n
+            got = np.frombuffer(wf.readframes(n), dtype=np.int16).reshape(-1, 2)
+        assert np.array_equal(got, want)
+
 
 # ── MultiStreamRecorder.stop ──────────────────────────────────────────────────
 
@@ -950,12 +976,17 @@ class TestLlmClaudeCli:
         with patch("meetingscribe.subprocess.Popen", return_value=proc):
             assert ms._llm_claude_cli("p", "lbl", 60) == "result"
 
-    def test_command_not_found_exits(self):
-        with patch("meetingscribe.subprocess.Popen", side_effect=FileNotFoundError()):
-            with pytest.raises(SystemExit):
-                ms._llm_claude_cli("p", "lbl", 60)
+    # Failures raise `_LLMCallFailed` rather than exiting the process, which
+    # is what lets `_llm_run` walk its fallback chain; `kind` is asserted
+    # because the log line and the "切换到 X" message are keyed off it.
 
-    def test_timeout_exits(self):
+    def test_command_not_found_is_classified_missing(self):
+        with patch("meetingscribe.subprocess.Popen", side_effect=FileNotFoundError()):
+            with pytest.raises(ms._LLMCallFailed) as exc:
+                ms._llm_claude_cli("p", "lbl", 60)
+        assert exc.value.kind == "missing"
+
+    def test_timeout_is_classified_timeout(self):
         # On timeout the helper kills the proc and calls communicate() a
         # second time to drain pipes — that second call must return
         # normally, so use an iterable side_effect.
@@ -965,14 +996,16 @@ class TestLlmClaudeCli:
             ("", ""),
         ]
         with patch("meetingscribe.subprocess.Popen", return_value=proc):
-            with pytest.raises(SystemExit):
+            with pytest.raises(ms._LLMCallFailed) as exc:
                 ms._llm_claude_cli("p", "lbl", 60)
+        assert exc.value.kind == "timeout"
 
-    def test_nonzero_returncode_exits(self):
+    def test_nonzero_returncode_is_classified_error(self):
         proc = self._popen_mock(stderr="error", returncode=1)
         with patch("meetingscribe.subprocess.Popen", return_value=proc):
-            with pytest.raises(SystemExit):
+            with pytest.raises(ms._LLMCallFailed) as exc:
                 ms._llm_claude_cli("p", "lbl", 60)
+        assert exc.value.kind == "error"
 
     def test_cancel_after_kill_raises_pipeline_cancelled(self):
         # Simulate the cancellation path: `_pipeline_kill_popens()` SIGKILLs
@@ -1012,33 +1045,37 @@ class TestLlmOpenai:
         with patch("urllib.request.urlopen", return_value=_url_mock(body)):
             assert ms._llm_openai("p", self._pcfg, "lbl", 60) == "hi"
 
-    def test_empty_choices_list_exits(self):
-        body = json.dumps({"choices": []}).encode()
-        with patch("urllib.request.urlopen", return_value=_url_mock(body)):
-            with pytest.raises(SystemExit):
-                ms._llm_openai("p", self._pcfg, "lbl", 60)
+    # HTTP providers raise `_LLMCallFailed` for the same reason the CLI ones
+    # do — a 429 with `llm_fallback` configured used to kill the process
+    # instead of switching providers.
 
-    def test_invalid_json_exits(self):
-        with patch("urllib.request.urlopen", return_value=_url_mock(b"not json")):
-            with pytest.raises(SystemExit):
+    def _kind(self, side_effect=None, body=None):
+        kwargs = ({"side_effect": side_effect} if side_effect is not None
+                  else {"return_value": _url_mock(body)})
+        with patch("urllib.request.urlopen", **kwargs):
+            with pytest.raises(ms._LLMCallFailed) as exc:
                 ms._llm_openai("p", self._pcfg, "lbl", 60)
+        return exc.value.kind
 
-    def test_http_error_exits(self):
-        with patch("urllib.request.urlopen", side_effect=_http_error(401)):
-            with pytest.raises(SystemExit):
-                ms._llm_openai("p", self._pcfg, "lbl", 60)
+    def test_empty_choices_list_is_error(self):
+        assert self._kind(body=json.dumps({"choices": []}).encode()) == "error"
 
-    def test_url_timeout_exits(self):
+    def test_invalid_json_is_error(self):
+        assert self._kind(body=b"not json") == "error"
+
+    def test_http_error_is_error(self):
+        assert self._kind(side_effect=_http_error(401)) == "error"
+
+    def test_http_429_is_quota_so_the_fallback_gets_a_turn(self):
+        assert self._kind(side_effect=_http_error(429)) == "quota"
+
+    def test_url_timeout_is_timeout(self):
         err = urllib.error.URLError(TimeoutError("timed out"))
-        with patch("urllib.request.urlopen", side_effect=err):
-            with pytest.raises(SystemExit):
-                ms._llm_openai("p", self._pcfg, "lbl", 60)
+        assert self._kind(side_effect=err) == "timeout"
 
-    def test_url_network_error_exits(self):
+    def test_url_network_error_is_error(self):
         err = urllib.error.URLError("connection refused")
-        with patch("urllib.request.urlopen", side_effect=err):
-            with pytest.raises(SystemExit):
-                ms._llm_openai("p", self._pcfg, "lbl", 60)
+        assert self._kind(side_effect=err) == "error"
 
 
 # ── _llm_gemini ───────────────────────────────────────────────────────────────
@@ -1050,27 +1087,29 @@ class TestLlmGemini:
         with patch("urllib.request.urlopen", return_value=_url_mock(_gemini_body("ok"))):
             assert ms._llm_gemini("p", self._pcfg, "lbl", 60) == "ok"
 
-    def test_empty_candidates_exits(self):
-        body = json.dumps({"candidates": []}).encode()
-        with patch("urllib.request.urlopen", return_value=_url_mock(body)):
-            with pytest.raises(SystemExit):
+    def _kind(self, side_effect=None, body=None):
+        kwargs = ({"side_effect": side_effect} if side_effect is not None
+                  else {"return_value": _url_mock(body)})
+        with patch("urllib.request.urlopen", **kwargs):
+            with pytest.raises(ms._LLMCallFailed) as exc:
                 ms._llm_gemini("p", self._pcfg, "lbl", 60)
+        return exc.value.kind
 
-    def test_invalid_json_exits(self):
-        with patch("urllib.request.urlopen", return_value=_url_mock(b"!!")):
-            with pytest.raises(SystemExit):
-                ms._llm_gemini("p", self._pcfg, "lbl", 60)
+    def test_empty_candidates_is_error(self):
+        assert self._kind(body=json.dumps({"candidates": []}).encode()) == "error"
 
-    def test_http_error_exits(self):
-        with patch("urllib.request.urlopen", side_effect=_http_error(403)):
-            with pytest.raises(SystemExit):
-                ms._llm_gemini("p", self._pcfg, "lbl", 60)
+    def test_invalid_json_is_error(self):
+        assert self._kind(body=b"!!") == "error"
 
-    def test_url_error_exits(self):
+    def test_http_error_is_error(self):
+        assert self._kind(side_effect=_http_error(403)) == "error"
+
+    def test_http_429_is_quota(self):
+        assert self._kind(side_effect=_http_error(429)) == "quota"
+
+    def test_url_error_is_error(self):
         err = urllib.error.URLError("network error")
-        with patch("urllib.request.urlopen", side_effect=err):
-            with pytest.raises(SystemExit):
-                ms._llm_gemini("p", self._pcfg, "lbl", 60)
+        assert self._kind(side_effect=err) == "error"
 
 
 # ── _transcribe_openai ────────────────────────────────────────────────────────
@@ -2173,6 +2212,75 @@ class TestSplitMeetingStem:
         assert ms._split_meeting_stem("randomname") == (None, None)
         assert ms._split_meeting_stem("not_a_timestamp.foo") == (None, None)
         assert ms._split_meeting_stem("") == (None, None)
+
+
+class TestScanMeetingArtifacts:
+    def test_keeps_history_when_audio_was_deleted(self, tmp_path):
+        stem = "20260902_133821.Nova AI 运维体系建设"
+        meeting = tmp_path / f"{stem}.meeting.md"
+        polish = tmp_path / f"{stem}.polish.txt"
+        raw = tmp_path / f"{stem}.raw.txt"
+        meeting.write_text("notes", encoding="utf-8")
+        polish.write_text("polished", encoding="utf-8")
+        raw.write_text("raw", encoding="utf-8")
+        (tmp_path / "not-a-meeting.meeting.md").write_text("ignore")
+
+        records = ms._scan_meeting_artifacts(tmp_path)
+
+        assert len(records) == 1
+        record = records[0]
+        assert record["stem"] == stem
+        assert record["audio_exists"] is False
+        assert record["wav_path"] == tmp_path / f"{stem}.wav"
+        assert record["meeting_md_path"] == meeting
+        assert record["polish_path"] == polish
+        assert record["raw_path"] == raw
+        assert record["has_md"] is True
+        assert record["has_polish"] is True
+        assert record["has_raw"] is True
+
+    def test_groups_audio_and_all_supported_artifacts(self, tmp_path):
+        stem = "20260902_133821"
+        _make_wav(tmp_path / f"{stem}.wav")
+        for suffix in (".meeting.md", ".interview.md", ".sharing.md",
+                       ".meta.json"):
+            (tmp_path / f"{stem}{suffix}").write_text("x", encoding="utf-8")
+
+        records = ms._scan_meeting_artifacts(tmp_path)
+
+        assert len(records) == 1
+        assert records[0]["audio_exists"] is True
+        assert records[0]["meeting_md_path"].name == f"{stem}.meeting.md"
+        assert records[0]["interview_md_path"].name == f"{stem}.interview.md"
+        assert records[0]["sharing_md_path"].name == f"{stem}.sharing.md"
+
+
+class TestArtifactOnlyMeetingFiles:
+    def test_can_rename_surviving_artifacts_without_audio(self, tmp_path):
+        stem = "20260902_133821"
+        raw = tmp_path / f"{stem}.raw.txt"
+        notes = tmp_path / f"{stem}.meeting.md"
+        raw.write_text("raw", encoding="utf-8")
+        notes.write_text("notes", encoding="utf-8")
+
+        new_wav = ms._rename_meeting_files(tmp_path / f"{stem}.wav", "运维体系建设")
+
+        assert new_wav == tmp_path / f"{stem}.运维体系建设.wav"
+        assert (tmp_path / f"{stem}.运维体系建设.raw.txt").exists()
+        assert (tmp_path / f"{stem}.运维体系建设.meeting.md").exists()
+        assert not raw.exists()
+        assert not notes.exists()
+
+    def test_can_delete_surviving_artifacts_without_audio(self, tmp_path):
+        stem = "20260902_133821"
+        (tmp_path / f"{stem}.meeting.md").write_text("notes")
+        (tmp_path / f"{stem}.polish.txt").write_text("polished")
+
+        deleted, errors = ms._delete_meeting_files(tmp_path / f"{stem}.wav")
+
+        assert deleted == 2
+        assert errors == []
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestSanitizeMeetingCustomName:

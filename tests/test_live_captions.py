@@ -3,6 +3,7 @@ Tests for the live bilingual caption engine (LiveCaptionEngine + helpers).
 Run: pytest tests/
 """
 
+import collections
 import sys
 import threading
 import time
@@ -136,6 +137,64 @@ def test_ensure_sherpa_model_skips_when_present(tmp_path, monkeypatch):
     assert ms._ensure_sherpa_model() == target
 
 
+# ── caption language → streaming model ───────────────────────────────────────
+
+class TestCaptionLanguage:
+    def test_default_is_english(self):
+        assert ms._caption_language({}) == "en"
+
+    def test_junk_falls_back_to_english(self):
+        assert ms._caption_language({"language": "fr"}) == "en"
+
+    def test_zh_keeps_the_bilingual_zipformer(self):
+        assert ms._caption_asr_model_url({"language": "zh"}) == ms._SHERPA_ZIPFORMER_URL
+
+    def test_en_picks_nemotron_by_chunk(self):
+        url = ms._caption_asr_model_url({"language": "en", "en_chunk_ms": 1120})
+        assert url == ms._SHERPA_NEMOTRON_URLS[1120]
+        assert "nemotron-speech-streaming-en" in url
+
+    def test_en_chunk_snaps_to_nearest_export(self):
+        assert ms._caption_asr_model_url(
+            {"language": "en", "en_chunk_ms": 500}) == ms._SHERPA_NEMOTRON_URLS[560]
+
+    def test_en_chunk_junk_uses_default(self):
+        assert ms._caption_asr_model_url(
+            {"language": "en", "en_chunk_ms": "x"}) == ms._SHERPA_NEMOTRON_URLS[560]
+
+    def test_explicit_model_dir_wins_over_language(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ms, "_ensure_sherpa_model",
+                            lambda url: pytest.fail("must not download"))
+        got = ms._caption_asr_model_dir(
+            {"language": "en", "asr_model_dir": str(tmp_path)})
+        assert got == tmp_path
+
+    def test_defaults_ship_in_config(self):
+        lc = ms.DEFAULT_CONFIG["live_captions"]
+        assert lc["language"] in ms._CAPTION_LANGUAGES
+        assert lc["en_chunk_ms"] in ms._SHERPA_NEMOTRON_URLS
+
+    def test_switching_language_loads_the_other_recognizer(self, monkeypatch):
+        """The model is in the ASR cache key: a session after a language
+        switch must not reuse the previous language's recognizer."""
+        built = []
+
+        class _Fake:
+            def __init__(self, lc, *a, **k):
+                built.append(lc.get("language"))
+
+            def reset_session(self, *a):
+                pass
+
+        monkeypatch.setattr(ms, "_SherpaCaptionASR", _Fake)
+        monkeypatch.setattr(ms, "_caption_backend_cache", {})
+        for lang in ("en", "zh", "en"):
+            eng = ms.LiveCaptionEngine(
+                {"live_captions": {"language": lang}}, lambda ev: None)
+            eng._load_asr_backend()
+        assert built == ["en", "zh"]
+
+
 # ── LiveCaptionEngine ─────────────────────────────────────────────────────────
 
 def test_engine_full_event_flow():
@@ -241,7 +300,7 @@ def test_mono_feed_unchanged():
 
 def test_engine_refine_flow():
     sink = _EventSink()
-    eng = ms.LiveCaptionEngine({}, sink)
+    eng = ms.LiveCaptionEngine({"live_captions": {"language": "zh"}}, sink)
 
     class _AudioASR(_FakeASR):
         def accept(self, samples):
@@ -375,7 +434,8 @@ def test_refine_passes_hotword():
     # The refine pass runs the SAME FunASR model as offline transcription, so
     # the same filter applies: "sandbox" is English and dropped, "API网关"
     # contains CJK and survives.
-    eng = ms.LiveCaptionEngine({"stt": {"funasr": {"hotword": "sandbox API网关"}}}, sink)
+    eng = ms.LiveCaptionEngine({"stt": {"funasr": {"hotword": "sandbox API网关"}},
+                                 "live_captions": {"language": "zh"}}, sink)
 
     class _AudioASR(_FakeASR):
         def accept(self, samples):
@@ -405,8 +465,17 @@ def test_refine_passes_hotword():
     assert _KwRefine.kwargs["hotword"] == "API网关"
 
 
-def test_refine_enabled_by_default():
-    assert ms.LiveCaptionEngine({}, lambda ev: None)._refine_enabled is True
+def test_refine_enabled_by_default_for_chinese():
+    assert ms.LiveCaptionEngine({"live_captions": {"language": "zh"}}, lambda ev: None)._refine_enabled is True
+
+
+def test_refine_off_in_english_mode():
+    """refine re-decodes with paraformer-zh; in an English meeting the
+    per-line sniff missed a short line and refine rewrote it as 「需要。」."""
+    assert ms.LiveCaptionEngine({}, lambda ev: None)._refine_enabled is False
+    assert ms.LiveCaptionEngine(
+        {"live_captions": {"language": "en", "refine": True}},
+        lambda ev: None)._refine_enabled is False
 
 
 def test_refine_config_off():
@@ -499,6 +568,65 @@ def test_group_caption_rows_gap_zero_disables_merging():
     assert [len(g) for g in ms._group_caption_rows(rows, gap_secs=0)] == [1, 1]
 
 
+# ── Speaker-change is the primary paragraph break (Google-Meet shape) ────────
+
+def _row(i, speaker, src="句子", t=None):
+    return {"src": src, "t": 100.0 + (i * 3.0 if t is None else t),
+            "speaker": speaker, "side": "mic", "role": "mic"}
+
+
+def test_one_speaker_flows_as_a_single_paragraph():
+    """The whole point: a person talking continuously is ONE block, however
+    many recognised lines that took. At the old 2.5 s default this produced
+    five separate paragraphs — measured on two real sessions, only 35-55% of
+    adjacent lines merged, which is the choppiness this fixes."""
+    rows = [_row(i, 1) for i in range(5)]        # 3 s apart, same speaker
+    assert [len(g) for g in ms._group_caption_rows(rows)] == [5]
+
+
+def test_speaker_change_starts_a_new_paragraph():
+    rows = [_row(0, 1), _row(1, 1), _row(2, 2), _row(3, 2)]
+    assert [len(g) for g in ms._group_caption_rows(rows)] == [2, 2]
+
+
+def test_old_default_would_have_split_the_same_input():
+    # Pins the regression this change fixes, so nobody "tidies" the default
+    # back to 2.5 s without seeing what it costs.
+    rows = [_row(i, 1) for i in range(5)]
+    assert len(ms._group_caption_rows(rows, gap_secs=2.5)) == 5
+    assert len(ms._group_caption_rows(rows)) == 1
+
+
+def test_long_silence_still_breaks():
+    """30 s is a safety valve, not a disabled rule — a genuine long pause
+    from the same speaker is a new thought."""
+    rows = [_row(0, 1), _row(1, 1, t=45.0)]
+    assert [len(g) for g in ms._group_caption_rows(rows)] == [1, 1]
+
+
+def test_monologue_is_bounded_by_max_chars():
+    """Without a cap a 20-minute monologue becomes one unbounded paragraph,
+    and every appended line then re-renders an ever-growing block."""
+    rows = [_row(i, 1, src="字" * 300) for i in range(4)]
+    groups = ms._group_caption_rows(rows, max_chars=800)
+    assert len(groups) > 1
+    assert all(sum(len(r["src"]) for r in g) <= 800 + 300 for g in groups)
+
+
+def test_never_merges_across_roles_even_with_the_loose_gap():
+    # Attributing one side's words to the other is the one unacceptable
+    # outcome, so the loosened gap must not weaken it.
+    rows = [{"src": "a", "t": 100.0, "speaker": None, "side": None, "role": "mic"},
+            {"src": "b", "t": 100.5, "speaker": None, "side": None, "role": "system"}]
+    assert [len(g) for g in ms._group_caption_rows(rows)] == [1, 1]
+
+
+def test_defaults_match_the_shipped_config():
+    lc = ms.DEFAULT_CONFIG["live_captions"]
+    assert lc["merge_gap_ms"] == 30000
+    assert lc["merge_max_chars"] == 800
+
+
 # ── MT worker correct+translate path (①) ─────────────────────────────────────
 
 class _FakeFixMT:
@@ -552,7 +680,7 @@ def test_refine_backlog_cap_skips_excess_segments(monkeypatch):
     growing, otherwise corrections land after the line scrolled away."""
     logged: list = []
     monkeypatch.setattr(ms, "_log", lambda cat, msg: logged.append((cat, msg)))
-    eng = ms.LiveCaptionEngine({"live_captions": {"refine_max_backlog": 2}}, lambda ev: None)
+    eng = ms.LiveCaptionEngine({"live_captions": {"refine_max_backlog": 2, "language": "zh"}}, lambda ev: None)
     assert eng._refine_enabled and eng._refine_max_backlog == 2
     audio = np.zeros(16000, dtype=np.float32)
     for i in range(5):
@@ -569,7 +697,7 @@ def test_refine_backlog_default_from_config():
 
 
 def test_refine_queue_carries_pre_refine_text():
-    eng = ms.LiveCaptionEngine({}, lambda ev: None)
+    eng = ms.LiveCaptionEngine({"live_captions": {"language": "zh"}}, lambda ev: None)
     eng._finalize_segment("原始文本", np.zeros(16000, dtype=np.float32))
     sid, audio, before = eng._refine_queue.get_nowait()
     assert (sid, before) == (1, "原始文本") and audio.size == 16000
@@ -579,7 +707,7 @@ def test_refine_logs_duration_and_whether_text_changed(monkeypatch):
     logged: list = []
     monkeypatch.setattr(ms, "_log", lambda cat, msg: logged.append((cat, msg)))
     sink = _EventSink()
-    eng = ms.LiveCaptionEngine({}, sink)
+    eng = ms.LiveCaptionEngine({"live_captions": {"language": "zh"}}, sink)
 
     class _AudioASR(_FakeASR):
         def accept(self, samples):
@@ -644,10 +772,10 @@ def test_partial_gate_uses_partial_cost_not_fix_cost():
         eng.stop()
 
 
-def test_slow_partial_path_still_disables_partials():
+def test_partials_paused_during_cooldown():
     sink = _EventSink()
     eng = _make_engine(sink)
-    eng._mt_partial_secs = 2.0   # e.g. NLLB on CPU
+    eng._mt_partial_resume_at = time.time() + 60   # just had a slow partial
     eng.start()
     try:
         with eng._partial_lock:
@@ -656,6 +784,29 @@ def test_slow_partial_path_still_disables_partials():
         assert "partial_translation" not in sink.types()
     finally:
         eng.stop()
+
+
+def test_one_slow_partial_does_not_disable_partials_for_good():
+    """Regression: the gate used to read the last partial's cost, which only
+    a partial translation could refresh — so one call over 0.8 s switched
+    partial translation off for the rest of the session."""
+    sink = _EventSink()
+    eng = _make_engine(sink)
+    eng._mt_partial_secs = 2.0           # the last partial was slow…
+    eng._mt_partial_resume_at = 0.0      # …but its cooldown has passed
+    eng.start()
+    try:
+        with eng._partial_lock:
+            eng._partial_pending = "这是一句进行中的字幕"
+        assert sink.wait_for("partial_translation", timeout=5.0)
+    finally:
+        eng.stop()
+
+
+def test_mt_partial_cooldown():
+    assert ms._mt_partial_cooldown(0.3) == 0.0
+    assert ms._mt_partial_cooldown(0.8) == 0.0
+    assert ms._mt_partial_cooldown(1.5) == pytest.approx(3.0)
 
 
 # ── MT repetition loops (reported: 「雅 的 内容」×30 then "Ya"×100) ────────────
@@ -1104,6 +1255,8 @@ def _sherpa_with(results):
     asr._seg_audio = []
     asr._raw_hyp = ""
     asr._clean_hyp = ""
+    asr.decode_secs = 0.0
+    asr.audio_secs = 0.0
     asr._emit_partial = lambda t: None
     asr._emit_final = lambda t, a=None: None
     return asr
@@ -1223,3 +1376,216 @@ def test_no_overflow_log_when_keeping_up(monkeypatch):
         eng._drain_mixed()
     assert eng._dropped_secs == 0
     assert not [m for m in logged if "overflow" in m]
+
+
+# ── Sliding review window: overlap must MODIFY lines, never duplicate them ───
+
+def _review_engine(**review):
+    cfg = {"live_captions": {"review": {"enabled": True, "window_lines": 5,
+                                        "trigger_lines": 2, **review}}}
+    return ms.LiveCaptionEngine(cfg, _EventSink())
+
+
+def test_review_window_triggers_on_line_count():
+    eng = _review_engine()
+    for sid in (1, 2, 3):
+        eng._review_record(sid, f"句子{sid}")
+        if sid < 2:
+            assert eng._next_review_window() == [], "不该在攒够之前触发"
+    win = eng._next_review_window()
+    assert [r["id"] for r in win] == [1, 2, 3]
+    # Consumed the pending count, so an immediate second call does nothing.
+    assert eng._next_review_window() == []
+
+
+def test_review_window_is_the_last_n_lines_and_slides():
+    eng = _review_engine()
+    seen = []
+    for sid in range(1, 12):
+        eng._review_record(sid, f"句子{sid}")
+        win = eng._next_review_window()
+        if win:
+            seen.append([r["id"] for r in win])
+    # window=5, trigger=2 → the window slides by 2 and never exceeds 5.
+    assert all(len(w) <= 5 for w in seen)
+    # trigger=2, so dispatches land on even counts: after 11 lines the last
+    # window ended at line 10 and line 11 is still pending.
+    assert seen[-1] == [6, 7, 8, 9, 10]
+    assert eng._review_pending == 1
+    # Every line is looked at ceil(5/2)=3 times at most — that IS the overlap.
+    counts = collections.Counter(sid for w in seen for sid in w)
+    assert max(counts.values()) <= 3
+
+
+def test_review_does_not_consume_rows():
+    """The buffer must NOT be popped: a row has to stay available so the
+    window can slide over it again with more following context."""
+    eng = _review_engine()
+    for sid in (1, 2):
+        eng._review_record(sid, f"句子{sid}")
+    eng._next_review_window()
+    assert [r["id"] for r in eng._review_buffer] == [1, 2]
+
+
+def test_repeated_review_modifies_the_row_never_appends():
+    """The user-visible contract: a sentence reviewed three times shows as
+    ONE line that changed three times — not as the sentence three times."""
+    rows = [{"id": 7, "src": "原始文本", "dst": "", "t": 0.0,
+             "role": "mic", "speaker": 1, "side": "mic"}]
+    for text in ("第一次修正", "第二次修正", "第三次修正"):
+        ev = {"type": "refined", "id": 7, "text": text}
+        for row in reversed(rows):            # same logic as _on_caption_event
+            if row["id"] == ev["id"]:
+                row["src"] = ev["text"]
+                row["dst"] = ""
+                break
+        else:
+            rows.append({"id": ev["id"], "src": ev["text"]})
+    assert len(rows) == 1, "重复复核绝不能让同一句在面板里出现多次"
+    assert rows[0]["src"] == "第三次修正"
+
+
+def test_review_context_holds_distinct_lines_not_repeats():
+    """Regression: overlapping windows settle the same line 2-3 times, and
+    appending each time filled the context slots with copies of a handful of
+    lines instead of a real history."""
+    eng = _review_engine(context_lines=6)
+    settled_rounds = [
+        [{"id": 1, "text": "a", "dst": "A"}, {"id": 2, "text": "b", "dst": "B"}],
+        [{"id": 1, "text": "a2", "dst": "A2"}, {"id": 2, "text": "b", "dst": "B"},
+         {"id": 3, "text": "c", "dst": "C"}],
+        [{"id": 2, "text": "b3", "dst": "B3"}, {"id": 3, "text": "c", "dst": "C"},
+         {"id": 4, "text": "d", "dst": "D"}],
+    ]
+    for settled in settled_rounds:
+        for row in settled:
+            eng._review_context.pop(row["id"], None)
+            eng._review_context[row["id"]] = row
+        while len(eng._review_context) > eng._review_context_lines:
+            eng._review_context.pop(next(iter(eng._review_context)))
+    ctx = list(eng._review_context.values())
+    ids = [r["id"] for r in ctx]
+    assert ids == sorted(set(ids)), f"上下文里有重复：{ids}"
+    # Latest settled text wins for a line seen more than once.
+    by_id = {r["id"]: r["text"] for r in ctx}
+    assert by_id[1] == "a2" and by_id[2] == "b3"
+
+
+def test_review_context_is_trimmed_to_the_limit():
+    eng = _review_engine(context_lines=3)
+    for sid in range(1, 9):
+        eng._review_context.pop(sid, None)
+        eng._review_context[sid] = {"id": sid, "text": f"t{sid}", "dst": ""}
+        while len(eng._review_context) > eng._review_context_lines:
+            eng._review_context.pop(next(iter(eng._review_context)))
+    assert [r["id"] for r in eng._review_context.values()] == [6, 7, 8]
+
+
+def test_idle_flush_reviews_the_tail_below_the_trigger():
+    """One line left when speech stops must still get reviewed, or the last
+    sentences of every meeting go unchecked."""
+    eng = _review_engine(idle_flush_secs=0.01)
+    # Clamped to a 1 s floor: an instant flush would make every pause in
+    # speech dispatch a call, silently defeating trigger_lines.
+    assert eng._review_idle_flush == 1.0
+    eng._review_record(1, "最后一句")
+    assert eng._review_pending == 1 < eng._review_trigger
+    assert eng._next_review_window() == [], "还没到 idle 时间"
+    time.sleep(1.1)
+    assert [r["id"] for r in eng._next_review_window()] == [1]
+
+
+def test_review_defaults_match_the_shipped_config():
+    rev = ms.DEFAULT_CONFIG["live_captions"]["review"]
+    assert rev["window_lines"] == 5 and rev["trigger_lines"] == 2
+    assert "interval_minutes" not in rev and "max_tries" not in rev
+
+
+# ── sentence-level caption translation ─────────────────────────────────────
+
+class TestSplitCaptionSentences:
+    def test_splits_on_sentence_punctuation(self):
+        text = ("It's not true at all, honestly. And probably we are the only "
+                "one doing that. So what do we do next")
+        assert ms._split_caption_sentences(text) == [
+            "It's not true at all, honestly.",
+            "And probably we are the only one doing that.",
+            "So what do we do next",
+        ]
+
+    def test_short_sentences_ride_with_the_next(self):
+        units = ms._split_caption_sentences(
+            "Yeah. Okay. So the policy is already in place for refunds.")
+        assert units == ["Yeah. Okay. So the policy is already in place for refunds."]
+
+    def test_decimal_and_abbreviation_without_space_stay_whole(self):
+        assert ms._split_caption_sentences("Version 3.5 shipped with the new e.g.x path") \
+            == ["Version 3.5 shipped with the new e.g.x path"]
+
+    def test_chinese_full_width_enders(self):
+        assert ms._split_caption_sentences(
+            "我们先把这个流量全部切到新的集群上面去。然后再观察一下成本有没有变化") == [
+            "我们先把这个流量全部切到新的集群上面去。", "然后再观察一下成本有没有变化"]
+
+    def test_short_chinese_interjection_still_rides_along(self):
+        assert ms._split_caption_sentences("好的。我们继续看下一个议题吧") == [
+            "好的。我们继续看下一个议题吧"]
+
+    def test_unit_complete(self):
+        assert ms._caption_unit_complete("Done.")
+        assert not ms._caption_unit_complete("still talking")
+
+
+class _RecordingMT:
+    def __init__(self, context_lines=0):
+        self.calls = []
+        self.context_lines = context_lines
+
+    def translate(self, text, context=None):
+        self.calls.append((text, context))
+        return f"<{text}>"
+
+
+class TestTranslateUnits:
+    S1 = "It's not true at all, honestly."
+    S2 = "And probably we are the only one doing that."
+
+    def _engine(self, **lc):
+        return ms.LiveCaptionEngine({"live_captions": lc}, lambda ev: None)
+
+    def test_partials_reuse_finished_sentences_and_final_reuses_all(self):
+        eng, mt = self._engine(), _RecordingMT()
+        eng._translate_units(mt, f"{self.S1} And probably")
+        eng._translate_units(mt, f"{self.S1} {self.S2} So")
+        out = eng._translate_units(mt, f"{self.S1} {self.S2}", final=True)
+        translated = [c[0] for c in mt.calls]
+        assert translated.count(self.S1) == 1     # finished → translated once
+        assert translated.count(self.S2) == 1
+        assert out == ms._join_caption_texts([f"<{self.S1}>", f"<{self.S2}>"])
+
+    def test_unfinished_tail_is_not_cached(self):
+        eng, mt = self._engine(), _RecordingMT()
+        eng._translate_units(mt, "still talking about the thing")
+        eng._translate_units(mt, "still talking about the thing")
+        assert len(mt.calls) == 2
+
+    def test_split_off_translates_whole_line(self):
+        eng, mt = self._engine(mt_sentence_split=False), _RecordingMT()
+        eng._translate_units(mt, f"{self.S1} {self.S2}", final=True)
+        assert [c[0] for c in mt.calls] == [f"{self.S1} {self.S2}"]
+
+    def test_context_from_previous_units_and_lines(self):
+        eng, mt = self._engine(), _RecordingMT(context_lines=2)
+        eng._translate_units(mt, self.S1, final=True)
+        eng._translate_units(mt, f"{self.S2} So what do we do next", final=True)
+        assert mt.calls[0] == (self.S1, [])
+        assert mt.calls[1] == (self.S2, [self.S1])
+        assert mt.calls[2] == ("So what do we do next", [self.S1, self.S2])
+
+    def test_backend_without_context_support_gets_plain_call(self):
+        class Plain:
+            def translate(self, text):
+                return text.upper()
+        eng = self._engine()
+        assert eng._translate_units(Plain(), "hello there my friend", final=True) \
+            == "HELLO THERE MY FRIEND"

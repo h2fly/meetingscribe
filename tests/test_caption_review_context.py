@@ -17,6 +17,9 @@ import meetingscribe as ms
 
 
 def _engine(**review):
+    # trigger_lines=1 so a single recorded line dispatches a window; the
+    # sliding-window mechanics themselves are covered in test_live_captions.
+    review.setdefault("trigger_lines", 1)
     cfg = {"live_captions": {"review": {"enabled": True, **review}}}
     return ms.LiveCaptionEngine(cfg, lambda ev: None)
 
@@ -155,7 +158,6 @@ class _FakeReviewLLM:
 
 def _run_one_batch(eng):
     """Drive exactly one review cycle on the worker thread."""
-    eng._review_interval = 0.01
     eng._running = True
     t = threading.Thread(target=eng._review_worker, daemon=True)
     t.start()
@@ -175,16 +177,37 @@ class TestContextInPrompt:
         _run_one_batch(eng)
         assert "第一批" in eng._review_llm.prompts[0]
 
+        # A window of 1 keeps line 1 OUT of the second batch, so it can show
+        # up as context. (When the window still covers a settled line, the
+        # line is deliberately excluded from the context instead — it would
+        # otherwise appear twice in the same prompt.)
+        eng._review_window = 1
         eng._review_record(2, "下一句")
         eng._review_llm.prompts.clear()
         _run_one_batch(eng)
-        # The settled text of batch 1 now precedes batch 2's lines.
         prompt = eng._review_llm.prompts[0]
-        # split from the END: rule 6 mentions 【上文】 literally, so the first
-        # occurrence is in the rules, not the section itself.
+        # split from the END: the rules mention 【上文】 literally, so the
+        # first occurrence is in the rules, not the section itself.
         ctx = prompt.split("【上文】")[-1].split("【字幕】")[0]
         assert "用 ChatOps 部署" in ctx
         assert "下一句" not in ctx          # the batch itself is not context
+
+    def test_a_line_never_appears_in_both_context_and_batch(self):
+        """Overlapping windows mean a settled line is usually still in the
+        batch. Sending it in both sections shows the model the same sentence
+        twice — once as settled, once as to-be-corrected."""
+        eng = _engine(context_lines=12, max_lines=10, window_lines=5)
+        eng._review_llm = _FakeReviewLLM()
+        eng._review_record(1, "第一句已定稿的内容")
+        _run_one_batch(eng)
+        eng._review_record(2, "第二句新的内容")
+        eng._review_llm.prompts.clear()
+        _run_one_batch(eng)
+        prompt = eng._review_llm.prompts[0]
+        ctx = prompt.split("【上文】")[-1].split("【字幕】")[0]
+        body = prompt.split("【字幕】")[-1]
+        assert "第一句已定稿的内容" in body     # still inside the window
+        assert "第一句已定稿的内容" not in ctx  # so it must NOT repeat here
 
     def test_correction_not_the_original_carries_forward(self):
         """Terminology decided by the pass is what the next batch must see —
@@ -194,11 +217,19 @@ class TestContextInPrompt:
             reply_from=lambda s: s.replace("拆特ops", "ChatOps"))
         eng._review_record(1, "我们用拆特ops 发布")
         _run_one_batch(eng)
-        assert eng._review_context[-1]["text"] == "我们用ChatOps 发布"
+        assert list(eng._review_context.values())[-1]["text"] == "我们用ChatOps 发布"
 
     def test_context_is_capped_by_config(self):
         eng = _engine(context_lines=2, max_lines=10)
-        assert eng._review_context.maxlen == 2
+        assert eng._review_context_lines == 2
+        eng._review_llm = _FakeReviewLLM()
+        eng._review_window = 1
+        for sid in (1, 2, 3, 4):
+            eng._review_record(sid, f"第{sid}句的内容")
+            eng._review_llm.prompts.clear()
+            _run_one_batch(eng)
+        # Keyed by id and trimmed from the front — not a deque of repeats.
+        assert [r["id"] for r in eng._review_context.values()] == [3, 4]
 
     def test_zero_context_lines_still_substitutes_the_slot(self):
         eng = _engine(context_lines=0, max_lines=10)

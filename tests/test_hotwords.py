@@ -320,6 +320,119 @@ class TestQwenCaptionMT:
             ms._QwenCaptionMT({}, {"qwen": {"model_path": str(gguf)}})
 
 
+def _hymt(fake_llama, hotword="", phrases=None):
+    lc = {"hymt": {"model_path": str(fake_llama)}}
+    return ms._HYMTCaptionMT({}, lc, hotword=hotword, phrases=phrases)
+
+
+class TestHYMTCaptionMT:
+    def test_gpu_offload_enabled_by_default(self, fake_llama):
+        assert _hymt(fake_llama)._llm.kwargs["n_gpu_layers"] == -1
+
+    def test_en_to_zh_uses_model_card_template(self, fake_llama):
+        mt = _hymt(fake_llama)
+        assert mt.translate("let's review the deployment plan") == "TRANSLATED"
+        prompt = mt._llm.prompts[-1]
+        assert prompt.startswith("将以下文本翻译为中文")
+        assert prompt.rstrip().endswith("let's review the deployment plan")
+
+    def test_zh_to_en_direction(self, fake_llama):
+        mt = _hymt(fake_llama)
+        mt.translate("我们今天讨论架构方案")
+        assert "翻译为英文" in mt._llm.prompts[-1]
+
+    def test_greedy_with_card_repetition_penalty(self, fake_llama):
+        mt = _hymt(fake_llama)
+        mt.translate("hello there")
+        kw = mt._llm.call_kwargs[-1]
+        assert kw["temperature"] == 0.0 and kw["repeat_penalty"] == 1.05
+        assert "grammar" not in kw
+
+    def test_terminology_block_maps_hits_to_themselves(self, fake_llama):
+        mt = _hymt(fake_llama, hotword="BigQuery GKE", phrases=["Cloud SQL"])
+        mt.translate("we moved it from cloud sql to BigQuery")
+        prompt = mt._llm.prompts[-1]
+        assert prompt.startswith("参考下面的翻译：")
+        assert "BigQuery 翻译成 BigQuery" in prompt
+        assert "Cloud SQL 翻译成 Cloud SQL" in prompt
+        assert "GKE" not in prompt     # not in the line → not in the block
+
+    def test_plain_words_not_pinned_on_english_lines(self, fake_llama):
+        # Mined from Chinese meetings, where an English word IS a term; on an
+        # English line pinning it stops the translation.
+        mt = _hymt(fake_llama, hotword="support release Yeah GKE K8s")
+        mt.translate("Yeah support will release it on GKE and K8s")
+        prompt = mt._llm.prompts[-1]
+        assert "GKE 翻译成 GKE" in prompt and "K8s 翻译成 K8s" in prompt
+        for w in ("support", "release", "Yeah"):
+            assert f"{w} 翻译成" not in prompt
+
+    def test_plain_words_still_pinned_on_chinese_lines(self, fake_llama):
+        mt = _hymt(fake_llama, hotword="release")
+        mt.translate("这个版本下周 release 到生产环境")
+        assert "release 翻译成 release" in mt._llm.prompts[-1]
+
+    def test_word_boundary_matching(self, fake_llama):
+        mt = _hymt(fake_llama, hotword="CU AI")
+        mt.translate("the customer wants to maintain it")
+        assert "参考下面的翻译" not in mt._llm.prompts[-1]
+
+    def test_no_terminology_block_without_hits(self, fake_llama):
+        mt = _hymt(fake_llama, hotword="BigQuery")
+        mt.translate("nothing relevant here")
+        assert "参考下面的翻译" not in mt._llm.prompts[-1]
+
+    def test_translate_only_no_correction_path(self, fake_llama):
+        # The MT worker dispatches on this attribute; HY-MT must take the
+        # plain translate path, never the 修正/翻译 contract.
+        assert not hasattr(_hymt(fake_llama), "correct_and_translate")
+
+    def test_context_uses_contextual_template(self, fake_llama):
+        mt = _hymt(fake_llama)
+        mt.translate("and then we ship it", context=["We fixed the bug."])
+        prompt = mt._llm.prompts[-1]
+        assert prompt.startswith("We fixed the bug.\n参考上面的信息")
+        assert prompt.rstrip().endswith("and then we ship it")
+
+    def test_no_context_uses_plain_template(self, fake_llama):
+        mt = _hymt(fake_llama)
+        mt.translate("and then we ship it", context=[])
+        assert mt._llm.prompts[-1].startswith("将以下文本翻译为中文")
+
+    def test_placeholder_in_caption_text_not_expanded(self, fake_llama):
+        mt = _hymt(fake_llama)
+        mt.translate("literally {text} here", context=["said {context} once"])
+        prompt = mt._llm.prompts[-1]
+        assert "said {context} once" in prompt
+        assert prompt.rstrip().endswith("literally {text} here")
+
+    def test_context_lines_default_off(self, fake_llama):
+        assert _hymt(fake_llama).context_lines == 0
+
+    def test_missing_model_path_raises(self, fake_llama, tmp_path):
+        lc = {"hymt": {"model_path": str(tmp_path / "nope.gguf")}}
+        with pytest.raises(RuntimeError, match="不存在"):
+            ms._HYMTCaptionMT({}, lc)
+
+    def test_engine_selects_and_caches_hymt(self, fake_llama):
+        cfg = {"live_captions": {"mt_provider": "hymt",
+                                 "hymt": {"model_path": str(fake_llama)}}}
+        eng = ms.LiveCaptionEngine(cfg, lambda ev: None)
+        b1 = eng._load_mt_backend()
+        assert isinstance(b1, ms._HYMTCaptionMT)
+        assert eng._load_mt_backend() is b1
+
+    def test_engine_falls_back_to_marian_when_unavailable(
+            self, monkeypatch, tmp_path):
+        monkeypatch.setitem(sys.modules, "llama_cpp", None)
+        sentinel = object()
+        monkeypatch.setattr(ms, "_MarianCaptionMT", lambda lc: sentinel)
+        cfg = {"live_captions": {"mt_provider": "hymt",
+                                 "hymt": {"model_path": str(tmp_path / "x")}}}
+        eng = ms.LiveCaptionEngine(cfg, lambda ev: None)
+        assert eng._load_mt_backend() is sentinel
+
+
 class TestParseFixMt:
     def test_two_line_format(self):
         out = "修正：我们把流量切到GKE\n翻译：We route traffic to GKE"
@@ -495,7 +608,8 @@ class TestCmdHotwordsBody:
 
 class TestPromptParity:
     @pytest.mark.parametrize(
-        "key", ["polish", "hotwords_extract", "caption_mt", "caption_fix_mt"])
+        "key", ["polish", "hotwords_extract", "caption_mt", "caption_fix_mt",
+                "caption_mt_hymt", "caption_mt_hymt_context"])
     def test_config_jsonc_matches_defaults(self, key):
         repo_cfg = Path(ms.__file__).parent / "config.jsonc"
         cfg = json.loads(
@@ -511,14 +625,73 @@ class TestPromptParity:
         for token in ("{src_lang}", "{dst_lang}", "{glossary}", "{text}"):
             assert token in tpl
 
+    def test_caption_mt_hymt_has_its_placeholders(self):
+        tpl = ms._resolve_prompt({}, "caption_mt_hymt")
+        for token in ("{dst_lang}", "{glossary}", "{text}"):
+            assert token in tpl
+
     def test_caption_fix_mt_has_its_placeholders(self):
         tpl = ms._resolve_prompt({}, "caption_fix_mt")
         for token in ("{src_lang}", "{dst_lang}", "{glossary}",
                       "{context}", "{text}"):
             assert token in tpl
 
+    @pytest.mark.parametrize("mode", ["meeting", "interview", "sharing"])
+    @pytest.mark.parametrize("key", ["notes_zh", "notes_en"])
+    def test_notes_config_jsonc_matches_defaults(self, mode, key):
+        repo_cfg = Path(ms.__file__).parent / "config.jsonc"
+        cfg = json.loads(
+            ms._strip_jsonc_comments(repo_cfg.read_text(encoding="utf-8")))
+        assert ms._resolve_prompt(cfg, key, mode=mode).rstrip() == \
+            ms._PROMPT_DEFAULTS[mode][key].rstrip()
+
     def test_polish_has_hotwords_placeholder(self):
         assert "{hotwords}" in ms._resolve_prompt({}, "polish")
+
+    @pytest.mark.parametrize("mode", ["meeting", "interview", "sharing"])
+    @pytest.mark.parametrize("key", ["notes_zh", "notes_en"])
+    def test_notes_have_hotwords_placeholder(self, mode, key):
+        # The notes step is what turns polish's 【？】 markers into the final
+        # deliverable; without the glossary it cannot resolve them and copies
+        # every marker through (measured: 57 of them in one sharing summary,
+        # most on terms that were sitting in this table).
+        assert "{hotwords}" in ms._resolve_prompt({}, key, mode=mode)
+
+
+class TestGenerateNotesSubstitution:
+    """`generate_notes` fills both placeholders before calling the LLM."""
+
+    def _capture(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(ms, "_llm_run",
+                            lambda prompt, *a, **kw: seen.append(prompt) or "")
+        return seen
+
+    def test_hotwords_and_transcript_substituted(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        cfg = {"stt": {"funasr": {"hotword": "SaaS CockroachDB"}}}
+        ms.generate_notes("会议内容", "claude", cfg, mode="sharing")
+        assert len(seen) == 2                       # zh + en
+        for prompt in seen:
+            assert "{hotwords}" not in prompt
+            assert "{transcript}" not in prompt
+            assert "SaaS、CockroachDB" in prompt
+            assert "会议内容" in prompt
+
+    def test_empty_hotword_table_renders_placeholder_text(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        ms.generate_notes("t", "claude", {}, mode="meeting")
+        assert all("{hotwords}" not in p and "（无）" in p for p in seen)
+
+    def test_transcript_saying_hotwords_does_not_pull_in_the_table(
+            self, monkeypatch):
+        # Substitution order is glossary-then-transcript, so untrusted ASR
+        # text cannot expand a placeholder of its own.
+        seen = self._capture(monkeypatch)
+        cfg = {"stt": {"funasr": {"hotword": "SecretTerm"}}}
+        ms.generate_notes("他说了 {hotwords} 这个词", "claude", cfg,
+                          mode="meeting")
+        assert all(p.count("SecretTerm") == 1 for p in seen)
 
 
 class TestGlossaryCandidates:
@@ -650,3 +823,34 @@ class TestQwenGrammar:
         assert mt._fix_grammar is None
         mt.correct_and_translate("测试句子", [])
         assert "预算下周才能确认" in mt._llm.prompts[-1]
+
+
+class TestCloseCaptionLlmBackends:
+    def test_waits_for_inflight_call_before_closing(self, monkeypatch):
+        import threading
+        import time as _time
+        order = []
+
+        class _LLM:
+            def close(self):
+                order.append("close")
+
+        backend = types.SimpleNamespace(_llm=_LLM(), _llm_lock=threading.Lock())
+        monkeypatch.setitem(ms._caption_backend_cache, ("mt", "hymt"), backend)
+
+        def worker():
+            with backend._llm_lock:
+                _time.sleep(0.3)
+                order.append("decode done")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        _time.sleep(0.05)
+        ms._close_caption_llm_backends()
+        t.join()
+        assert order == ["decode done", "close"]
+        assert backend._llm_lock.locked()      # stays held after close
+
+    def test_backend_without_llm_is_skipped(self, monkeypatch):
+        monkeypatch.setitem(ms._caption_backend_cache, ("mt", "marian"), object())
+        ms._close_caption_llm_backends()       # must not raise
