@@ -2592,6 +2592,21 @@ def _log_device_raw_dump(reason: str) -> None:
     _log("DEVICE-RAW", f"end reason={reason}")
 
 
+def _coreaudio_device_ids() -> "dict[str, int]":
+    """{device name: AudioObjectID} from CoreAudio, live. macOS only.
+
+    Unlike PortAudio's device list this needs no re-initialisation, so it is
+    safe to call while streams are open — which is what lets the recorder
+    notice a device that vanished, or came back as a new object, mid-recording.
+    """
+    try:
+        return {e["name"]: e["id"] for e in _coreaudio_device_raw_dump()
+                if e.get("name") and e.get("id") is not None}
+    except Exception as e:
+        _log("ERR", f"coreaudio device ids: {type(e).__name__}: {e}")
+        return {}
+
+
 def _audio_output_processes() -> "list[dict] | None":
     """Every process currently running audio OUTPUT, with the devices it
     plays to: [{"pid", "bundle", "devices": [name, ...]}]. macOS only.
@@ -3671,6 +3686,10 @@ class MultiStreamRecorder:
         self._frames: dict[str, list] = {}   # device → frame list
         self._streams: dict[str, object] = {}  # device → InputStream
         self._rms: dict[str, float] = {}     # device → latest RMS
+        # device → CoreAudio AudioObjectID it had when its stream opened; a
+        # different (or missing) live id means the stream is bound to a dead
+        # device object. See `_stale_streams`.
+        self._ca_ids: dict[str, "int | None"] = {}
         self._lock = threading.Lock()        # protects _streams / _frames dict ops
         self.recording = False
         self.skipped: list[str] = []
@@ -3759,6 +3778,7 @@ class MultiStreamRecorder:
                     self._streams[device] = stream
                     self._frames[device] = []
                     self._rms[device] = 0.0
+                    self._ca_ids[device] = _coreaudio_device_ids().get(device)
                     orphan = None
             if orphan is not None:
                 try:
@@ -3811,10 +3831,79 @@ class MultiStreamRecorder:
                 break
             self._monitor_iteration()
 
+    def _stale_streams(self) -> "list[str]":
+        """Open streams whose device vanished from CoreAudio or came back as a
+        new device object. macOS only; [] elsewhere.
+
+        PortAudio's device list is deliberately NOT refreshed mid-recording
+        (re-initialising it closes every stream), so it keeps listing a device
+        that was unplugged — and the open stream does not die either: it keeps
+        delivering audio from some OTHER input. Measured on a real session
+        (2026-10-29 19:03): headphones unplugged, the "External Microphone"
+        stream went on for 15 minutes carrying a sample-for-sample copy of
+        BlackHole, so audio played in the room never reached the recording or
+        the captions. Replugging did not help: the device returns with a new
+        AudioObjectID (175 → 190 → 146 seen the same day) while PortAudio's
+        cache still points at the old one.
+        """
+        if sys.platform != "darwin":
+            return []
+        live = _coreaudio_device_ids()
+        if not live:
+            return []          # query failed: never rebuild on no information
+        with self._lock:
+            opened = dict(self._ca_ids)
+            devices = list(self._streams)
+        return [d for d in devices
+                if d not in live
+                or (opened.get(d) is not None and live[d] != opened[d])]
+
+    def _rebuild_streams(self, stale: "list[str]") -> None:
+        """Close every stream, re-initialise PortAudio, re-resolve the plan
+        and reopen — the only way to reach a device PortAudio's cache has lost
+        track of. All roles close and reopen together, so both channels take
+        the same short gap and stay time-aligned; recorded frames carry over
+        per ROLE, so a mic that changes device (headset → built-in) keeps one
+        continuous channel.
+        """
+        old_wanted = list(self.wanted)
+        with self._lock:
+            carried = [list(self._frames.get(d, [])) for d in old_wanted]
+        _log("STREAM", f"rebuild: stale={stale} wanted={old_wanted}")
+        for dev in list(self._streams):
+            self._close_one(dev, reason="rebuild")
+        _refresh_portaudio()
+        try:
+            plan = resolve_audio_devices(query_fresh=False)
+            new_wanted = [n for n in (plan.sys_source_name, plan.mic_name) if n]
+        except Exception as e:
+            _log("ERR", f"rebuild resolve: {type(e).__name__}: {e}")
+            new_wanted = []
+        if not new_wanted:
+            new_wanted = old_wanted
+        self.wanted = new_wanted
+        self.role_labels = ["system", "mic"][: len(new_wanted)]
+        opened = [d for d in new_wanted if self._try_open(d)]
+        with self._lock:
+            for i, dev in enumerate(new_wanted):
+                prior = carried[i] if i < len(carried) else []
+                if dev in self._frames:
+                    self._frames[dev] = prior + self._frames[dev]
+                elif prior:
+                    self._frames[dev] = prior
+            for old in old_wanted:
+                if old not in new_wanted:
+                    self._frames.pop(old, None)
+        _log("HOTPLUG", f"rebuild: wanted={new_wanted} opened={opened}")
+
     def _monitor_iteration(self):
         """One pass of the monitor loop: query devices, re-resolve plan,
         reconcile streams. Extracted from `_monitor` so unit tests can drive
         it deterministically without spinning the wait loop."""
+        stale = self._stale_streams()
+        if stale and self.recording:
+            self._rebuild_streams(stale)
+            return
         try:
             with _portaudio_lock:
                 avail = {
@@ -3923,6 +4012,7 @@ class MultiStreamRecorder:
         self.recording = True
         self._frames = {}
         self._rms = {}
+        self._ca_ids = {}
         self.skipped = []
         self.warnings = []
         _hotplug_event.clear()  # don't fire on stale events from before start

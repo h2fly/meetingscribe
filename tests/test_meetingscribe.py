@@ -293,6 +293,12 @@ class TestMultiStreamRecorderStopRace:
     monitor thread before clearing streams and (b) `_try_open`'s defensive
     re-check of `self.recording` inside the lock."""
 
+    @pytest.fixture(autouse=True)
+    def _no_live_coreaudio(self, monkeypatch):
+        # These tests drive _monitor_iteration with made-up device names; the
+        # stale-stream check must not consult the real machine's devices.
+        monkeypatch.setattr(ms, "_coreaudio_device_ids", lambda: {})
+
     def test_try_open_returns_false_when_not_recording(self):
         """Defensive guard inside _try_open: if `self.recording` flipped to
         False after the stream object was created but before the install,
@@ -465,6 +471,12 @@ class TestMultiStreamRecorderMicSwap:
     different mic (e.g. USB headset plugged in), the recorder closes the old
     mic stream, opens the new one, and prepends the old frames into the new
     stream's frame list so audio continuity is preserved."""
+
+    @pytest.fixture(autouse=True)
+    def _no_live_coreaudio(self, monkeypatch):
+        # These tests drive _monitor_iteration with made-up device names; the
+        # stale-stream check must not consult the real machine's devices.
+        monkeypatch.setattr(ms, "_coreaudio_device_ids", lambda: {})
 
     def _devices(self, names):
         return _qd([{"name": n, "in": 1, "out": 0} for n in names])
@@ -2688,3 +2700,86 @@ class TestDevicePlanLogThrottle:
         # t=0 A, t=2 B (change), t=3 A (change back), t=6 would be next
         # heartbeat but the loop ends at t=5 → 3 lines, none of them delayed.
         assert [m for _, m in out] == ["plan: A", "plan: B", "plan: A"]
+
+
+class TestMultiStreamRecorderStaleStreams:
+    """A device unplugged mid-recording (or replugged as a new CoreAudio
+    object) must be detected from CoreAudio and the streams rebuilt — the
+    PortAudio cache keeps listing it and the dead stream keeps delivering
+    another input's audio (measured: a sample-for-sample copy of BlackHole)."""
+
+    def _rec(self):
+        rec = ms.MultiStreamRecorder(["BlackHole 2ch", "External Microphone"], 48000,
+                                     role_labels=["system", "mic"])
+        rec._streams = {"BlackHole 2ch": MagicMock(), "External Microphone": MagicMock()}
+        rec._ca_ids = {"BlackHole 2ch": 81, "External Microphone": 146}
+        rec._frames = {"BlackHole 2ch": [np.full((4, 1), 0.1, np.float32)],
+                       "External Microphone": [np.full((4, 1), 0.2, np.float32)]}
+        rec.recording = True
+        return rec
+
+    @pytest.fixture(autouse=True)
+    def _darwin(self, monkeypatch):
+        monkeypatch.setattr(ms.sys, "platform", "darwin")
+
+    def test_unplugged_device_is_stale(self, monkeypatch):
+        monkeypatch.setattr(ms, "_coreaudio_device_ids", lambda: {"BlackHole 2ch": 81})
+        assert self._rec()._stale_streams() == ["External Microphone"]
+
+    def test_replugged_device_with_new_id_is_stale(self, monkeypatch):
+        monkeypatch.setattr(ms, "_coreaudio_device_ids",
+                            lambda: {"BlackHole 2ch": 81, "External Microphone": 190})
+        assert self._rec()._stale_streams() == ["External Microphone"]
+
+    def test_unchanged_devices_are_not_stale(self, monkeypatch):
+        monkeypatch.setattr(ms, "_coreaudio_device_ids",
+                            lambda: {"BlackHole 2ch": 81, "External Microphone": 146})
+        assert self._rec()._stale_streams() == []
+
+    def test_failed_query_never_triggers_rebuild(self, monkeypatch):
+        monkeypatch.setattr(ms, "_coreaudio_device_ids", lambda: {})
+        assert self._rec()._stale_streams() == []
+
+    def _rebuild(self, monkeypatch, new_mic):
+        rec = self._rec()
+        monkeypatch.setattr(ms, "_refresh_portaudio", lambda: None)
+        monkeypatch.setattr(ms, "resolve_audio_devices",
+                            lambda query_fresh=False: ms.AudioPlan(
+                                sys_source_name="BlackHole 2ch", mic_name=new_mic))
+        opened = []
+
+        def fake_open(dev):
+            opened.append(dev)
+            rec._streams[dev] = MagicMock()
+            rec._frames[dev] = [np.full((4, 1), 0.9, np.float32)]   # post-rebuild audio
+            return True
+
+        monkeypatch.setattr(rec, "_try_open", fake_open)
+        old_streams = dict(rec._streams)
+        rec._rebuild_streams(["External Microphone"])
+        return rec, opened, old_streams
+
+    def test_unplug_switches_mic_and_keeps_one_continuous_channel(self, monkeypatch):
+        rec, opened, old = self._rebuild(monkeypatch, "MacBook Air Microphone")
+        assert rec.wanted == ["BlackHole 2ch", "MacBook Air Microphone"]
+        assert opened == ["BlackHole 2ch", "MacBook Air Microphone"]
+        for s in old.values():                        # every old stream closed
+            s.stop.assert_called_once()
+        mic = rec._frames["MacBook Air Microphone"]
+        assert [float(f[0, 0]) for f in mic] == pytest.approx([0.2, 0.9])  # prior + new
+        assert "External Microphone" not in rec._frames
+
+    def test_replug_same_name_keeps_earlier_frames(self, monkeypatch):
+        rec, _, _ = self._rebuild(monkeypatch, "External Microphone")
+        mic = rec._frames["External Microphone"]
+        assert [float(f[0, 0]) for f in mic] == pytest.approx([0.2, 0.9])
+        sysf = rec._frames["BlackHole 2ch"]
+        assert [float(f[0, 0]) for f in sysf] == pytest.approx([0.1, 0.9])
+
+    def test_monitor_iteration_rebuilds_on_stale(self, monkeypatch):
+        rec = self._rec()
+        monkeypatch.setattr(ms, "_coreaudio_device_ids", lambda: {"BlackHole 2ch": 81})
+        called = []
+        monkeypatch.setattr(rec, "_rebuild_streams", lambda stale: called.append(stale))
+        rec._monitor_iteration()
+        assert called == [["External Microphone"]]
