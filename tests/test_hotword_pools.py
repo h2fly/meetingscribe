@@ -410,32 +410,6 @@ class TestTermList:
         assert ms._hotword_term_list("", None) == []
 
 
-class TestSherpaEncodable:
-    """One stray character makes the recognizer skip the WHOLE term, and it
-    complains on C-level stderr that the log tee never captured — so a term
-    looked configured while biasing nothing. All measured against the real
-    model."""
-
-    @pytest.mark.parametrize("term", [
-        "GKE", "n2d", "CockroachDB", "K8s", "P0", "巡检", "GKE 集群",
-        "Cloud SQL", "error budget", "node pool", "Spot VM", "AI Native",
-    ])
-    def test_encodable(self, term):
-        assert ms._sherpa_encodable(term)
-
-    @pytest.mark.parametrize("term", [
-        "Pub/Sub", "blue-green", "AI-Native", "Agent-Ready", "Semi-Annual",
-        "one-liner", "Node.js", "C++", "snake_case", "it's", "3.5",
-    ])
-    def test_not_encodable(self, term):
-        assert not ms._sherpa_encodable(term)
-
-    def test_blank_is_not_encodable(self):
-        assert not ms._sherpa_encodable("")
-        assert not ms._sherpa_encodable("   ")
-        assert not ms._sherpa_encodable(None)
-
-
 class TestPromptGlossary:
     """`_cfg_hotword` feeds the polish and caption-review prompts. It must not
     lose multi-word terms the way the sherpa hotwords file used to."""

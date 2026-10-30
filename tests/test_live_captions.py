@@ -66,8 +66,14 @@ class _FakeMT:
         return "EN:" + text
 
 
+# The fixtures speak Chinese, so they run a "zh" session (target "en");
+# refine off so no FunASR model is touched.
+def _zh_cfg():
+    return {"live_captions": {"language": "zh", "refine": False}}
+
+
 def _make_engine(sink):
-    eng = ms.LiveCaptionEngine({}, sink)
+    eng = ms.LiveCaptionEngine(_zh_cfg(), sink)
     eng._load_asr_backend = lambda: _FakeASR(eng)
     eng._load_mt_backend = lambda: _FakeMT()
     return eng
@@ -146,8 +152,23 @@ class TestCaptionLanguage:
     def test_junk_falls_back_to_english(self):
         assert ms._caption_language({"language": "fr"}) == "en"
 
-    def test_zh_keeps_the_bilingual_zipformer(self):
-        assert ms._caption_asr_model_url({"language": "zh"}) == ms._SHERPA_ZIPFORMER_URL
+    def test_zh_defaults_to_the_streaming_paraformer(self):
+        assert ms._caption_asr_model_url({"language": "zh"}) == ms._SHERPA_ZH_URLS["paraformer"]
+        assert ms.DEFAULT_CONFIG["live_captions"]["zh_model"] == "paraformer"
+
+    def test_zh_model_is_selectable(self):
+        for key, url in ms._SHERPA_ZH_URLS.items():
+            assert ms._caption_asr_model_url({"language": "zh", "zh_model": key}) == url
+        assert ms._caption_asr_model_url(
+            {"language": "zh", "zh_model": "zipformer-2023"}) == ms._SHERPA_ZIPFORMER_URL
+
+    def test_zh_model_junk_falls_back_to_paraformer(self):
+        assert ms._caption_asr_model_url(
+            {"language": "zh", "zh_model": "whisper"}) == ms._SHERPA_ZH_URLS["paraformer"]
+
+    def test_zh_model_ignored_for_english(self):
+        url = ms._caption_asr_model_url({"language": "en", "zh_model": "zipformer-2025"})
+        assert "nemotron" in url
 
     def test_en_picks_nemotron_by_chunk(self):
         url = ms._caption_asr_model_url({"language": "en", "en_chunk_ms": 1120})
@@ -643,7 +664,7 @@ class _FakeFixMT:
 
 def test_mt_worker_uses_correct_and_translate_for_finals():
     sink = _EventSink()
-    eng = ms.LiveCaptionEngine({}, sink)
+    eng = ms.LiveCaptionEngine(_zh_cfg(), sink)
     backend = _FakeFixMT()
     eng._load_asr_backend = lambda: _FakeASR(eng)
     eng._load_mt_backend = lambda: backend
@@ -809,6 +830,52 @@ def test_mt_partial_cooldown():
     assert ms._mt_partial_cooldown(1.5) == pytest.approx(3.0)
 
 
+class TestMtPartialDue:
+    """Partial translation throttle: 90 % of HY-MT's work went into previews."""
+
+    def test_first_partial_is_due(self):
+        assert ms._mt_partial_due("we decided that", "", 0.0, 2.5, 40)
+
+    def test_small_growth_waits(self):
+        last = "we decided that the queries on Jira"
+        assert not ms._mt_partial_due(last + " are", last, 10.0, 2.5, 40)
+
+    def test_enough_growth_but_too_soon_waits(self):
+        last = "we decided that"
+        text = last + " the queries on Jira are going to be owned by support"
+        assert not ms._mt_partial_due(text, last, 1.0, 2.5, 40)
+        assert ms._mt_partial_due(text, last, 3.0, 2.5, 40)
+
+    def test_completed_sentence_is_due_immediately(self):
+        last = "We decided that the queries on Jira are owned by support"
+        assert ms._mt_partial_due(last + ". So", last, 0.1, 2.5, 40)
+
+    def test_new_line_counts_in_full(self):
+        last = "the previous line that already finalized and went away"
+        text = "Okay so for the next item on the agenda we have"
+        assert ms._mt_partial_due(text, last, 3.0, 2.5, 40)
+
+    def test_cjk_counts_double(self):
+        last = "我们决定"
+        # 20 new characters weigh 40; 19 weigh 38.
+        assert ms._mt_partial_due(last + "交给支持团队" * 3 + "负责", last, 3.0, 2.5, 40)
+        assert not ms._mt_partial_due(last + "交给支持团队" * 3 + "负", last, 3.0, 2.5, 40)
+
+
+def test_partial_mt_off_translates_only_finals():
+    sink = _EventSink()
+    eng = _make_engine(sink)
+    eng._lc["partial_mt"] = False
+    eng.start()
+    try:
+        with eng._partial_lock:
+            eng._partial_pending = "这是一句进行中的字幕"
+        time.sleep(1.0)
+        assert "partial_translation" not in sink.types()
+    finally:
+        eng.stop()
+
+
 # ── MT repetition loops (reported: 「雅 的 内容」×30 then "Ya"×100) ────────────
 
 def test_collapse_mt_repeats_kills_cjk_loop():
@@ -875,7 +942,7 @@ def test_translation_events_are_collapsed():
             return "Ya Ya Ya Ya Ya Ya"
 
     sink = _EventSink()
-    eng = ms.LiveCaptionEngine({}, sink)
+    eng = ms.LiveCaptionEngine(_zh_cfg(), sink)
     eng._load_asr_backend = lambda: _FakeASR(eng)
     eng._load_mt_backend = lambda: _LoopMT()
     eng.start()
@@ -1589,3 +1656,183 @@ class TestTranslateUnits:
         eng = self._engine()
         assert eng._translate_units(Plain(), "hello there my friend", final=True) \
             == "HELLO THERE MY FRIEND"
+
+
+# ── mid-session language switch (panel 中文 / English control) ─────────────
+
+class _NamedASR:
+    def __init__(self, name):
+        self.name = name
+        self.flushed = 0
+
+    def flush(self):
+        self.flushed += 1
+
+
+class TestCaptionLanguageSwitch:
+    def _engine(self, lang="en", **lc):
+        return ms.LiveCaptionEngine(
+            {"live_captions": {"language": lang, "review": {"enabled": False},
+                               "speaker_id": {"enabled": False}, **lc}},
+            lambda ev: None)
+
+    def test_request_is_recorded_only_for_a_real_change(self):
+        eng = self._engine("en")
+        eng.set_language("en")
+        assert eng._lang_request is None
+        eng.set_language("klingon")
+        assert eng._lang_request is None
+        eng.set_language("ZH")
+        assert eng._lang_request == "zh"
+
+    def test_switch_flushes_old_model_then_loads_new(self, monkeypatch):
+        eng = self._engine("en")
+        old = _NamedASR("nemotron")
+        loaded = []
+        monkeypatch.setattr(eng, "_load_asr_backend",
+                            lambda: loaded.append(eng._lc["language"]) or _NamedASR("zipformer"))
+        monkeypatch.setattr(eng, "_refine_worker", lambda: None)
+        new = eng._switch_asr_language(old, "zh")
+        assert old.flushed == 1                     # in-flight line finalized first
+        assert loaded == ["zh"] and new.name == "zipformer"
+        assert eng.asr_backend is new
+        assert eng._refine_enabled                  # zh turns refine on…
+        eng._switch_asr_language(new, "en")
+        assert not eng._refine_enabled              # …and en turns it off
+
+    def test_failed_load_keeps_the_old_model(self, monkeypatch):
+        eng = self._engine("en")
+        old = _NamedASR("nemotron")
+
+        def boom():
+            raise RuntimeError("model download failed")
+
+        monkeypatch.setattr(eng, "_load_asr_backend", boom)
+        assert eng._switch_asr_language(old, "zh") is old
+        assert eng._lc["language"] == "en"
+
+    def test_refine_disabled_in_config_stays_off(self, monkeypatch):
+        eng = self._engine("en", refine=False)
+        monkeypatch.setattr(eng, "_load_asr_backend", lambda: _NamedASR("zipformer"))
+        eng._switch_asr_language(_NamedASR("nemotron"), "zh")
+        assert not eng._refine_enabled
+
+
+# ── Translation target (live_captions.translate_to) ───────────────────────────
+
+class TestTranslateTarget:
+    def test_unset_defaults_to_the_other_language(self):
+        assert ms._caption_translate_to({}) == "zh"
+        assert ms._caption_translate_to({"language": "zh"}) == "en"
+        assert ms._caption_translate_to({"translate_to": "junk"}) == "zh"
+        assert ms._caption_translate_to({"translate_to": "OFF"}) == "off"
+
+    def test_off_or_same_language_translates_nothing(self):
+        assert not ms._caption_mt_active({"translate_to": "off"})
+        assert not ms._caption_mt_active({"language": "en", "translate_to": "en"})
+        assert not ms._caption_mt_active({"language": "zh", "translate_to": "zh"})
+        assert ms._caption_mt_active({"language": "en", "translate_to": "zh"})
+
+    def test_lines_already_in_the_target_are_skipped(self):
+        lc = {"language": "zh", "translate_to": "en"}
+        assert ms._caption_mt_wanted("我们讨论一下架构方案。", lc)
+        assert not ms._caption_mt_wanted("Let's move on to the next item.", lc)
+        lc = {"language": "en", "translate_to": "zh"}
+        assert ms._caption_mt_wanted("Let's move on to the next item.", lc)
+
+    def test_off_session_never_loads_mt_and_marks_lines_skipped(self):
+        sink = _EventSink()
+        eng = ms.LiveCaptionEngine(
+            {"live_captions": {"language": "zh", "refine": False,
+                               "translate_to": "off"}}, sink)
+        eng._load_asr_backend = lambda: _FakeASR(eng)
+        loads = []
+        eng._load_mt_backend = lambda: loads.append(1) or _FakeMT()
+        eng.start()
+        try:
+            eng.feed("mic", np.zeros((3200, 1), dtype=np.float32), 16000)
+            ev = sink.wait_for("translation", timeout=5.0)
+            assert ev and ev.get("skipped") and ev["text"] == ""
+            time.sleep(0.6)               # several idle ticks
+            assert loads == [] and "partial_translation" not in sink.types()
+        finally:
+            eng.stop()
+
+    def test_switch_on_mid_session_loads_lazily(self):
+        sink = _EventSink()
+        eng = ms.LiveCaptionEngine(
+            {"live_captions": {"language": "zh", "refine": False,
+                               "translate_to": "off"}}, sink)
+        eng._load_asr_backend = lambda: _FakeASR(eng)
+        eng._load_mt_backend = lambda: _FakeMT()
+        eng.start()
+        try:
+            eng.set_translate_to("en")
+            eng._queue_translation(1, "第二句话")
+            ev = sink.wait_for("translation", timeout=5.0)
+            assert ev and ev["text"] == "EN:第二句话"
+        finally:
+            eng.stop()
+
+    def test_switch_off_clears_the_partial_translation(self):
+        sink = _EventSink()
+        eng = ms.LiveCaptionEngine(_zh_cfg(), sink)
+        eng.set_translate_to("off")
+        assert [e["text"] for e in sink.events
+                if e["type"] == "partial_translation"] == [""]
+        eng.set_translate_to("bogus")          # ignored
+        assert eng._lc["translate_to"] == "off"
+
+
+# ── Recognizer type follows the model files ──────────────────────────────────
+
+class _FakeSherpaRecognizer:
+    calls: list = []
+
+    def __init__(self, kind, kw):
+        self.kind, self.kw = kind, kw
+
+    @classmethod
+    def from_paraformer(cls, **kw):
+        cls.calls.append("paraformer")
+        return cls("paraformer", kw)
+
+    @classmethod
+    def from_transducer(cls, **kw):
+        cls.calls.append("transducer")
+        return cls("transducer", kw)
+
+    def create_stream(self):
+        return object()
+
+
+@pytest.fixture
+def fake_sherpa(monkeypatch):
+    import types
+    mod = types.ModuleType("sherpa_onnx")
+    mod.OnlineRecognizer = _FakeSherpaRecognizer
+    _FakeSherpaRecognizer.calls = []
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", mod)
+    return _FakeSherpaRecognizer
+
+
+def _model_dir(tmp_path, *files):
+    for f in ("tokens.txt",) + files:
+        (tmp_path / f).write_text("x")
+    return tmp_path
+
+
+def test_paraformer_dir_loads_a_paraformer(tmp_path, fake_sherpa):
+    d = _model_dir(tmp_path, "encoder.int8.onnx", "decoder.int8.onnx")
+    asr = ms._SherpaCaptionASR({"asr_model_dir": str(d)}, lambda t: None,
+                               lambda t, a=None: None, hotword="GKE BigQuery")
+    assert fake_sherpa.calls == ["paraformer"]
+    assert asr._rec.kw["encoder"].endswith("encoder.int8.onnx")
+    assert asr._hotwords == ["GKE", "BigQuery"]      # still used for casing
+
+
+def test_transducer_dir_still_loads_a_transducer(tmp_path, fake_sherpa):
+    d = _model_dir(tmp_path, "encoder.onnx", "decoder.onnx", "joiner.onnx")
+    ms._SherpaCaptionASR({"asr_model_dir": str(d)}, lambda t: None,
+                         lambda t, a=None: None)
+    assert fake_sherpa.calls == ["transducer"]

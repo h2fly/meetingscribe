@@ -31,7 +31,7 @@
   // ── Live bilingual captions (GUI recording view; fully local inference) ────
   "live_captions": {
     // Default state of the caption switch in the recording view.
-    "enabled": true,
+    "enabled": false,
     // Main spoken language of the meeting; picks the streaming ASR model.
     //   "en" = NVIDIA Nemotron Speech Streaming EN 0.6B (sherpa-onnx int8,
     //          ~440 MB one-time download). English-first, emits real casing
@@ -40,11 +40,30 @@
     //          the FunASR refine pass below. Use it for Chinese meetings.
     // Translation runs after either one (see mt_provider below).
     "language": "en",
+    // Translation target: "zh" / "en" / "off". Set from the caption panel's
+    // dropdown and remembered. Nothing is translated when it is "off" or the
+    // same as "language" (the MT model is not even loaded then); in a "zh"
+    // session, lines the bilingual model already emits in the target
+    // language are skipped. Empty = the other language.
+    "translate_to": "zh",
     // Encoder chunk for "en": 80 / 160 / 560 / 1120 ms. Each is its own
     // export (the chunk is baked into the ONNX graph). A bigger chunk is more
     // accurate but the words appear later. NVIDIA's WER figures:
     // 8.43 / 7.67 / 7.07 / 6.93 %.
     "en_chunk_ms": 560,
+    // Streaming model for "zh". Measured on four real built-in-mic
+    // recordings (char error rate test/meeting/book/zh-en mixed):
+    //   "paraformer"            (default) zh+en, 17/27/19/32 %. Few stutters
+    //                           and keeps English terms (owner, mysql, api).
+    //   "zipformer-2025"        Chinese-only, 21/39/13/34 %. Best on pure
+    //                           Chinese, but English words mostly vanish.
+    //   "zipformer-2025-xlarge" Chinese-only, 6/44/13/30 %, ~3x the CPU.
+    //   "zipformer-2023"        the old bilingual model, 31/88/96/69 %;
+    //                           stutters on room audio (「点点点点点」).
+    // Downloaded on first use. No streaming model gets hotword biasing
+    // (measured: it made recognition worse); terms are fixed by refine,
+    // the MT glossary and the review pass.
+    "zh_model": "paraformer",
     // Empty = auto-download the model for "language" on first use into
     // ~/Documents/meetingscribe/models/. A path here overrides "language".
     "asr_model_dir": "",
@@ -65,6 +84,27 @@
     // Minimum refresh interval (ms) for the in-flight gray caption line;
     // raise it for a calmer display, lower it for snappier partials.
     "partial_interval_ms": 500,
+    // Live translation of the in-flight line. Translating every partial
+    // change spent 90 % of the MT work (measured: 122 calls / 52 s of
+    // model time vs 9 calls / 5.6 s for the finalized lines in 2 minutes
+    // of English) on previews the final replaces. Now a partial is
+    // re-translated only when a sentence completes, or when at least
+    // partial_mt_min_chars of new text (CJK counts double) arrived and
+    // the last call is partial_mt_min_interval_ms old.
+    // Measured on the same replay: 1500 / 24 -> -50 % model time,
+    // 2500 / 40 -> -65 % (32 calls / 18.4 s), finalized-line latency
+    // unchanged; the preview refreshes every ~3-4 s instead of every second.
+    // false = translate finalized lines only (lowest power draw).
+    "partial_mt": true,
+    "partial_mt_min_interval_ms": 2500,
+    "partial_mt_min_chars": 40,
+    // Minutes of idleness after a recording before the cached llama.cpp
+    // translation model (HY-MT / Qwen) is released: ~1.2 GB back, reloaded
+    // in under a second by the next recording. The recognizer and refine's
+    // paraformer stay cached on purpose — measured, the recognizer returns
+    // almost no memory when released and refine takes 27 s to reload.
+    // 0 = keep everything resident.
+    "release_idle_minutes": 10,
     // Sentence-break (endpoint detection) thresholds, forwarded to sherpa.
     // This is THE knob for how fragmented the captions are: the less a
     // continuous speaker gets cut up, the more context each line carries

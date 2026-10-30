@@ -854,3 +854,64 @@ class TestCloseCaptionLlmBackends:
     def test_backend_without_llm_is_skipped(self, monkeypatch):
         monkeypatch.setitem(ms._caption_backend_cache, ("mt", "marian"), object())
         ms._close_caption_llm_backends()       # must not raise
+
+
+class TestReleaseCaptionModels:
+    """Idle release frees only llama.cpp backends (see the docstring for the
+    measurements behind that)."""
+
+    def _llm_backend(self, order):
+        import threading
+
+        class _LLM:
+            def close(self):
+                order.append("close")
+
+        return types.SimpleNamespace(_llm=_LLM(), _llm_lock=threading.Lock())
+
+    def test_frees_llm_keeps_recognizer(self, monkeypatch):
+        order = []
+        llm, asr = self._llm_backend(order), object()
+        monkeypatch.setattr(ms, "_caption_backend_cache",
+                            {("mt", "hymt"): llm, ("asr", "x"): asr})
+        assert ms._release_caption_models() == ["SimpleNamespace"]
+        assert order == ["close"]
+        assert ms._caption_backend_cache == {("asr", "x"): asr}
+
+    def test_busy_model_is_kept_for_next_round(self, monkeypatch):
+        order = []
+        llm = self._llm_backend(order)
+        llm._llm_lock.acquire()                 # a decode is in flight
+        monkeypatch.setattr(ms, "_caption_backend_cache", {("mt", "hymt"): llm})
+        assert ms._release_caption_models() == []
+        assert order == [] and ("mt", "hymt") in ms._caption_backend_cache
+
+
+class TestConfigSaveKeepsHotwordsOut:
+    """GUI preference saves pass the RUNTIME cfg, which carries the hotword
+    list merged in from gitignored hotword.jsonc — it must never land in the
+    tracked config.jsonc."""
+
+    def test_in_place_save_leaves_hotword_alone(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.jsonc"
+        cfg_file.write_text(
+            '{\n  "live_captions": {\n    "language": "en"\n  },\n'
+            '  "stt": {\n    "funasr": {\n      "hotword": ""\n    }\n  }\n}\n',
+            encoding="utf-8")
+        monkeypatch.setattr(ms, "CONFIG_FILE", cfg_file)
+        runtime = {"live_captions": {"language": "zh"},
+                   "stt": {"funasr": {"hotword": "李雷 韩梅梅",
+                                      "hotword_phrases": ["Cloud SQL"]}}}
+        assert ms._save_config_preserving_comments(runtime)
+        text = cfg_file.read_text(encoding="utf-8")
+        assert '"language": "zh"' in text
+        assert "李雷" not in text and "Cloud SQL" not in text
+        assert runtime["stt"]["funasr"]["hotword"] == "李雷 韩梅梅"   # caller untouched
+
+    def test_fallback_dump_blanks_hotword(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ms, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(ms, "CONFIG_FILE", tmp_path / "config.jsonc")
+        ms.save_config({"stt": {"funasr": {"hotword": "李雷",
+                                           "hotword_phrases": ["Cloud SQL"]}}})
+        text = (tmp_path / "config.jsonc").read_text(encoding="utf-8")
+        assert "李雷" not in text and "hotword_phrases" not in text

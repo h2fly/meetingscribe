@@ -262,3 +262,29 @@ class TestInlinePartial:
         groups = ms._caption_groups_html(rows)
         assert r.render(groups) != "full"
         assert_matches_full_rebuild(view, groups)
+
+
+class TestUntranslatedGroups:
+    """dst=None: translation off / line already in the target language."""
+
+    def test_no_placeholder_but_still_two_blocks(self, pane):
+        out = ms._caption_groups_html([("", "hello there", None)])
+        assert "…" not in out[0] and out[0].count("<p ") == 2
+        view, r = pane
+        r.render(out)
+        assert view.document().blockCount() == 2
+
+    def test_partial_translation_still_shows(self):
+        out = ms._caption_groups_html([("", "你好", None)],
+                                      partial="下一句", partial_dst="next")
+        assert "next" in out[0]
+
+    def test_incremental_paths_keep_block_count(self, pane):
+        view, r = pane
+        rows = []
+        for i in range(30):
+            rows.append(("", f"line {i}", None if i % 2 else f"第 {i} 行"))
+            groups = ms._caption_groups_html(rows)
+            mode = r.render(groups)
+            assert i <= 1 or mode != "full"   # 1 group: nothing untouched to keep
+            assert_matches_full_rebuild(view, groups)

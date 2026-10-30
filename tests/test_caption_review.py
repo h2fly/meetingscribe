@@ -138,7 +138,9 @@ class _Sink:
 
 
 def _engine(sink, reply="", **review):
-    cfg = {"live_captions": {"review": {"trigger_lines": 1, **review}}}
+    # Chinese fixtures → a "zh" session, so their translations are wanted.
+    cfg = {"live_captions": {"language": "zh", "refine": False,
+                             "review": {"trigger_lines": 1, **review}}}
     eng = ms.LiveCaptionEngine(cfg, sink)
     eng._review_llm = lambda prompt: reply
     return eng
@@ -200,6 +202,17 @@ class TestReviewWorker:
         assert refined and refined[0]["text"] == "我们把流量切到 ChatOps 上面"
         trans = sink.of_type("translation")
         assert trans and trans[0]["text"] == "We route traffic to ChatOps."
+
+    def test_no_translation_written_back_when_translation_is_off(self):
+        sink = _Sink()
+        eng = _engine(sink)
+        eng._lc["translate_to"] = "off"
+        eng._finalize_segment("我们把流量切到拆特ops上面")
+        eng._review_llm = lambda p: (
+            "1 ||| 我们把流量切到 ChatOps 上面 ||| We route traffic to ChatOps.")
+        self._run_once(eng, sink, "refined")
+        assert sink.of_type("refined")          # the source is still corrected
+        assert all(t.get("skipped") for t in sink.of_type("translation"))
 
     def test_prompt_carries_hotwords_and_lines(self):
         seen = {}
@@ -298,7 +311,8 @@ class TestReviewLlmCall:
             lambda *a, **k: (_ for _ in ()).throw(TypeError("bad signature")))
         sink = _Sink()
         eng = ms.LiveCaptionEngine(
-            {"live_captions": {"review": {"trigger_lines": 1}}}, sink)
+            {"live_captions": {"language": "zh", "refine": False,
+                               "review": {"trigger_lines": 1}}}, sink)
         eng._finalize_segment("第一句话内容")
         eng._running = True
         t = threading.Thread(target=eng._review_worker, daemon=True)

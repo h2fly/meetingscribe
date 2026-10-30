@@ -406,7 +406,9 @@ class TestNoiseSegments:
 
     def test_real_segment_still_flows(self):
         events = []
-        eng = ms.LiveCaptionEngine({}, lambda ev: events.append(ev))
+        eng = ms.LiveCaptionEngine(
+            {"live_captions": {"language": "zh", "refine": False}},
+            lambda ev: events.append(ev))
         eng._finalize_segment("这个方案可以", np.zeros(24000, dtype=np.float32))
         assert [e["type"] for e in events] == ["final"]
         assert eng._spk_queue.qsize() == 1

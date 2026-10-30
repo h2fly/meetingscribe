@@ -1201,9 +1201,16 @@ DEFAULT_CONFIG = {
         #   "en" = NVIDIA Nemotron Speech Streaming EN 0.6B（自带大小写和标点，英文远好于 zipformer）
         #   "zh" = 流式 zipformer 中英双语 + FunASR refine（中文会议用）
         "language": "en",
+        # 实时翻译的目标语言："zh" / "en" / "off"（不翻译）。留空 = 识别语言的另一种。
+        # 目标与识别语言相同时整场不翻译（也不加载翻译模型）；双语识别里已是目标语言的行跳过。
+        "translate_to": "",
         # en 模式的编码器分块（80 / 160 / 560 / 1120 ms，各是一个独立导出的模型）：
         # 越大越准、出字越晚。NVIDIA 公布 WER：8.43 / 7.67 / 7.07 / 6.93 %。
         "en_chunk_ms": 560,
+        # zh 模式的流式模型："paraformer"（默认，中英双语，叠字少、英文术语认得出）/
+        # "zipformer-2025"（纯中文，中文更准但几乎认不出英文词）/ "zipformer-2025-xlarge"
+        # （同上，更大更慢）/ "zipformer-2023"（旧的双语模型，远场叠字严重）。首次使用自动下载。
+        "zh_model": "paraformer",
         "asr_model_dir": "",       # 留空 = 按 language 首次使用时自动下载；填了则无视 language
         "mt_zh_en": "Helsinki-NLP/opus-mt-zh-en",
         "mt_en_zh": "Helsinki-NLP/opus-mt-en-zh",
@@ -1212,6 +1219,14 @@ DEFAULT_CONFIG = {
         # 直接跳过——迟到几十秒的修正没有价值，还会拖住后面的段。
         "refine_max_backlog": 3,
         "partial_interval_ms": 500,  # 进行中字幕的最小刷新间隔（调大 = 更稳定不闪跳）
+        # 进行中那一行的实时翻译。只在「刚说完一句」或「新增够多文字且距上次够久」时才翻，
+        # 否则译文工作量的九成都花在定稿后就被替换的预览上。false = 只翻定稿行（最省电）。
+        "partial_mt": True,
+        "partial_mt_min_interval_ms": 2500,
+        "partial_mt_min_chars": 40,   # 中文按 2 计
+        # 录音结束后空闲多少分钟释放翻译模型（HY-MT / Qwen，约 1.2 GB）；
+        # 下次录音重新加载不到 1 秒。0 = 一直常驻。
+        "release_idle_minutes": 10,
         # 断句（端点检测）阈值，直接透传给 sherpa。这是「字幕碎不碎」的唯一旋钮：
         # 一个人连续讲话时断得越少，每行携带的上下文越多，后面的 refine 和批量
         # 复核就越准；代价是这一行要更晚才出现在屏幕上。
@@ -1687,8 +1702,7 @@ def _save_hotword_file(hotword: str, store: "dict | None" = None) -> None:
         "// hotword   单词词表，空格分隔；手工增删这一行即可。",
         "// phrases   多词术语（含空格），如 \"Cloud SQL\" / \"error budget\"。",
         "//           空格分隔的 hotword 表达不了它们，所以单列一个数组。",
-        "//           注意：含标点的词（Pub/Sub、AI-Native）流式识别无法编码，",
-        "//           会被跳过并记日志；二次校验和 qwen 术语表仍然使用。",
+        "//           实时字幕的流式识别不使用热词；离线转写、二次校验和翻译术语表使用。",
         "// pinned    永不淘汰的词（Notion 导入的成员/项目名，或你手工钉的）。",
         "//           手工往 pinned 里加词即可生效，不必同时写进 hotword。",
         "// hits      该词在历次转写中出现的次数。",
@@ -1726,7 +1740,7 @@ def load_config() -> dict:
     if _hw_store["phrases"]:
         # Kept separate from the flat string, which is space-separated and so
         # cannot hold a multi-word term. Only consumers that can use a phrase
-        # read this (sherpa hotwords file, qwen glossary, caption casing).
+        # read this (qwen glossary, caption casing).
         cfg.setdefault("stt", {}).setdefault("funasr", {})[
             "hotword_phrases"] = list(_hw_store["phrases"])
     _apply_audio_overrides(cfg)
@@ -1747,7 +1761,31 @@ def save_config(cfg: dict):
     if _save_config_preserving_comments(cfg):
         return
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        json.dump(_config_for_disk(cfg, {}), f, ensure_ascii=False, indent=2)
+
+
+def _config_for_disk(cfg: dict, on_disk: dict) -> dict:
+    """`cfg` minus what `load_config` merged in from gitignored hotword.jsonc.
+
+    The runtime config carries the whole hotword list (colleague and customer
+    names) in `stt.funasr.hotword` / `hotword_phrases`. Every GUI preference
+    save passes that runtime dict here, so without this the list was copied
+    into the TRACKED config.jsonc (found 2026-10-30 after a caption-language
+    switch). config.jsonc's `hotword` is always written empty (the documented
+    invariant; also what `_migrate_inline_hotword` relies on) and only where
+    the file already has the key — adding one would force the comment-losing
+    fallback. `hotword_phrases` is runtime-only and never written.
+    """
+    out = copy.deepcopy(cfg)
+    funasr = out.get("stt", {}).get("funasr")
+    if isinstance(funasr, dict):
+        disk = (on_disk.get("stt") or {}).get("funasr") or {}
+        funasr.pop("hotword_phrases", None)
+        if "hotword" in disk or not on_disk:
+            funasr["hotword"] = ""
+        else:
+            funasr.pop("hotword", None)
+    return out
 
 
 def _resolve_prompt(cfg: dict, key: str, mode: str | None = None) -> str:
@@ -1841,6 +1879,7 @@ def _save_config_preserving_comments(cfg: dict) -> bool:
     except (OSError, json.JSONDecodeError, ValueError) as e:
         _log("CONFIG", f"in-place save: parse failed: {type(e).__name__}: {e}")
         return False
+    cfg = _config_for_disk(cfg, existing)
 
     diffs: list[tuple[tuple[str, ...], object]] = []
 
@@ -4557,22 +4596,6 @@ _CAPTION_PACER_INTERVAL = 0.25     # seconds between drain/mix/feed iterations
 _CAPTION_STOP_ASR_TIMEOUT = 5.0
 _CAPTION_STOP_TOKEN_TIMEOUT = 0.5
 
-# Hotwords sherpa can actually encode. Its cjkchar+bpe vocabulary has no
-# punctuation tokens, so ONE stray character makes the whole term fail and the
-# recognizer skips it — printing to C-level stderr, which the log tee never
-# captured, so the term looked configured while doing nothing. Measured
-# against the real model: letters / digits / CJK / spaces encode (including
-# multi-word phrases like `Cloud SQL` and `error budget`); `.` `+` `_` `'`
-# `-` `/` all fail (`Node.js`, `C++`, `Pub/Sub`, `blue-green`, `AI-Native`).
-_SHERPA_HOTWORD_OK_RE = re.compile(r"^[0-9A-Za-z一-鿿 ]+$")
-
-
-def _sherpa_encodable(term: str) -> bool:
-    """Whether the streaming recognizer can bias on this hotword."""
-    term = (term or "").strip()
-    return bool(term) and bool(_SHERPA_HOTWORD_OK_RE.match(term))
-
-
 def _hotword_term_list(hotword: str, phrases: "list[str] | None" = None) -> "list[str]":
     """All hotword terms as a list: the space-separated single words plus any
     multi-word phrases, de-duplicated case-insensitively, order preserved.
@@ -4580,8 +4603,8 @@ def _hotword_term_list(hotword: str, phrases: "list[str] | None" = None) -> "lis
     Two stores because the flat `hotword` string uses space as its separator
     and so cannot hold a phrase. Keeping it that way means every existing
     consumer (FunASR's `generate(hotword=…)`, the config editor, hand edits)
-    is unaffected, and only the consumers that can USE a phrase — the sherpa
-    hotwords file, the qwen glossary, caption case restoration — read both.
+    is unaffected, and only the consumers that can USE a phrase — the qwen
+    glossary and caption case restoration — read both.
     """
     out, seen = [], set()
     for term in list((hotword or "").split()) + list(phrases or []):
@@ -4636,6 +4659,37 @@ _SHERPA_ZIPFORMER_URL = (
     _SHERPA_RELEASE_BASE
     + "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2"
 )
+# Chinese captions (`language: "zh"`), picked by `live_captions.zh_model`.
+# Measured 2026-10-30 on four real recordings from the built-in mic (45 s
+# test, 4-min meeting, 4-min book talk, 4-min zh/en code-switching), CER
+# against the offline paraformer-large transcript of the same audio, plus
+# adjacent repeated CJK chars per 1000 (offline reference: 0 / 2 / 28 / 10):
+#
+#   model                     CER test/meet/read/mixed   repeats       RTF
+#   zipformer bilingual 2023  31 / 88 / 96 / 69 %         152/116/198/79  0.035
+#   paraformer bilingual      17 / 27 / 19 / 32 %         0/17/37/11      0.035
+#   zipformer zh 2025         21 / 39 / 13 / 34 %         0/3/18/4        0.05
+#   zipformer zh xlarge 2025   6 / 44 / 13 / 30 %         0/1/21/1        0.12
+#
+# The 2023 zipformer is clean on its own close-talk test wavs but stutters on
+# far-field room audio (「今天点点点点点什么」) — neither gain, polyphase
+# resampling nor sherpa's own resampler changed that, so it is the model.
+# The 2025 zipformers are Chinese-only (byte-level BPE, multi_zh-hans data):
+# English terms vanish (DB → 「津」, monitor / testing dropped), which is why
+# paraformer is the default — it kept performance / owner / mysql / api. Its
+# CER is flattered by a same-family reference; the repeat and English counts
+# are not. No model gets hotword biasing any more (measured: it made the
+# 2023 zipformer WORSE, 31 → 44 % on the test clip; paraformer can't bias).
+_SHERPA_ZH_URLS = {
+    "paraformer": _SHERPA_RELEASE_BASE
+    + "sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2",
+    "zipformer-2025": _SHERPA_RELEASE_BASE
+    + "sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30.tar.bz2",
+    "zipformer-2025-xlarge": _SHERPA_RELEASE_BASE
+    + "sherpa-onnx-streaming-zipformer-zh-xlarge-int8-2025-06-30.tar.bz2",
+    "zipformer-2023": _SHERPA_ZIPFORMER_URL,
+}
+_CAPTION_ZH_MODEL_DEFAULT = "paraformer"
 # English captions: NVIDIA Nemotron Speech Streaming EN 0.6B (Jan 2026), the
 # sherpa-onnx int8 export. Unlike the 2023 bilingual zipformer it emits real
 # casing and punctuation, and it is an English-first model — the zipformer
@@ -4660,15 +4714,56 @@ def _caption_language(lc_cfg: dict) -> str:
     return "en"
 
 
+_CAPTION_TRANSLATE_TARGETS = ("zh", "en", "off")
+
+
+def _caption_translate_to(lc_cfg: dict) -> str:
+    """`live_captions.translate_to`: "zh" / "en" / "off".
+
+    Unset or junk → the language opposite to the recognition language, which
+    is what every session did before the target became selectable.
+    """
+    raw = str(lc_cfg.get("translate_to") or "").strip().lower()
+    if raw in _CAPTION_TRANSLATE_TARGETS:
+        return raw
+    if raw:
+        _log("CAPTION", f"translate_to={raw!r} not one of "
+                        f"{_CAPTION_TRANSLATE_TARGETS}, using the default")
+    return "en" if _caption_language(lc_cfg) == "zh" else "zh"
+
+
+def _caption_mt_active(lc_cfg: dict) -> bool:
+    """Whether this session translates at all: not "off", and not into the
+    language being recognized (an English meeting with English captions)."""
+    target = _caption_translate_to(lc_cfg)
+    return target != "off" and target != _caption_language(lc_cfg)
+
+
+def _caption_mt_wanted(text: str, lc_cfg: dict) -> bool:
+    """Whether this LINE needs translating. Every backend picks its direction
+    by sniffing the line, so skipping lines already in the target language is
+    all it takes to pin the direction — the bilingual zipformer emits English
+    lines in a Chinese session, and translating those "into English" would
+    just send them to Chinese."""
+    if not _caption_mt_active(lc_cfg):
+        return False
+    return _caption_is_english(text) != (_caption_translate_to(lc_cfg) == "en")
+
+
 def _caption_asr_model_url(lc_cfg: dict) -> str:
     """Release archive for the configured caption language.
 
-    "zh" keeps the bilingual zipformer (plus the FunASR refine pass, which
-    only ever touches Chinese lines). "en" picks the Nemotron export whose
-    chunk size is closest to `en_chunk_ms`.
+    "zh" picks `zh_model` from `_SHERPA_ZH_URLS` (paraformer by default; junk
+    falls back to it, logged). "en" picks the Nemotron export whose chunk
+    size is closest to `en_chunk_ms`.
     """
     if _caption_language(lc_cfg) == "zh":
-        return _SHERPA_ZIPFORMER_URL
+        want = str(lc_cfg.get("zh_model") or _CAPTION_ZH_MODEL_DEFAULT).strip().lower()
+        if want not in _SHERPA_ZH_URLS:
+            _log("CAPTION", f"zh_model={want!r} not one of {list(_SHERPA_ZH_URLS)}, "
+                            f"using {_CAPTION_ZH_MODEL_DEFAULT!r}")
+            want = _CAPTION_ZH_MODEL_DEFAULT
+        return _SHERPA_ZH_URLS[want]
     try:
         want = float(lc_cfg.get("en_chunk_ms") or 560)
     except (TypeError, ValueError):
@@ -4703,28 +4798,74 @@ def _close_caption_llm_backends() -> None:
     printed. Python's atexit runs before those destructors.
     """
     for backend in list(_caption_backend_cache.values()):
-        llm = getattr(backend, "_llm", None)
-        close = getattr(llm, "close", None)
-        if close is None:
-            continue
-        # The MT worker may still be inside a call: the engine abandons slow
-        # workers on stop, and freeing the model under a running decode aborts
-        # too (`GGML_ASSERT(backend_res != nullptr)`, measured after a replay
-        # with context translation, whose calls run longer). Wait it out —
-        # one call is a few seconds at most. If it never frees up, skip the
-        # close: the teardown assert is the lesser evil than a hang at exit.
-        lock = getattr(backend, "_llm_lock", None)
-        if lock is not None and not lock.acquire(timeout=10):
-            continue
-        # The lock is deliberately never released: a straggling worker must
-        # block on it rather than call into a freed model.
-        try:
-            close()
-        except Exception:
-            pass   # exit path: never raise
+        _close_llm_backend(backend, timeout=10)
+
+
+def _close_llm_backend(backend, timeout: float) -> bool:
+    """Free one cached llama.cpp backend; False if it is still busy.
+
+    The MT worker may still be inside a call: the engine abandons slow
+    workers on stop, and freeing the model under a running decode aborts
+    too (`GGML_ASSERT(backend_res != nullptr)`, measured after a replay
+    with context translation, whose calls run longer). So wait for its lock
+    — one call is a few seconds at most — and if it never frees up, skip
+    the close: at exit the teardown assert is the lesser evil than a hang.
+    Backends without a llama model (sherpa, Marian) report True: dropping
+    the reference is all they need.
+    """
+    llm = getattr(backend, "_llm", None)
+    close = getattr(llm, "close", None)
+    if close is None:
+        return True
+    lock = getattr(backend, "_llm_lock", None)
+    if lock is not None and not lock.acquire(timeout=timeout):
+        return False
+    # The lock is deliberately never released: a straggling worker must
+    # block on it rather than call into a freed model.
+    try:
+        close()
+    except Exception as e:
+        _log("CAPTION", f"llm close: {type(e).__name__}: {e}")
+    return True
 
 
 atexit.register(_close_caption_llm_backends)
+
+
+def _release_caption_models() -> "list[str]":
+    """Free the cached llama.cpp translation models so an idle app gives the
+    memory back.
+
+    Models are cached across recordings so the next one starts instantly, but
+    nothing ever let go of them: measured, the GUI sat at 1.27 GB idle after
+    one English session. Only the llama.cpp backends (HY-MT / Qwen) go,
+    because they are the only ones where releasing pays — measured over four
+    load/release cycles:
+      - HY-MT: ~1.2 GB returned each time, reload 0.2-0.9 s;
+      - the sherpa recognizer: almost nothing returned (onnxruntime's memory
+        stays with the allocator) while each reload grew the process ~100 MB,
+        so releasing it costs reload time and memory;
+      - refine's paraformer-large (`_funasr_model_cache`, shared with the
+        offline pipeline): a 27 s reload.
+    The caller must make sure no caption engine is running — the GUI calls
+    this on the Qt thread, which is also where recording and captions start,
+    so nothing can load a model concurrently. Returns what was released.
+    """
+    released = []
+    for key in list(_caption_backend_cache):
+        backend = _caption_backend_cache[key]
+        if getattr(getattr(backend, "_llm", None), "close", None) is None:
+            continue
+        # Short wait: this runs on the UI thread, and a busy model is just
+        # kept for the next round rather than worth a freeze.
+        if not _close_llm_backend(backend, timeout=1.0):
+            continue
+        del _caption_backend_cache[key]
+        released.append(type(backend).__name__)
+    if released:
+        import gc
+        gc.collect()
+    return released
 
 
 def _caption_resample(x: "np.ndarray", sr_from: int, sr_to: int = _CAPTION_SAMPLE_RATE) -> "np.ndarray":
@@ -5271,7 +5412,7 @@ class _CaptionSpeakerId:
         return np.asarray(arr, dtype=np.float32).reshape(-1)
 
 
-def _caption_groups_html(groups: "list[tuple[str, str, str]]",
+def _caption_groups_html(groups: "list[tuple[str, str, str | None]]",
                          partial: str = "", partial_dst: str = "") -> "list[str]":
     """HTML for the caption pane: one entry per `(tag_html, src, dst)` group,
     each exactly two paragraphs (the unit `_CaptionDocRenderer` patches).
@@ -5304,16 +5445,23 @@ def _caption_groups_html(groups: "list[tuple[str, str, str]]",
     last = len(groups) - 1
     for i, (tag, src, dst) in enumerate(groups):
         src_html = html.escape(src)
-        dst_html = html.escape(dst)
+        dst_html = html.escape(dst or "")
         if i == last and partial:
             src_html = _tail(src, partial, "#8a8a8a")
             if partial_dst:
-                dst_html = _tail(dst, partial_dst, "#7fa8d9")
+                dst_html = _tail(dst or "", partial_dst, "#7fa8d9")
+        if dst is None and not dst_html:
+            # Nothing to translate (off, or already the target language).
+            # The paragraph must still exist — the renderer counts two blocks
+            # per group — so it is a 1 px zero-width space: Qt drops an EMPTY
+            # <p> from the block list (measured), which would break that count.
+            dst_para = '<p style="margin:0; font-size:1px;">&#8203;</p>'
+        else:
+            dst_para = (f'<p style="margin:1px 0 0 0; color:#0066d6;">'
+                        f'{dst_html or "…"}</p>')
         out.append(
             f'<p style="margin:6px 0 0 0; color:#1f1f1f;">'
-            f'{tag}{src_html}</p>'
-            f'<p style="margin:1px 0 0 0; color:#0066d6;">'
-            f'{dst_html or "…"}</p>'
+            f'{tag}{src_html}</p>{dst_para}'
         )
     return out
 
@@ -5532,9 +5680,10 @@ def _pick_model_file(model_dir: Path, stem: str) -> str:
 
 
 class _SherpaCaptionASR:
-    """Streaming caption ASR on sherpa-onnx: the bilingual zipformer for
-    `language: "zh"`, Nemotron Speech Streaming EN for `language: "en"`.
-    Both are transducers, so one class drives either."""
+    """Streaming caption ASR on sherpa-onnx: `zh_model` for `language: "zh"`
+    (streaming paraformer by default, or a zipformer), Nemotron Speech
+    Streaming EN for `language: "en"`. Transducers and the paraformer share
+    the OnlineRecognizer stream API, so one class drives all of them."""
 
     def __init__(self, lc_cfg: dict, emit_partial, emit_final, hotword: str = "",
                  phrases: "list[str] | None" = None):
@@ -5550,6 +5699,28 @@ class _SherpaCaptionASR:
         self.model_name = model_dir.name
         _log("CAPTION", f"streaming ASR model: {model_dir.name}")
         ep = _caption_endpoint_rules(lc_cfg)
+        terms = _hotword_term_list(hotword, phrases)
+        # Kept for `_caption_fix_case`: the 2023 zipformer emits English in
+        # ALL CAPS, and the configured spelling of a hotword must survive the
+        # downcase. Phrases included — a multi-word term needs it too.
+        self._hotwords = [t for t in terms if len(t) >= 2]
+        if not list(model_dir.glob("joiner*.onnx")):
+            # Streaming paraformer (encoder + decoder, no joiner): the Chinese
+            # default.
+            self._rec = sherpa_onnx.OnlineRecognizer.from_paraformer(
+                tokens=str(model_dir / "tokens.txt"),
+                encoder=_pick_model_file(model_dir, "encoder"),
+                decoder=_pick_model_file(model_dir, "decoder"),
+                num_threads=2,
+                sample_rate=_CAPTION_SAMPLE_RATE,
+                feature_dim=80,
+                enable_endpoint_detection=True,
+                **ep,
+            )
+            _log("CAPTION", "endpoint rules: " + " ".join(
+                f"{k.split('_min_')[0]}={v}" for k, v in sorted(ep.items())))
+            self._init_session_state()
+            return
         kwargs = dict(
             tokens=str(model_dir / "tokens.txt"),
             encoder=_pick_model_file(model_dir, "encoder"),
@@ -5564,63 +5735,14 @@ class _SherpaCaptionASR:
         )
         _log("CAPTION", "endpoint rules: " + " ".join(
             f"{k.split('_min_')[0]}={v}" for k, v in sorted(ep.items())))
-        # Contextual biasing for domain terms. ONE TERM PER LINE, and a line
-        # may contain spaces: sherpa encodes the whole line as a token
-        # sequence, so `Cloud SQL` and `error budget` bias correctly (measured
-        # against the real model). Splitting on whitespace, as this used to
-        # do, made multi-word terms structurally inexpressible — which is most
-        # GCP service names. Needs modified_beam_search + the model's
-        # bpe.vocab.
-        terms = _hotword_term_list(hotword, phrases)
-        usable = [t for t in terms if _sherpa_encodable(t)]
-        skipped = [t for t in terms if not _sherpa_encodable(t)]
-        if skipped:
-            # Previously these failed inside the recognizer, which complained
-            # on C-level stderr that the log tee never captured — so a term
-            # looked configured while biasing nothing.
-            _log("CAPTION", f"hotwords not encodable by the streaming model, "
-                            f"skipped {len(skipped)}: {' '.join(skipped)} "
-                            f"(punctuation has no bpe token; refine + qwen "
-                            f"glossary still use them)")
-        bpe_vocab = model_dir / "bpe.vocab"
-        if usable and not bpe_vocab.exists():
-            # The Nemotron export ships tokens.txt only; sherpa needs the
-            # sentencepiece vocab to encode a hotword, so biasing is off and
-            # terms are left to the MT glossary and the LLM review pass.
-            _log("CAPTION", f"hotwords inactive: {model_dir.name} has no "
-                            f"bpe.vocab ({len(usable)} terms not biased)")
-        if usable and bpe_vocab.exists():
-            hw_file = CONFIG_DIR / "models" / "caption_hotwords.txt"
-            hw_file.parent.mkdir(parents=True, exist_ok=True)
-            hw_file.write_text("\n".join(usable) + "\n", encoding="utf-8")
-            kwargs.update(
-                decoding_method="modified_beam_search",
-                hotwords_file=str(hw_file),
-                hotwords_score=1.5,
-                modeling_unit="cjkchar+bpe",
-                bpe_vocab=str(bpe_vocab),
-            )
-        try:
-            self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
-            if "hotwords_file" in kwargs:
-                _log("CAPTION", f"fast ASR hotwords active: {len(usable)} terms"
-                                f" ({sum(1 for t in usable if ' ' in t)} 多词)")
-        except Exception as e:
-            if "hotwords_file" not in kwargs:
-                raise
-            # Older sherpa-onnx builds lack hotword kwargs — degrade to
-            # greedy decoding rather than losing captions entirely.
-            _log("CAPTION", f"hotwords unsupported, falling back to greedy: "
-                            f"{type(e).__name__}: {e}")
-            for k in ("hotwords_file", "hotwords_score",
-                      "modeling_unit", "bpe_vocab"):
-                kwargs.pop(k, None)
-            kwargs["decoding_method"] = "greedy_search"
-            self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
-        # Kept for `_caption_fix_case`: this model emits English in ALL CAPS,
-        # and the configured spelling of a hotword must survive the downcase.
-        # Phrases included — a multi-word term needs its casing restored too.
-        self._hotwords = [t for t in terms if len(t) >= 2]
+        # No contextual biasing: measured on the 2023 zipformer it made
+        # recognition WORSE (CER 31 → 44 % on a real built-in-mic clip), and
+        # the paraformer default cannot bias at all. Terminology is handled
+        # by the refine pass, the MT glossary and the LLM review pass.
+        self._rec = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
+        self._init_session_state()
+
+    def _init_session_state(self):
         self._stream = self._rec.create_stream()
         self._seg_audio: list = []
         # `_raw_hyp` mirrors what the recognizer last returned (needed to
@@ -6150,6 +6272,40 @@ def _mt_partial_cooldown(secs: float) -> float:
     return secs * _MT_PARTIAL_COOLDOWN_RATIO
 
 
+# Throttle for partial translation (`live_captions.partial_mt_*`). Measured on
+# a 2-minute English replay with HY-MT, translating every partial change cost
+# 122 calls / 52.4 s of model time against 9 calls / 5.6 s for the finalized
+# lines — 90 % of the MT work went into previews that the final replaces.
+# Throttled (same replay): 1500 ms / 24 chars -> 49 calls / 26.1 s (-50 %),
+# 2500 ms / 40 chars -> 32 calls / 18.4 s (-65 %), with final->translation
+# latency unchanged (median 0.61-0.65 s). The preview then refreshes every
+# ~3-4 s instead of every second, which reads fine: the source line above it
+# keeps updating live.
+_MT_PARTIAL_MIN_INTERVAL_MS = 2500
+_MT_PARTIAL_MIN_CHARS = 40
+
+
+def _mt_partial_due(text: str, last: str, since_last: float,
+                    min_interval: float, min_chars: int) -> bool:
+    """Whether the in-flight partial is worth another translation call.
+
+    Due when a sentence has just been completed (that unit is cached, so the
+    final reuses it for free), or when enough NEW text has arrived since the
+    last call — measured past the common prefix, so a new line counts in full
+    and a recognizer rewriting its tail counts what it rewrote — and the last
+    call is at least `min_interval` old.
+    """
+    if not last:
+        return True
+    done = sum(map(_caption_unit_complete, _split_caption_sentences(text)))
+    done_before = sum(map(_caption_unit_complete, _split_caption_sentences(last)))
+    if done > done_before:
+        return True
+    common = len(os.path.commonprefix([text, last]))
+    return (since_last >= min_interval
+            and _caption_unit_weight(text[common:]) >= min_chars)
+
+
 class _HYMTCaptionMT:
     """MT backend: Tencent HY-MT1.5-1.8B (GGUF) via llama.cpp.
 
@@ -6436,6 +6592,9 @@ class LiveCaptionEngine:
         # ("Yeah" / "Uh-huh" class) came back from refine as 「需要。」.
         self._refine_enabled = (bool(self._lc.get("refine", True))
                                 and _caption_language(self._lc) == "zh")
+        # Mid-session language switch requested from the GUI; picked up by the
+        # ASR worker between decode steps (see `set_language`).
+        self._lang_request: "str | None" = None
         # A re-decode costs ~1.0–1.4 s per segment (measured on M2, offline
         # paraformer-large + vad + punc). When speech comes in faster than
         # that the queue grows without bound and refinements land minutes
@@ -6471,9 +6630,28 @@ class LiveCaptionEngine:
         self._emit(type="partial", text=text)
 
     def _queue_translation(self, sid: int, text: str):
+        if not _caption_mt_wanted(text, self._lc):
+            # Translation off, into the recognized language, or a line already
+            # in the target language: say so, so the pane doesn't wait on "…".
+            with self._mt_lock:
+                self._mt_texts[sid] = text
+                self._mt_done[sid] = text
+            self._emit(type="translation", id=sid, text="", skipped=True)
+            return
         with self._mt_lock:
             self._mt_texts[sid] = text
         self._mt_queue.put(sid)
+
+    def set_translate_to(self, target: str) -> None:
+        """Change the translation target mid-session ("zh" / "en" / "off").
+        Applies from the next line on; lines already shown keep theirs. The
+        MT model loads lazily on the first line that needs it."""
+        target = (target or "").strip().lower()
+        if target not in _CAPTION_TRANSLATE_TARGETS:
+            return
+        self._lc["translate_to"] = target
+        if not _caption_mt_active(self._lc):
+            self._emit(type="partial_translation", text="")
 
     def _review_record(self, sid: int, text: str):
         if not self._review_enabled:
@@ -6851,6 +7029,9 @@ class LiveCaptionEngine:
         try:
             while self._running:
                 time.sleep(_CAPTION_PACER_INTERVAL)
+                lang, self._lang_request = self._lang_request, None
+                if lang:
+                    backend = self._switch_asr_language(backend, lang)
                 chunk = self._drain_mixed()
                 try:
                     backend.accept(chunk)
@@ -6861,6 +7042,52 @@ class LiveCaptionEngine:
                 backend.flush()
             except Exception as e:
                 _log("CAPTION", f"asr flush: {type(e).__name__}: {e}")
+
+    def set_language(self, lang: str) -> None:
+        """Switch the streaming recognizer mid-session ("en" / "zh").
+
+        Only records the request: the ASR thread owns the recognizer and
+        performs the swap between decode steps, so no lock is held around a
+        model load. Audio keeps accumulating in the per-source ring buffers
+        meanwhile (`_CAPTION_RING_SECONDS`), so nothing said during the swap
+        is lost — it is decoded by the new model once it is ready.
+        """
+        lang = (lang or "").strip().lower()
+        if lang in _CAPTION_LANGUAGES and lang != _caption_language(self._lc):
+            self._lang_request = lang
+
+    def _switch_asr_language(self, backend, lang: str):
+        """Finalize the line in flight with the OLD model, then swap. Returns
+        the backend to keep using — the old one if the new model fails to
+        load, so a bad switch costs the switch, not the captions."""
+        try:
+            backend.flush()
+        except Exception as e:
+            _log("CAPTION", f"asr flush before switch: {type(e).__name__}: {e}")
+        old = self._lc.get("language")
+        self._lc["language"] = lang
+        self._emit(type="status", state="loading")
+        t0 = time.time()
+        try:
+            new = self._load_asr_backend()
+        except Exception as e:
+            _log("ERR", f"caption language switch to {lang}: {type(e).__name__}: {e}")
+            self._lc["language"] = old
+            self._emit(type="error", message=str(e))
+            return backend
+        self.asr_backend = new
+        # Refine re-decodes with a Chinese model: on for zh, off for en (the
+        # reason it is session-level, not per-line, is in __init__).
+        self._refine_enabled = (bool(self._lc.get("refine", True)) and lang == "zh")
+        if self._refine_enabled and not (
+                self._refine_thread and self._refine_thread.is_alive()):
+            self._refine_thread = threading.Thread(
+                target=self._refine_worker, daemon=True, name="caption-refine")
+            self._refine_thread.start()
+        self._emit(type="status", state="ready")
+        _log("CAPTION", f"language switched {old} -> {lang} in {time.time() - t0:.1f}s "
+                        f"refine={self._refine_enabled}")
+        return new
 
     def _mt_worker(self):
         backend = None
@@ -6877,9 +7104,18 @@ class LiveCaptionEngine:
                     backend = False  # sentinel: don't retry every segment
             return backend
 
-        # Preload so the first finalized line doesn't pay model-load latency.
-        _ensure_backend()
+        # Preload so the first finalized line doesn't pay model-load latency —
+        # unless this session doesn't translate, which then never loads the
+        # ~1.1 GB model at all. A later switch to a target loads it lazily.
+        if _caption_mt_active(self._lc):
+            _ensure_backend()
         last_partial = ""
+        last_partial_at = 0.0
+        partial_on = bool(self._lc.get("partial_mt", True))
+        min_interval = max(0, int(self._lc.get(
+            "partial_mt_min_interval_ms", _MT_PARTIAL_MIN_INTERVAL_MS))) / 1000.0
+        min_chars = max(0, int(self._lc.get(
+            "partial_mt_min_chars", _MT_PARTIAL_MIN_CHARS)))
         while True:
             try:
                 item = self._mt_queue.get(timeout=0.25)
@@ -6892,14 +7128,22 @@ class LiveCaptionEngine:
                 # path's cost — is the right thing to gate on. Gating on the
                 # shared last-call time would let the grammar-constrained fix
                 # call (~1.8 s) disable partial translation outright.
-                if not self._running or not _ensure_backend():
+                if (not partial_on or not self._running
+                        or not _caption_mt_active(self._lc)):
                     continue
                 if time.time() < self._mt_partial_resume_at:
                     continue
                 with self._partial_lock:
                     text = self._partial_pending
-                if text and text != last_partial and len(text) >= 6:
+                if not _caption_mt_wanted(text, self._lc):
+                    continue
+                if (text and text != last_partial and len(text) >= 6
+                        and _ensure_backend()
+                        and _mt_partial_due(text, last_partial,
+                                            time.time() - last_partial_at,
+                                            min_interval, min_chars)):
                     last_partial = text
+                    last_partial_at = time.time()
                     try:
                         t0 = time.time()
                         out = self._translate_units(backend, text)
@@ -6913,12 +7157,17 @@ class LiveCaptionEngine:
                 continue
             if item is None:
                 break
-            if not _ensure_backend():
-                continue
             with self._mt_lock:
                 text = self._mt_texts.get(item, "")
             if not text or self._mt_done.get(item) == text:
                 continue  # superseded duplicate or nothing to do
+            if not _caption_mt_wanted(text, self._lc):
+                # Target changed while this line waited in the queue.
+                self._mt_done[item] = text
+                self._emit(type="translation", id=item, text="", skipped=True)
+                continue
+            if not _ensure_backend():
+                continue
             try:
                 t0 = time.time()
                 fix = getattr(backend, "correct_and_translate", None)
@@ -7086,6 +7335,8 @@ class LiveCaptionEngine:
                              f"review seg={row['id']} src: "
                              f"{_review_log_text(row['text'])} → "
                              f"{_review_log_text(text)}")
+                    if not _caption_mt_wanted(text, self._lc):
+                        dst = ""  # the model translates every row regardless
                     if dst and dst != row["dst"]:
                         self._emit(type="translation", id=row["id"], text=dst)
                         dst_changed += 1
@@ -7279,7 +7530,7 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
     spk_model   = (pcfg.get("spk_model") or "").strip()
     # Filtered, not the raw list: English terms are measurably inert for
     # SeACo biasing and everyday CJK words measurably harmful. See
-    # `_funasr_hotword`. sherpa and the LLM prompts still get the full list.
+    # `_funasr_hotword`. The LLM prompts still get the full list.
     hotword     = _funasr_hotword(pcfg.get("hotword", ""),
                                   int(pcfg.get("hotword_common_cutoff", 1000)))
     chunk_secs       = int(pcfg.get("chunk_secs", 300))
@@ -8343,9 +8594,8 @@ def _funasr_hotword(hotword: str, cutoff: int = 1000) -> str:
     offender, while 容灾 / 压测 / 冷热存储 / colleague names are absent from it
     entirely and are exactly what needs the help.
 
-    Deliberately NOT applied to sherpa (its own bpe vocab encodes
-    CockroachDB / n2d / `Cloud SQL` fine — English biasing genuinely works
-    there) nor to any LLM prompt, which read the full list as plain text.
+    Deliberately NOT applied to any LLM prompt, which reads the full list as
+    plain text.
     """
     terms = [t for t in (hotword or "").split()
              if any("\u4e00" <= c <= "\u9fff" for c in t)]
@@ -8366,8 +8616,7 @@ def _cfg_hotword(cfg: dict) -> str:
 
     Rendered 、-separated rather than space-separated because multi-word terms
     exist: space-joining would turn 「Cloud SQL」 into two unrelated entries
-    for the reading model, which is the same boundary loss that made the
-    sherpa hotwords file useless for phrases.
+    for the reading model.
 
     This is the PROMPT-facing form only (polish, caption review). FunASR's
     `generate(hotword=…)` reads the raw space-separated string straight from
@@ -10798,6 +11047,8 @@ def _cmd_captions_body(args, cfg):
         lc["en_chunk_ms"] = args.chunk_ms
     if getattr(args, "mt", None):
         lc["mt_provider"] = args.mt
+    if getattr(args, "translate_to", None):
+        lc["translate_to"] = args.translate_to
 
     rows: dict = {}
     order: list = []
@@ -11161,9 +11412,7 @@ def _hotwords_set_phrases(args, cfg) -> None:
     """`hotwords --phrase/--unphrase`: manage multi-word terms.
 
     They need their own store because the flat `hotword` string is
-    space-separated. sherpa encodes a whole hotwords-file line, so `Cloud SQL`
-    biases correctly — which matters because most GCP service names are two
-    words and were previously inexpressible.
+    space-separated, and most GCP service names are two words.
     """
     store = _load_hotword_store()
     have = {p.lower() for p in store["phrases"]}
@@ -11172,11 +11421,6 @@ def _hotwords_set_phrases(args, cfg) -> None:
         ph = " ".join(str(raw).split())
         if " " not in ph:
             rejected.append((ph, "单个词请用 hotword 行或 --pin"))
-        elif not _sherpa_encodable(ph):
-            # Accepting it would look like it worked while the streaming model
-            # silently skipped it; the refine pass would still use it, so this
-            # is a warning rather than a hard stop.
-            rejected.append((ph, "含标点，流式识别无法编码"))
         elif ph.lower() in have:
             missing.append(ph)
         else:
@@ -11446,7 +11690,7 @@ def _cmd_ui_body(args, cfg):
             TextEdit, ProgressBar, SegmentedWidget, BodyLabel,
             StrongBodyLabel, TitleLabel, SubtitleLabel, CaptionLabel,
             SearchLineEdit, TextBrowser, ScrollArea, SpinBox,
-            InfoBar, InfoBarPosition, SwitchButton,
+            InfoBar, InfoBarPosition, SwitchButton, ComboBox,
         )
     except ImportError as e:
         print(
@@ -11715,8 +11959,13 @@ def _cmd_ui_body(args, cfg):
             "rec.import.no_ffmpeg_msg": "未在 PATH 中找到 ffmpeg。\n在 macOS 上可执行：brew install ffmpeg",
             "rec.no_file": "未选择录音文件",
             "rec.selected_prefix": "已选择：",
-            "rec.captions.title": "实时双语字幕",
-            "rec.captions.idle_hint": "开始录音后，此处实时显示中英双语字幕",
+            "rec.captions.title": "实时字幕",
+            "rec.captions.lang_label": "识别",
+            "rec.captions.mt_label": "翻译",
+            "rec.captions.mt_zh": "中文",
+            "rec.captions.mt_en": "English",
+            "rec.captions.mt_off": "不翻译",
+            "rec.captions.idle_hint": "开始录音后，此处实时显示字幕",
             "rec.captions.disabled_hint": "字幕已关闭",
             "rec.captions.status.loading": "字幕模型加载中…（首次使用需下载模型）",
             "rec.captions.status.ready": "字幕运行中",
@@ -11914,8 +12163,13 @@ def _cmd_ui_body(args, cfg):
             "rec.import.no_ffmpeg_msg": "ffmpeg not found on PATH.\nOn macOS: brew install ffmpeg",
             "rec.no_file": "No recording selected",
             "rec.selected_prefix": "Selected: ",
-            "rec.captions.title": "Live bilingual captions",
-            "rec.captions.idle_hint": "Bilingual captions appear here once recording starts",
+            "rec.captions.title": "Live captions",
+            "rec.captions.lang_label": "Speech",
+            "rec.captions.mt_label": "Translate",
+            "rec.captions.mt_zh": "中文",
+            "rec.captions.mt_en": "English",
+            "rec.captions.mt_off": "Off",
+            "rec.captions.idle_hint": "Captions appear here once recording starts",
             "rec.captions.disabled_hint": "Captions are off",
             "rec.captions.status.loading": "Loading caption models… (first use downloads them)",
             "rec.captions.status.ready": "Captions live",
@@ -12355,11 +12609,22 @@ def _cmd_ui_body(args, cfg):
             # int — the read is atomic and a stale read only costs one dropped
             # event on the boundary.
             self._caption_session = 0
+            # Mid-recording caption on/off (set_captions_live). The lock makes
+            # "is this engine still the current one → attach it" atomic
+            # against stop_recording taking the engine away.
+            self._caption_lock = threading.Lock()
+            self._caption_stop_thread: "threading.Thread | None" = None
             self._save_thread: "threading.Thread | None" = None
             self._saved_internal.connect(self._on_saved)
             self._tick = QTimer(self)
             self._tick.setInterval(1000)
             self._tick.timeout.connect(self._on_tick)
+            # Frees the cached caption models after the app has sat idle
+            # (`live_captions.release_idle_minutes`); see
+            # _release_caption_models for why they are not kept forever.
+            self._idle_release = QTimer(self)
+            self._idle_release.setSingleShot(True)
+            self._idle_release.timeout.connect(self._release_idle_models)
 
         @property
         def status(self) -> str:
@@ -12383,6 +12648,7 @@ def _cmd_ui_body(args, cfg):
                 self.elapsed_changed.emit(int(time.time() - self._start_time))
 
         def start_recording(self, plan: "AudioPlan", audio_path: Path) -> bool:
+            self._idle_release.stop()
             wanted = [n for n in (plan.sys_source_name, plan.mic_name) if n]
             role_labels: list[str] = []
             if plan.sys_source_name:
@@ -12396,26 +12662,7 @@ def _cmd_ui_body(args, cfg):
             recorder.on_warning = lambda code: self.warning.emit(code)
             engine = None
             if self.captions_enabled:
-                # Session gate. A superseded engine's workers can still be
-                # mid-call when the next recording starts — a review batch is
-                # a measured 62 s median, and stop() cannot interrupt one.
-                # Their events carry segment ids that restart from 1 every
-                # session, and the pane matches `refined` / `translation` /
-                # `speaker` by id alone, so a late correction from the old
-                # session would overwrite the NEW session's row with that id.
-                # That is what made captions look like they "took a while to
-                # refresh" after a stop-then-immediately-start.
-                # The token is compared, not the running flag: the session
-                # being stopped stays current until the next one begins, so
-                # its final flush still reaches the pane.
-                self._caption_session += 1
-                sess = self._caption_session
-
-                def _emit_caption(ev, _sess=sess):
-                    if _sess == self._caption_session:
-                        self.caption_event.emit(ev)
-
-                engine = LiveCaptionEngine(cfg, _emit_caption)
+                engine = self._new_caption_engine()
                 engine.start()
                 recorder.on_audio_chunk = engine.feed
             try:
@@ -12436,6 +12683,86 @@ def _cmd_ui_body(args, cfg):
             self.set_status("recording")
             return True
 
+        def _new_caption_engine(self) -> "LiveCaptionEngine":
+            """A caption engine behind a fresh session gate (not started)."""
+            # Session gate. A superseded engine's workers can still be
+            # mid-call when the next recording starts — a review batch is
+            # a measured 62 s median, and stop() cannot interrupt one.
+            # Their events carry segment ids that restart from 1 every
+            # session, and the pane matches `refined` / `translation` /
+            # `speaker` by id alone, so a late correction from the old
+            # session would overwrite the NEW session's row with that id.
+            # That is what made captions look like they "took a while to
+            # refresh" after a stop-then-immediately-start.
+            # The token is compared, not the running flag: the session
+            # being stopped stays current until the next one begins, so
+            # its final flush still reaches the pane.
+            self._caption_session += 1
+            sess = self._caption_session
+
+            def _emit_caption(ev, _sess=sess):
+                if _sess == self._caption_session:
+                    self.caption_event.emit(ev)
+
+            return LiveCaptionEngine(cfg, _emit_caption)
+
+        def set_captions_live(self, on: bool) -> None:
+            """Turn captions on/off for the recording in progress.
+
+            Off: detach the engine from the audio tap at once and stop it on
+            a worker thread (stop() can take seconds). The session counter is
+            bumped so its late events are dropped, and the pane is told the
+            engine stopped (that status would otherwise be dropped too).
+            On: start a new engine behind a new session gate — but only after
+            a previous off has finished stopping: the cached streaming
+            recognizer is shared, and two sessions' audio interleaved in one
+            decoder corrupts recognition (see _CAPTION_STOP_ASR_TIMEOUT).
+            Idle: just the preference for the next recording.
+            """
+            self.captions_enabled = on
+            rec = self._recorder
+            if self._status != "recording" or rec is None:
+                return
+            if not on:
+                with self._caption_lock:
+                    engine, self._caption_engine = self._caption_engine, None
+                if engine is None:
+                    return
+                rec.on_audio_chunk = None
+                self._caption_session += 1
+                self.caption_event.emit({"type": "status", "state": "stopped"})
+
+                def _stop(e=engine):
+                    try:
+                        e.stop()
+                    except Exception as ex:
+                        _log("ERR", f"caption live stop: {type(ex).__name__}: {ex}")
+
+                self._caption_stop_thread = threading.Thread(
+                    target=_stop, name="caption-stop", daemon=True)
+                self._caption_stop_thread.start()
+                _log("CAPTION", "captions turned off mid-recording")
+                return
+            if self._caption_engine is not None:
+                return
+            prev = self._caption_stop_thread
+            engine = self._new_caption_engine()
+            with self._caption_lock:
+                self._caption_engine = engine
+
+            def _start():
+                if prev is not None:
+                    prev.join(timeout=_CAPTION_STOP_ASR_TIMEOUT + 2)
+                with self._caption_lock:
+                    # Toggled off again, or the recording ended, meanwhile.
+                    if self._caption_engine is not engine or self._recorder is not rec:
+                        return
+                    engine.start()
+                    rec.on_audio_chunk = engine.feed
+                _log("CAPTION", "captions turned on mid-recording")
+
+            threading.Thread(target=_start, name="caption-start", daemon=True).start()
+
         def stop_recording(self) -> bool:
             """Stop capture now; finish the slow part on a worker thread.
 
@@ -12450,15 +12777,16 @@ def _cmd_ui_body(args, cfg):
             """
             if not self._recorder:
                 return False
-            recorder, engine, path = (
-                self._recorder, self._caption_engine, self._audio_path)
+            with self._caption_lock:
+                recorder, engine, path = (
+                    self._recorder, self._caption_engine, self._audio_path)
+                self._caption_engine = None
             try:
                 recorder.stop()
             except Exception as e:
                 _log("ERR", f"Qt recorder.stop: {type(e).__name__}: {e}")
             _stop_bypass_monitor(self._bypass_mon)
             self._bypass_mon = None
-            self._caption_engine = None
             self._tick.stop()
             self._start_time = 0.0
             self.set_status("saving")
@@ -12498,6 +12826,23 @@ def _cmd_ui_body(args, cfg):
             self._audio_path = None
             self.set_status("idle")
             self.saved.emit(saved_path)
+            minutes = float((cfg.get("live_captions") or {}).get(
+                "release_idle_minutes", 10) or 0)
+            if minutes > 0:
+                self._idle_release.start(int(minutes * 60_000))
+
+        def _release_idle_models(self) -> None:
+            # Runs on the Qt thread, like start_recording and the caption
+            # toggle, so no engine can be loading a model meanwhile.
+            stopping = self._caption_stop_thread
+            if (self._status != "idle" or self._caption_engine is not None
+                    or (stopping is not None and stopping.is_alive())):
+                return
+            t0 = time.time()
+            released = _release_caption_models()
+            if released:
+                _log("CAPTION", f"idle release: {', '.join(released)} "
+                                f"in {time.time() - t0:.2f}s")
 
     # ── Recording view ────────────────────────────────────────────────────
 
@@ -12917,12 +13262,45 @@ def _cmd_ui_body(args, cfg):
             self._captions_title = SubtitleLabel("", self)
             self._i18n(self._captions_title, "rec.captions.title")
             cap_header.addWidget(self._captions_title)
-            cap_header.addStretch(1)
-            self.caption_switch = SwitchButton(self)
             lc_cfg = _deep_merge(
                 DEFAULT_CONFIG["live_captions"], cfg.get("live_captions", {}))
+            # On/off sits right next to the title it switches.
+            cap_header.addSpacing(12)
+            self.caption_switch = SwitchButton(self)
             self.caption_switch.setChecked(bool(lc_cfg.get("enabled", True)))
             cap_header.addWidget(self.caption_switch)
+            cap_header.addStretch(1)
+            # Recognition language. Switchable mid-recording: the engine swaps
+            # the streaming model between decode steps (set_language), so a
+            # Chinese meeting started in English mode doesn't have to be
+            # stopped and split into two files.
+            self._caption_lang_label = BodyLabel("", self)
+            self._i18n(self._caption_lang_label, "rec.captions.lang_label")
+            cap_header.addWidget(self._caption_lang_label)
+            self.caption_lang = ComboBox(self)
+            for code, text in (("en", "English"), ("zh", "中文")):
+                self.caption_lang.addItem(text, userData=code)
+            self.caption_lang.setCurrentIndex(
+                self.caption_lang.findData(_caption_language(lc_cfg)))
+            cap_header.addWidget(self.caption_lang)
+            cap_header.addSpacing(12)
+            # Translation target, also live (set_translate_to). Same language
+            # as the recognition one = nothing is translated.
+            self._caption_mt_label = BodyLabel("", self)
+            self._i18n(self._caption_mt_label, "rec.captions.mt_label")
+            cap_header.addWidget(self._caption_mt_label)
+            self.caption_mt = ComboBox(self)
+            for code in _CAPTION_TRANSLATE_TARGETS:
+                self.caption_mt.addItem(
+                    _t(f"rec.captions.mt_{code}"), userData=code)
+            self.caption_mt.setCurrentIndex(
+                self.caption_mt.findData(_caption_translate_to(lc_cfg)))
+
+            def _relabel_mt():
+                for i, code in enumerate(_CAPTION_TRANSLATE_TARGETS):
+                    self.caption_mt.setItemText(i, _t(f"rec.captions.mt_{code}"))
+            self._lang_callbacks.append(_relabel_mt)
+            cap_header.addWidget(self.caption_mt)
             cv.addLayout(cap_header)
 
 
@@ -12984,6 +13362,10 @@ def _cmd_ui_body(args, cfg):
             self.state.warning.connect(self._on_warning)
             self.state.caption_event.connect(self._on_caption_event)
             self.caption_switch.checkedChanged.connect(self._on_caption_prefs_changed)
+            self.caption_lang.currentIndexChanged.connect(
+                lambda i: self._on_caption_language(self.caption_lang.itemData(i)))
+            self.caption_mt.currentIndexChanged.connect(
+                lambda i: self._on_caption_translate_to(self.caption_mt.itemData(i)))
 
             _get_audio_monitor().on_recording_plan_change = self._on_plan_change
 
@@ -12994,6 +13376,8 @@ def _cmd_ui_body(args, cfg):
 
         def _on_caption_prefs_changed(self, *_a):
             self._sync_caption_enabled_to_state()
+            # Mid-recording: start / stop the engine on the live recording.
+            self.state.set_captions_live(self.caption_switch.isChecked())
             self._render_captions()
             lc = cfg.setdefault("live_captions", {})
             lc["enabled"] = self.caption_switch.isChecked()
@@ -13003,6 +13387,38 @@ def _cmd_ui_body(args, cfg):
                 _save_config_preserving_comments(cfg)
             except Exception as e:
                 _log("ERR", f"persist caption prefs: {type(e).__name__}: {e}")
+
+        def _on_caption_language(self, lang: str):
+            lc = cfg.setdefault("live_captions", {})
+            if lc.get("language") == lang:
+                return
+            lc["language"] = lang
+            try:
+                _save_config_preserving_comments(cfg)
+            except Exception as e:
+                _log("ERR", f"persist caption language: {type(e).__name__}: {e}")
+            # Live: the running engine swaps its recognizer now. Idle: the
+            # next session's engine reads the updated cfg at construction.
+            engine = getattr(self.state, "_caption_engine", None)
+            if engine is not None:
+                engine.set_language(lang)
+            _log("CAPTION", f"language set to {lang} from the panel "
+                            f"({'live' if engine is not None else 'next session'})")
+
+        def _on_caption_translate_to(self, target: str):
+            lc = cfg.setdefault("live_captions", {})
+            if lc.get("translate_to") == target:
+                return
+            lc["translate_to"] = target
+            try:
+                _save_config_preserving_comments(cfg)
+            except Exception as e:
+                _log("ERR", f"persist caption translate_to: {type(e).__name__}: {e}")
+            engine = getattr(self.state, "_caption_engine", None)
+            if engine is not None:
+                engine.set_translate_to(target)
+            _log("CAPTION", f"translate_to set to {target} from the panel "
+                            f"({'live' if engine is not None else 'next session'})")
 
         def _on_caption_event(self, ev: dict):
             t = ev.get("type")
@@ -13032,7 +13448,9 @@ def _cmd_ui_body(args, cfg):
             elif t == "translation":
                 for row in reversed(self._caption_rows):
                     if row["id"] == ev.get("id"):
-                        row["dst"] = ev.get("text", "")
+                        # None = deliberately untranslated (no "…" placeholder).
+                        row["dst"] = (None if ev.get("skipped")
+                                      else ev.get("text", ""))
                         break
             elif t == "speaker":
                 # Voice print beats the channel-energy guess: it arrives
@@ -13092,8 +13510,11 @@ def _cmd_ui_body(args, cfg):
                 src = _join_caption_texts([r["src"] for r in group])
                 dsts = [r["dst"] for r in group]
                 dst = _join_caption_texts([d for d in dsts if d])
-                if dst and any(not d for d in dsts):
+                waiting = any(d == "" for d in dsts)
+                if dst and waiting:
                     dst += " …"  # part of the paragraph still translating
+                elif not dst and not waiting:
+                    dst = None   # nothing to translate: no placeholder line
                 # Speaker tag: mic = me, system audio = the other side. None
                 # when the engine can't attribute (single active source).
                 head = group[0]
@@ -13665,6 +14086,15 @@ def _cmd_ui_body(args, cfg):
                 except Exception as e:
                     _log("ERR", f"Qt stop slider unmute: {type(e).__name__}: {e}")
                 self._slider_mute_active = False
+            # Close the streams FIRST (returns immediately; _on_recording_saved
+            # finishes the UI side once the WAV is on disk). The restore below
+            # queries fresh, i.e. Pa_Terminate — with input streams still open
+            # that stops them from this thread while CoreAudio's IO thread is
+            # in its start/stop callback, and the two deadlock on each other's
+            # mutex: 2026-10-30 17:15 the window hung for good on stop and the
+            # 10-minute recording, still only in memory, was lost. The CLI
+            # path already had this order.
+            self.state.stop_recording()
             try:
                 _restore_output_if_needed(
                     resolve_audio_devices(query_fresh=True),
@@ -13672,10 +14102,6 @@ def _cmd_ui_body(args, cfg):
                 )
             except Exception as e:
                 _log("ERR", f"Qt stop output restore: {type(e).__name__}: {e}")
-
-            # Returns immediately; _on_recording_saved finishes the UI side
-            # once the WAV is on disk.
-            self.state.stop_recording()
             QTimer.singleShot(200, self._sync_vol_slider)
 
         def _on_recording_saved(self, saved):
@@ -13687,10 +14113,10 @@ def _cmd_ui_body(args, cfg):
 
         def _on_status_changed(self, s: str):
             self._current_status = s
-            # Caption prefs are session-scoped: lock the switch while a
-            # recording (or pipeline) is active.
-            caption_idle = s == "idle"
-            self.caption_switch.setEnabled(caption_idle)
+            # Captions can be turned on/off mid-recording (set_captions_live);
+            # only the brief "saving" window locks the switch, while the last
+            # session's engine is still being torn down.
+            self.caption_switch.setEnabled(s != "saving")
             # Can't start the next session while the last one is still being
             # written (see _RecorderState.stop_recording).
             self.rec_btn.setEnabled(s != "saving")
@@ -15632,6 +16058,9 @@ def main():
     p_cap.add_argument("--chunk-ms", type=int, choices=sorted(_SHERPA_NEMOTRON_URLS),
                        dest="chunk_ms",
                        help="覆盖 live_captions.en_chunk_ms（仅 en 生效）")
+    p_cap.add_argument("--translate-to", choices=_CAPTION_TRANSLATE_TARGETS,
+                       dest="translate_to",
+                       help="覆盖 live_captions.translate_to（zh / en / off）")
     p_cap.add_argument("--mt", choices=("marian", "nllb", "qwen", "hymt"),
                        help="覆盖 live_captions.mt_provider（翻译模型 A/B）")
 
