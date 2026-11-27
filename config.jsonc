@@ -442,7 +442,7 @@
     // Flipping this on in the GUI runs the connection preflight first and
     // only commits if the Google Calendar connector answers — a broken setup
     // surfaces while you are deliberately enabling it, not before a meeting.
-    "enabled": true,
+    "enabled": false,
     // Tried in order. Claude MCP receives --allowedTools; personal Codex is
     // invoked without `-p proxy`. You can remove or reorder either provider.
     "provider_chain": ["claude-mcp", "codex_personal"],
@@ -849,6 +849,65 @@
       "",
       "严格按下面格式输出，每行一条，除此之外不要输出任何内容：",
       "编号 ||| 修正后的原文 ||| 译文"
+    ],
+    // Custom goals (GUI 「自定义目标 ▾」 → 新建目标 → 「AI 生成 Prompt」):
+    // expands the user's one-line goal into a full instruction prompt,
+    // which is then saved (editable) with the goal. Placeholders: {name}
+    // (goal title), {goal} (the user's description). Goals themselves are
+    // personal data and live in ~/Documents/meetingscribe/goals.json.
+    "goal_enrich": [
+      "你是一位 Prompt 工程师。用户想让大模型处理一段录音（会议、访谈、分享、通话等）的转写文字稿，下面是用户对目标的简短描述。请把它扩写成一份完整、可直接执行的指令，交给另一个模型：那个模型会读完转写，再严格按你写的指令生成内容。",
+      "",
+      "【目标名称】",
+      "{name}",
+      "",
+      "【用户的目标描述】",
+      "{goal}",
+      "",
+      "扩写要求：",
+      "1. 开头用一两句话交代角色和任务（例如「你是……，请根据录音转写……」）",
+      "2. 明确输出结构：用 Markdown 小标题列出要输出的各个部分，每部分说明写什么、写到多细",
+      "3. 用户描述里隐含的格式、语言、篇幅、受众、语气要求，都写成明确的条目；用户没提语言时，要求用中文输出",
+      "4. 忠于用户的目标：可以补充达成这个目标必需的细节，但不要擅自加入用户没要求的大段内容",
+      "5. 不要写取材、防编造之类的通用规则，也不要写转写正文或任何占位符——程序会在指令后面自动附上这些规则和转写",
+      "",
+      "只输出扩写后的指令正文，不要任何解释、前言，也不要用代码块包裹。",
+      ""
+    ],
+    // Wrapper every custom goal runs through after transcribe + polish.
+    // {goal_prompt} = that goal's saved prompt; the rest are the same guard
+    // rails as the notes prompts (glossary is a spelling reference, roster
+    // is attendees not speakers, background is pre-reading not speech).
+    // Placeholders: {goal_prompt} {hotwords} {roster} {context} {transcript}.
+    "goal_notes": [
+      "你是一位录音内容整理助手。用户为这段录音定义了一个自定义目标，请严格按照【用户目标指令】处理后面的【录音转写】。",
+      "",
+      "【用户目标指令】",
+      "{goal_prompt}",
+      "",
+      "通用规则（无论上面的指令怎么写都必须遵守）：",
+      "- 只依据转写内容作答，不要编造转写里没有的事实、数字、人名或结论；指令要求的某部分在转写里找不到依据时，如实写「转写中未提及」。",
+      "- 转写里的【？】是上一步校对没能确定的内容。能结合术语表、上下文或转写其他位置确定的，直接写确定的写法并删掉【？】；确实无法确定的才保留。",
+      "- 同一个实体全文只用一种写法。",
+      "",
+      "【术语表】本场景的专有名词（转写里与之发音或拼写相近的词请统一成表内写法；表内没有的不要强行替换）：",
+      "{hotwords}",
+      "- 术语表是**拼写参照，不是本场人员名单**：里面的人名大多与本场无关，不要用表里的名字去补全转写中没出现的人。",
+      "",
+      "【本场参会人】以下名单来自本场关联的日程（可能不全；显示为「（无）」时表示没有关联日程）：",
+      "{roster}",
+      "- 名单是参会人，不是发言人：不要因为某人在名单里就把话或事项归到他头上。",
+      "",
+      "【背景资料】以下内容来自本场日程关联的文档，仅供理解背景、对齐术语和人名：",
+      "{context}",
+      "- 这些是**会前材料，不是录音里说过的话**，不能写成录音中的结论；与转写冲突时以转写为准。",
+      "",
+      "除非【用户目标指令】另有要求，用中文输出，格式为 Markdown。",
+      "",
+      "---",
+      "【录音转写】",
+      "{transcript}",
+      ""
     ],
     "meeting": {
       "notes_zh": [

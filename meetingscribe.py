@@ -313,9 +313,18 @@ def _purge_old_logs(log_dir: Path, days: int = 7) -> None:
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 
+__version__ = "1.0.0"
+
+# Packaged as MeetingScribe.app (PyInstaller, see packaging/). Inside the
+# bundle the script's own directory is read-only and replaced on every update,
+# so files the app WRITES — config.jsonc, hotword.jsonc — move to CONFIG_DIR;
+# the bundled config.jsonc only seeds the first launch (_prepare_frozen_runtime).
+_FROZEN = bool(getattr(sys, "frozen", False))
+_BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+
 CONFIG_DIR = Path.home() / "Documents" / "meetingscribe"
 LOG_DIR    = CONFIG_DIR / "logs"
-CONFIG_FILE = Path(__file__).parent / "config.jsonc"
+CONFIG_FILE = (CONFIG_DIR if _FROZEN else Path(__file__).parent) / "config.jsonc"
 _LLM_PROVIDER_STATE_FILE = CONFIG_DIR / ".llm-provider-state.json"
 _LLM_PROVIDER_STATE_LOCK = threading.Lock()
 _LLM_PROVIDER_PROBE_LEASE_SECS = 300
@@ -324,7 +333,57 @@ _LLM_PROVIDER_PROBE_LEASE_SECS = 300
 # internal codenames — personal data that has no business in a config file
 # that ships with the project (this repo is public). config.jsonc keeps the
 # key as an empty default; hotword.jsonc overrides it when present.
-HOTWORD_FILE = Path(__file__).parent / "hotword.jsonc"
+HOTWORD_FILE = (CONFIG_DIR if _FROZEN else Path(__file__).parent) / "hotword.jsonc"
+
+
+def _login_shell_path() -> "list[str]":
+    """The PATH an interactive login shell would have.
+
+    An app started from Finder inherits launchd's bare PATH
+    (/usr/bin:/bin:/usr/sbin:/sbin), so `claude` / `codex` (npm, ~/.local)
+    and `ffmpeg` (Homebrew) are not found — every LLM step and every import
+    would fail with "command not found". The user's shell config is the only
+    place that knows where they live, so ask it once. A marker isolates the
+    value from whatever the rc files print.
+    """
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    if not os.path.isabs(shell) or not os.path.exists(shell):
+        shell = "/bin/zsh"
+    try:
+        out = subprocess.run(
+            [shell, "-ilc", 'printf "__MS_PATH__%s" "$PATH"'],
+            capture_output=True, text=True, timeout=8,
+            stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    _, sep, value = (out.stdout or "").rpartition("__MS_PATH__")
+    return [p for p in value.strip().split(":") if p] if sep else []
+
+
+def _prepare_frozen_runtime() -> None:
+    """One-time setup for the packaged app; a no-op when run as a script."""
+    if not _FROZEN:
+        return
+    # A windowed app has no terminal: stdout/stderr may be None, and the
+    # timestamped log tee writes through to them.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        seed = _BUNDLE_DIR / "config.jsonc"
+        if seed.exists():
+            import shutil
+            shutil.copyfile(seed, CONFIG_FILE)
+    home = Path.home()
+    extra = _login_shell_path() + [
+        "/opt/homebrew/bin", "/usr/local/bin",
+        str(home / ".local" / "bin"), str(home / ".npm-global" / "bin"),
+        str(home / ".bun" / "bin"),
+    ]
+    current = [p for p in os.environ.get("PATH", "").split(":") if p]
+    os.environ["PATH"] = ":".join(dict.fromkeys(current + extra))
 
 
 def _setup_log_file():
@@ -847,6 +906,66 @@ _PROMPT_DEFAULTS: dict = {
 
 严格按下面格式输出，每行一条，除此之外不要输出任何内容：
 编号 ||| 修正后的原文 ||| 译文
+""",
+    # ``goal_enrich`` turns a one-line user goal ("提取客户提到的所有需求")
+    # into a full instruction prompt for the custom-goal pipeline (GUI 「自定义
+    # 目标」 → 「AI 生成 Prompt」). Placeholders: {name} (the goal's title),
+    # {goal} (the user's own description). The reply is stored, editable, as
+    # the goal's prompt; it must NOT carry the transcript or the shared guard
+    # rails — `goal_notes` wraps it with both at generation time.
+    "goal_enrich": """\
+你是一位 Prompt 工程师。用户想让大模型处理一段录音（会议、访谈、分享、通话等）的转写文字稿，下面是用户对目标的简短描述。请把它扩写成一份完整、可直接执行的指令，交给另一个模型：那个模型会读完转写，再严格按你写的指令生成内容。
+
+【目标名称】
+{name}
+
+【用户的目标描述】
+{goal}
+
+扩写要求：
+1. 开头用一两句话交代角色和任务（例如「你是……，请根据录音转写……」）
+2. 明确输出结构：用 Markdown 小标题列出要输出的各个部分，每部分说明写什么、写到多细
+3. 用户描述里隐含的格式、语言、篇幅、受众、语气要求，都写成明确的条目；用户没提语言时，要求用中文输出
+4. 忠于用户的目标：可以补充达成这个目标必需的细节，但不要擅自加入用户没要求的大段内容
+5. 不要写取材、防编造之类的通用规则，也不要写转写正文或任何占位符——程序会在指令后面自动附上这些规则和转写
+
+只输出扩写后的指令正文，不要任何解释、前言，也不要用代码块包裹。
+""",
+    # ``goal_notes`` is the wrapper every custom goal runs through. The
+    # goal's own prompt (written by the user or by `goal_enrich`) goes into
+    # {goal_prompt}; the rest are the guard rails the built-in notes prompts
+    # carry, so a hand-written goal cannot lose them — the glossary is a
+    # spelling reference not a cast list, the roster is attendees not
+    # speakers, the background is pre-reading not speech. Placeholders:
+    # {goal_prompt}, {hotwords}, {roster}, {context}, {transcript}.
+    "goal_notes": """\
+你是一位录音内容整理助手。用户为这段录音定义了一个自定义目标，请严格按照【用户目标指令】处理后面的【录音转写】。
+
+【用户目标指令】
+{goal_prompt}
+
+通用规则（无论上面的指令怎么写都必须遵守）：
+- 只依据转写内容作答，不要编造转写里没有的事实、数字、人名或结论；指令要求的某部分在转写里找不到依据时，如实写「转写中未提及」。
+- 转写里的【？】是上一步校对没能确定的内容。能结合术语表、上下文或转写其他位置确定的，直接写确定的写法并删掉【？】；确实无法确定的才保留。
+- 同一个实体全文只用一种写法。
+
+【术语表】本场景的专有名词（转写里与之发音或拼写相近的词请统一成表内写法；表内没有的不要强行替换）：
+{hotwords}
+- 术语表是**拼写参照，不是本场人员名单**：里面的人名大多与本场无关，不要用表里的名字去补全转写中没出现的人。
+
+【本场参会人】以下名单来自本场关联的日程（可能不全；显示为「（无）」时表示没有关联日程）：
+{roster}
+- 名单是参会人，不是发言人：不要因为某人在名单里就把话或事项归到他头上。
+
+【背景资料】以下内容来自本场日程关联的文档，仅供理解背景、对齐术语和人名：
+{context}
+- 这些是**会前材料，不是录音里说过的话**，不能写成录音中的结论；与转写冲突时以转写为准。
+
+除非【用户目标指令】另有要求，用中文输出，格式为 Markdown。
+
+---
+【录音转写】
+{transcript}
 """,
     "meeting": {
         "notes_zh": """\
@@ -1762,6 +1881,87 @@ def save_config(cfg: dict):
         return
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(_config_for_disk(cfg, {}), f, ensure_ascii=False, indent=2)
+
+
+def _set_nested(d: dict, path: "tuple[str, ...]", value) -> None:
+    for k in path[:-1]:
+        nxt = d.get(k)
+        if not isinstance(nxt, dict):
+            nxt = d[k] = {}
+        d = nxt
+    d[path[-1]] = value
+
+
+def update_config_values(cfg: dict, updates: "dict[tuple[str, ...], object]") -> None:
+    """Change just these settings — in the running `cfg` AND in config.jsonc.
+
+    The settings form changes one control at a time. `save_config(cfg)`
+    diffs the WHOLE runtime config (defaults merged in) against the file,
+    so any default key the file lacks would knock it off the comment-
+    preserving path. This diffs the FILE against itself plus `updates`
+    instead: only these leaves change, the user's comments and every other
+    value stay byte-identical. A file that does not parse is never
+    overwritten — that would silently throw away the user's hand edits.
+    """
+    for path, value in updates.items():
+        _set_nested(cfg, path, value)
+    try:
+        text = CONFIG_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    if text is None:
+        on_disk: dict = {}
+    else:
+        try:
+            on_disk = json.loads(_strip_jsonc_comments(text))
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f"config.jsonc 无法解析，未写入：{e}") from e
+    new = copy.deepcopy(on_disk)
+    for path, value in updates.items():
+        _set_nested(new, path, value)
+    if _save_config_preserving_comments(new):
+        _log("CONFIG", "settings: " + ", ".join(
+            f"{'.'.join(p)}={json.dumps(v, ensure_ascii=False)}"
+            for p, v in updates.items()))
+        return
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(_config_for_disk(new, {}), f, ensure_ascii=False, indent=2)
+    _log("CONFIG", f"settings: rewrote config.jsonc without comments for "
+                   f"{[ '.'.join(p) for p in updates ]}")
+
+
+# The settings form (配置 → 常用设置): the handful of options people actually
+# change, as controls instead of JSONC. Everything else stays in the advanced
+# editor. Rows are (kind, config path, label id, choices):
+#   combo    — one of `choices`, stored as-is
+#   fallback — one of `choices`, stored as a one-item list ("" → [])
+#   spk      — switch stored as "cam++" / ""
+#   switch   — bool
+# Every path must exist in the shipped config.jsonc (a test checks), so a
+# change replaces one line in place and the user's comments survive.
+_LLM_FORM_PROVIDERS = ("claude", "codex_proxy", "codex_personal")
+_SETTINGS_SPEC = (
+    ("ai", (
+        ("combo", ("polish_provider",), "polish", _LLM_FORM_PROVIDERS),
+        ("combo", ("meeting_notes_provider",), "notes", _LLM_FORM_PROVIDERS),
+        ("fallback", ("llm_fallback",), "fallback", ("",) + _LLM_FORM_PROVIDERS),
+    )),
+    ("stt", (
+        ("spk", ("stt", "funasr", "spk_model"), "spk", None),
+    )),
+    ("captions", (
+        ("combo", ("live_captions", "mt_provider"), "mt",
+         ("hymt", "qwen", "nllb", "marian")),
+        ("switch", ("live_captions", "refine"), "refine", None),
+        ("switch", ("live_captions", "speaker_id", "enabled"), "speaker", None),
+        ("switch", ("live_captions", "review", "enabled"), "review", None),
+    )),
+    ("hotwords", (
+        ("switch", ("hotwords", "auto_update"), "hotwords", None),
+    )),
+)
+_SETTINGS_PATHS = tuple(row[1] for _, rows in _SETTINGS_SPEC for row in rows)
 
 
 def _config_for_disk(cfg: dict, on_disk: dict) -> dict:
@@ -5579,6 +5779,12 @@ class _CaptionDocRenderer:
         sb.setValue(sb.maximum() if at_bottom else min(prev, sb.maximum()))
 
 
+# Set by a running LiveCaptionEngine so a multi-hundred-MB first-use download
+# shows progress in the caption panel instead of a bare 「加载中」. Called as
+# hook(file_name, done_mb, total_mb) every 10 % from the downloading thread.
+_model_download_hook = None
+
+
 def _caption_download(url: str, dest: Path) -> None:
     """Stream a URL to disk with certifi's CA bundle.
 
@@ -5611,6 +5817,13 @@ def _caption_download(url: str, dest: Path) -> None:
                 _log("CAPTION", f"model download {done * 100 // total}% "
                                 f"({done // (1024 * 1024)} MB)")
                 next_pct += 10
+                hook = _model_download_hook
+                if hook is not None:
+                    try:
+                        hook(dest.name.removesuffix(".part"),
+                             done // (1024 * 1024), total // (1024 * 1024))
+                    except Exception as e:   # UI observer; never breaks a download
+                        _log("CAPTION", f"download hook: {type(e).__name__}: {e}")
 
 
 def _ensure_sherpa_model(url: str = _SHERPA_ZIPFORMER_URL) -> Path:
@@ -5668,6 +5881,365 @@ def _ensure_qwen_gguf(repo: str, filename: str, label: str = "qwen") -> Path:
         tmp.unlink(missing_ok=True)
     _log("CAPTION", f"{label} MT model ready at {target}")
     return target
+
+
+# ── First-use model downloads ────────────────────────────────────────────────
+#
+# No model ships with the app (see "Packaging" in CLAUDE.md): each one
+# downloads the first time the feature that needs it runs. Without a heads-up
+# that looks like a hang — transcription sits at 5 % while ~2 GB arrives,
+# captions sit on 「加载中」. These helpers say up front WHAT will download and
+# roughly HOW BIG, from a cheap on-disk check; they never download anything.
+# Sizes are the measured on-disk footprint, rounded.
+
+# FunASR short name → (ModelScope id, display name, MB). Mirrors funasr's own
+# download/name_maps_from_hub.py for the names this tool configures.
+_FUNASR_MODEL_INFO = {
+    "paraformer-zh": ("iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-"
+                      "common-vocab8404-pytorch", "paraformer-large", 950),
+    "fsmn-vad": ("iic/speech_fsmn_vad_zh-cn-16k-common-pytorch", "FSMN-VAD", 4),
+    "ct-punc": ("iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+                "CT-Punc", 1100),
+    "cam++": ("iic/speech_campplus_sv_zh-cn_16k-common", "cam++", 28),
+}
+# Streaming caption models, keyed by archive stem → (display name, MB).
+_SHERPA_MODEL_INFO = {
+    "sherpa-onnx-streaming-paraformer-bilingual-zh-en":
+        ("Streaming Paraformer zh-en", 230),
+    "sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30":
+        ("Zipformer zh 2025", 160),
+    "sherpa-onnx-streaming-zipformer-zh-xlarge-int8-2025-06-30":
+        ("Zipformer zh xlarge 2025", 740),
+    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20":
+        ("Zipformer zh-en 2023", 530),
+    **{f"sherpa-onnx-nemotron-speech-streaming-en-0.6b-{ms}ms-int8-2026-04-25":
+       ("Nemotron Speech EN 0.6B", 630) for ms in (80, 160, 560, 1120)},
+}
+_GGUF_MODEL_INFO = {
+    "HY-MT1.5-1.8B-Q4_K_M.gguf": ("HY-MT 1.5 1.8B", 1100),
+    "qwen2.5-1.5b-instruct-q4_k_m.gguf": ("Qwen2.5 1.5B", 1000),
+}
+_HF_MODEL_INFO = {
+    "Helsinki-NLP/opus-mt-zh-en": ("opus-mt zh→en", 300),
+    "Helsinki-NLP/opus-mt-en-zh": ("opus-mt en→zh", 300),
+    "facebook/nllb-200-distilled-600M": ("NLLB-200 600M", 2400),
+}
+_MODEL_WEIGHT_SUFFIXES = (".pt", ".bin", ".onnx", ".safetensors")
+
+
+def _dir_has_weights(d: Path) -> bool:
+    """A model dir counts as downloaded once a weight file sits in it — an
+    interrupted download leaves the config files without the weights."""
+    try:
+        return d.is_dir() and any(
+            p.suffix in _MODEL_WEIGHT_SUFFIXES and p.is_file()
+            for p in d.iterdir())
+    except OSError:
+        return False
+
+
+def _funasr_model_missing(name: str) -> "tuple[str, int] | None":
+    """(display name, MB) when the FunASR model `name` still has to be
+    downloaded, else None. A local directory, or a name this table does not
+    know and that is not a hub id, is assumed present — better no notice
+    than a wrong one."""
+    name = (name or "").strip()
+    if not name or Path(name).expanduser().is_dir():
+        return None
+    mid, label, mb = _FUNASR_MODEL_INFO.get(
+        name, (name, name.rsplit("/", 1)[-1], 0))
+    if "/" not in mid:
+        return None
+    env = os.environ.get("MODELSCOPE_CACHE")
+    root = Path(env).expanduser() if env else Path.home() / ".cache" / "modelscope"
+    if any(_dir_has_weights(d) for d in (root / "hub" / "models" / mid,
+                                         root / "hub" / mid)):
+        return None
+    return label, mb
+
+
+def _hf_model_missing(repo: str) -> "tuple[str, int] | None":
+    hub = os.environ.get("HF_HUB_CACHE") or str(
+        Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
+        / "hub")
+    snaps = Path(hub).expanduser() / ("models--" + repo.replace("/", "--")) / "snapshots"
+    try:
+        cached = any(_dir_has_weights(s) for s in snaps.iterdir())
+    except OSError:          # no snapshots dir yet = not downloaded
+        cached = False
+    if cached:
+        return None
+    return _HF_MODEL_INFO.get(repo, (repo.rsplit("/", 1)[-1], 0))
+
+
+def _gguf_model_missing(sub: dict, default_file: str) -> "tuple[str, int] | None":
+    if (sub.get("model_path") or "").strip():
+        return None   # explicit file: never downloaded, so nothing to announce
+    fname = sub.get("model_file") or default_file
+    if (CONFIG_DIR / "models" / fname).exists():
+        return None
+    return _GGUF_MODEL_INFO.get(fname, (fname, 0))
+
+
+def _dedupe_models(items) -> "list[tuple[str, int]]":
+    out, seen = [], set()
+    for it in items:
+        if it and it[0] not in seen:
+            seen.add(it[0])
+            out.append(it)
+    return out
+
+
+def _models_missing_for_transcription(cfg: dict) -> "list[tuple[str, int]]":
+    """Models the offline transcription step would download right now."""
+    if (cfg.get("transcribe_provider") or "funasr") != "funasr":
+        return []
+    f = _deep_merge(DEFAULT_CONFIG["stt"], cfg.get("stt", {})).get("funasr", {})
+    return _dedupe_models(_funasr_model_missing(n) for n in (
+        f.get("model", "paraformer-zh"), f.get("vad_model", "fsmn-vad"),
+        f.get("punc_model", "ct-punc"), f.get("spk_model", "")))
+
+
+def _models_missing_for_captions(cfg: dict, lc_cfg: dict) -> "list[tuple[str, int]]":
+    """Models a caption session with `lc_cfg` would download: the streaming
+    recognizer, the translator (only when this session translates), the
+    refine stack (Chinese only) and the voice-print model."""
+    items = []
+    if not (lc_cfg.get("asr_model_dir") or "").strip():
+        stem = _caption_asr_model_url(lc_cfg).rsplit("/", 1)[-1].removesuffix(".tar.bz2")
+        if not (CONFIG_DIR / "models" / stem / "tokens.txt").exists():
+            items.append(_SHERPA_MODEL_INFO.get(stem, (stem, 0)))
+    if _caption_mt_active(lc_cfg):
+        provider = (lc_cfg.get("mt_provider") or "default").strip().lower()
+        if provider == "qwen":
+            items.append(_gguf_model_missing(lc_cfg.get("qwen") or {},
+                                             "qwen2.5-1.5b-instruct-q4_k_m.gguf"))
+        elif provider in ("hymt", "hy-mt"):
+            items.append(_gguf_model_missing(lc_cfg.get("hymt") or {},
+                                             "HY-MT1.5-1.8B-Q4_K_M.gguf"))
+        elif provider == "nllb":
+            items.append(_hf_model_missing((lc_cfg.get("nllb") or {}).get(
+                "mt_model", "facebook/nllb-200-distilled-600M")))
+        else:
+            items.append(_hf_model_missing(
+                lc_cfg.get("mt_zh_en", "Helsinki-NLP/opus-mt-zh-en")))
+            items.append(_hf_model_missing(
+                lc_cfg.get("mt_en_zh", "Helsinki-NLP/opus-mt-en-zh")))
+    if lc_cfg.get("refine", True) and _caption_language(lc_cfg) == "zh":
+        f = _deep_merge(DEFAULT_CONFIG["stt"], cfg.get("stt", {})).get("funasr", {})
+        items += [_funasr_model_missing(n) for n in (
+            f.get("model", "paraformer-zh"), f.get("vad_model", "fsmn-vad"),
+            f.get("punc_model", "ct-punc"))]
+    sid = lc_cfg.get("speaker_id") or {}
+    if sid.get("enabled", True):
+        items.append(_funasr_model_missing((sid.get("model") or "cam++").strip()))
+    return _dedupe_models(items)
+
+
+def _fmt_model_mb(mb: int) -> str:
+    return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb} MB"
+
+
+def _model_download_notice(missing: "list", purpose: str, lang: str = "zh") -> str:
+    """One sentence naming the models about to download and their total size.
+    `purpose` is "transcribe" or "captions". Empty when nothing is missing."""
+    if not missing:
+        return ""
+    total = sum(int(mb) for _, mb in missing)
+    if lang == "en":
+        items = ", ".join(f"{n} (~{_fmt_model_mb(mb)})" if mb else n
+                          for n, mb in missing)
+        what = ("First transcription" if purpose == "transcribe"
+                else "First use of live captions")
+        return (f"{what} downloads models first, about {_fmt_model_mb(total)} "
+                f"in total: {items}. This happens once — stay online; it can "
+                f"take a few minutes.")
+    items = "、".join(f"{n}（约 {_fmt_model_mb(mb)}）" if mb else n
+                     for n, mb in missing)
+    what = "首次转写" if purpose == "transcribe" else "首次使用实时字幕"
+    return (f"{what}需要先下载模型，共约 {_fmt_model_mb(total)}：{items}。"
+            f"只需下载一次，期间请保持联网，可能要等几分钟。")
+
+
+# ── Environment check (运行环境) ─────────────────────────────────────────────
+#
+# The app bundles every Python dependency, but four things live outside it
+# and cannot ship with it: the BlackHole driver (admin install), the
+# Multi-Output Device (a user-made aggregate in Audio MIDI Setup), the
+# claude / codex CLIs (each user logs in with their own account) and,
+# optionally, ffmpeg. Missing any of them used to surface only as a line in
+# the run log — or as silence in the recording. `_environment_check` reports
+# each one so the GUI can say what is missing and how to fix it.
+
+# Fixed, well-known install commands shown to the user (copied, never run).
+_ENV_INSTALL_CMDS = {
+    "blackhole": "brew install --cask blackhole-2ch",
+    "ffmpeg": "brew install ffmpeg",
+    "claude": "npm install -g @anthropic-ai/claude-code",
+    "codex": "npm install -g @openai/codex",
+}
+# What to run once after installing, to log in.
+_ENV_LOGIN_CMDS = {"claude": "claude", "codex": "codex login"}
+
+
+@dataclass
+class EnvItem:
+    """One row of the environment check. `detail` is a device or provider
+    name for display — never a key or token."""
+    key: str           # "blackhole" | "multi_output" | "llm" | "ffmpeg"
+    state: str         # "ok" | "missing" | "no_physical"
+    required: bool
+    detail: str = ""
+    missing_cmds: "list[str]" = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.state == "ok"
+
+
+def _llm_provider_available(name: str, cfg: dict) -> "tuple[bool, str]":
+    """(usable, command-or-type) for one provider, without calling it.
+    A CLI provider is usable when its command is on PATH; an API provider
+    when its api_key is set. Login state is NOT knowable here — that is what
+    `_llm_probe` is for."""
+    import shutil
+    pcfg = _llm_provider_config(name, cfg)
+    if pcfg is None:
+        return False, ""
+    ptype = pcfg.get("type", name)
+    if ptype == "claude-cli":
+        return bool(shutil.which("claude")), "claude"
+    if ptype == "codex-cli":
+        return bool(shutil.which("codex")), "codex"
+    if ptype in ("openai", "gemini"):
+        return bool(str(pcfg.get("api_key") or "").strip()), ptype
+    return False, str(ptype)
+
+
+def _llm_check_chain(cfg: dict) -> "list[str]":
+    """Every provider the polish + notes steps may try, in order."""
+    names: "list[str]" = []
+    for key in ("polish_provider", "meeting_notes_provider"):
+        primary = cfg.get(key) or DEFAULT_CONFIG.get(key) or "codex_proxy"
+        for n in _llm_provider_chain(primary, cfg):
+            n = _LLM_PROVIDER_ALIASES.get(n, n)
+            if n not in names:
+                names.append(n)
+    return names
+
+
+def _environment_check(cfg: dict, plan: "AudioPlan | None" = None) -> "list[EnvItem]":
+    """Check the dependencies that live outside the app. Cheap (PATH lookups
+    and a cached device resolve), safe while recording — `query_fresh=False`
+    never re-initialises PortAudio under open streams."""
+    import shutil
+    items: "list[EnvItem]" = []
+    if sys.platform == "darwin":
+        if plan is None:
+            try:
+                plan = resolve_audio_devices(query_fresh=False)
+            except Exception as e:
+                _log("WARN", f"env check: device resolve failed: {type(e).__name__}: {e}")
+                plan = AudioPlan()
+        items.append(EnvItem("blackhole",
+                             "ok" if plan.sys_source_name else "missing", True,
+                             plan.sys_source_name or ""))
+        mo = plan.multi_output_name
+        if not mo:
+            mo_state = "missing"
+        elif not _get_multi_output_physical_subs(mo):
+            mo_state = "no_physical"   # recording works, the user hears nothing
+        else:
+            mo_state = "ok"
+        items.append(EnvItem("multi_output", mo_state, True, mo or ""))
+    avail = [(n,) + _llm_provider_available(n, cfg) for n in _llm_check_chain(cfg)]
+    usable = [n for n, ok, _ in avail if ok]
+    missing_cmds = sorted({c for _, ok, c in avail
+                           if not ok and c in ("claude", "codex")})
+    detail = ", ".join(usable) if usable else (
+        ", ".join(missing_cmds) or ", ".join(n for n, _, _ in avail))
+    items.append(EnvItem("llm", "ok" if usable else "missing", True,
+                         detail, missing_cmds))
+    items.append(EnvItem("ffmpeg", "ok" if shutil.which("ffmpeg") else "missing",
+                         False))
+    _log("CONFIG", "env check: " + ", ".join(
+        f"{i.key}={i.state}" for i in items))
+    return items
+
+
+# ── Install guide (安装说明) ──────────────────────────────────────────────────
+#
+# packaging/install-guide.html, generated by docs/build_install_guide.py. The
+# same file ships in the DMG (as 安装说明.html) and inside the app bundle, and
+# the GUI opens it at a section. Anchors are a fixed set so nothing user- or
+# config-supplied ever reaches the URL.
+_GUIDE_ANCHORS = {
+    "blackhole": "blackhole",
+    "multi_output": "multi-output",
+    "llm": "ai-cli",
+    "ffmpeg": "ffmpeg",
+    "install": "install",
+    "faq": "faq",
+}
+
+
+def _install_guide_path(lang: str = "zh") -> "Path | None":
+    """The guide in the UI's language (install-guide.en.html for English),
+    falling back to the other language rather than to nothing."""
+    names = (["install-guide.en.html", "install-guide.html"] if lang == "en"
+             else ["install-guide.html", "install-guide.en.html"])
+    for name in names:
+        for base in (_BUNDLE_DIR, _BUNDLE_DIR / "packaging"):
+            if (base / name).is_file():
+                return base / name
+    return None
+
+
+def _install_guide_url(section: str = "", lang: str = "zh") -> "str | None":
+    """file:// URL to open — via a tiny redirect page when a section is
+    wanted, because macOS LaunchServices drops the #fragment of a file URL
+    handed to the default browser, which would land every link at the top."""
+    guide = _install_guide_path(lang)
+    if guide is None:
+        return None
+    anchor = _GUIDE_ANCHORS.get(section, "")
+    if not anchor:
+        return guide.as_uri()
+    import tempfile
+    target = f"{guide.as_uri()}#{anchor}"
+    redirect = Path(tempfile.gettempdir()) / f"meetingscribe-guide-{lang}-{anchor}.html"
+    redirect.write_text(
+        '<!doctype html><meta charset="utf-8">'
+        f'<meta http-equiv="refresh" content="0; url={target}">'
+        f'<script>location.replace({json.dumps(target)});</script>',
+        encoding="utf-8")
+    return redirect.as_uri()
+
+
+def _llm_probe(cfg: dict, timeout: int = 90) -> "tuple[bool, str]":
+    """Send a trivial prompt to the first usable provider — the only way to
+    learn whether the user is actually LOGGED IN, since that state lives in
+    the CLI's own store, which this tool never reads. Returns (ok, message);
+    the message names the provider, and on failure carries the CLI's error."""
+    tried = []
+    for name in _llm_check_chain(cfg):
+        ok, _ = _llm_provider_available(name, cfg)
+        if not ok:
+            continue
+        pcfg = _llm_provider_config(name, cfg)
+        try:
+            reply = _llm_call_one("只回复 OK 两个字母，不要输出其他内容。",
+                                  name, pcfg, cfg, "env-check", timeout)
+        except _LLMCallFailed as e:
+            tried.append(f"{name}: {e.message[:200]}")
+            continue
+        except (Exception, SystemExit) as e:
+            tried.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
+            continue
+        _log("CONFIG", f"env check: llm probe ok via {name} ({len(reply)} chars)")
+        return True, name
+    _log("CONFIG", f"env check: llm probe failed: {tried}")
+    return False, "; ".join(tried)
 
 
 def _pick_model_file(model_dir: Path, stem: str) -> str:
@@ -6863,10 +7435,16 @@ class LiveCaptionEngine:
         return np.clip(mixed, -1.0, 1.0)
 
     # ── lifecycle ──
+    def _on_download_progress(self, name: str, done_mb: int, total_mb: int):
+        self._emit(type="download_progress", name=name,
+                   done_mb=done_mb, total_mb=total_mb)
+
     def start(self):
         if self._running:
             return
         self._running = True
+        global _model_download_hook
+        _model_download_hook = self._on_download_progress
         self._asr_thread = threading.Thread(
             target=self._asr_worker, daemon=True, name="caption-asr")
         self._mt_thread = threading.Thread(
@@ -6908,6 +7486,9 @@ class LiveCaptionEngine:
         survivor is visible rather than mysterious.
         """
         self._running = False
+        global _model_download_hook
+        if _model_download_hook == self._on_download_progress:
+            _model_download_hook = None
         self._mt_queue.put(None)
         self._refine_queue.put(None)
         self._spk_queue.put(None)
@@ -7015,8 +7596,21 @@ class LiveCaptionEngine:
         return backend
 
     # ── workers ──
+    def _announce_downloads(self) -> None:
+        """Tell the UI which models this session is about to download (and
+        their size) before the load that would otherwise just look stuck."""
+        try:
+            missing = _models_missing_for_captions(self.cfg, self._lc)
+        except Exception as e:   # a heads-up, never a reason to fail
+            _log("CAPTION", f"download check: {type(e).__name__}: {e}")
+            return
+        if missing:
+            _log("CAPTION", f"models to download: {missing}")
+            self._emit(type="download", models=[list(m) for m in missing])
+
     def _asr_worker(self):
         self._emit(type="status", state="loading")
+        self._announce_downloads()
         try:
             backend = self._load_asr_backend()
         except Exception as e:
@@ -7067,6 +7661,7 @@ class LiveCaptionEngine:
         old = self._lc.get("language")
         self._lc["language"] = lang
         self._emit(type="status", state="loading")
+        self._announce_downloads()
         t0 = time.time()
         try:
             new = self._load_asr_backend()
@@ -7533,6 +8128,12 @@ def _transcribe_funasr(audio_path: Path, pcfg: dict, on_progress=None, on_chunk_
     # `_funasr_hotword`. The LLM prompts still get the full list.
     hotword     = _funasr_hotword(pcfg.get("hotword", ""),
                                   int(pcfg.get("hotword_common_cutoff", 1000)))
+    missing = _dedupe_models(_funasr_model_missing(n) for n in
+                             (asr_model, vad_model, punc_model, spk_model))
+    if missing:
+        notice = _model_download_notice(missing, "transcribe")
+        _log("STT", f"models to download: {missing}")
+        print(notice, flush=True)
     chunk_secs       = int(pcfg.get("chunk_secs", 300))
     _workers_cfg     = int(pcfg.get("workers", 0))
     max_workers      = _workers_cfg if _workers_cfg > 0 else max(6, (os.cpu_count() or 4) // 2)
@@ -9026,6 +9627,176 @@ def save_minutes(minutes: str, audio_path: Path, mode: str = "meeting") -> Path:
     return note_path
 
 
+# ── 自定义目标 ────────────────────────────────────────────────────────────────
+# A goal is a user-defined output type next to meeting / interview / sharing:
+# a title, the user's one-line description, and the full prompt (written by
+# hand or expanded from the description by `goal_enrich`). Goals are personal
+# data — "给 XX 客户写跟进邮件" names customers — so they live in CONFIG_DIR,
+# outside the repository, never in config.jsonc.
+#
+# Output lands at `<stem>.goal-<id>.md`. The id is 8 random hex chars rather
+# than the title: titles are free text (CJK, slashes, renames), and keying the
+# filename on them would orphan every output on a rename and needs path
+# sanitising; a fixed hex id needs neither.
+GOALS_FILE = CONFIG_DIR / "goals.json"
+_GOAL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+_GOAL_SUFFIX_RE = re.compile(r"\.goal-([0-9a-f]{8})\.md$")
+_GOAL_NAME_MAX = 40
+_GOAL_TEXT_MAX = 4000
+_GOAL_PROMPT_MAX = 20000
+_GOALS_LOCK = threading.Lock()
+
+
+def _validate_goal(raw: object) -> "dict | None":
+    """A well-formed goal dict, or None. The file is hand-editable, so every
+    field is type- and length-checked rather than trusted."""
+    if not isinstance(raw, dict):
+        return None
+    gid, name = raw.get("id"), raw.get("name")
+    goal, prompt = raw.get("goal", ""), raw.get("prompt", "")
+    if not (isinstance(gid, str) and _GOAL_ID_RE.match(gid)):
+        return None
+    if not (isinstance(name, str) and name.strip()):
+        return None
+    if not isinstance(goal, str) or not isinstance(prompt, str):
+        return None
+    name = name.strip()[:_GOAL_NAME_MAX]
+    goal = goal.strip()[:_GOAL_TEXT_MAX]
+    prompt = prompt.strip()[:_GOAL_PROMPT_MAX]
+    if not (prompt or goal):
+        return None
+    return {"id": gid, "name": name, "goal": goal, "prompt": prompt}
+
+
+def _load_goals() -> "list[dict]":
+    """All saved goals, in creation order. A missing or broken file is an
+    empty list (logged) — never fatal to the app."""
+    try:
+        if not GOALS_FILE.exists():
+            return []
+        data = json.loads(GOALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _log("CONFIG", f"goals: unreadable {GOALS_FILE.name}: {type(e).__name__}: {e}")
+        return []
+    items = data.get("goals") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    out, seen = [], set()
+    for raw in items:
+        g = _validate_goal(raw)
+        if g is not None and g["id"] not in seen:
+            seen.add(g["id"])
+            out.append(g)
+    return out
+
+
+def _save_goals(goals: "list[dict]") -> None:
+    GOALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GOALS_FILE.with_name(GOALS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps({"goals": goals}, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, GOALS_FILE)
+
+
+def _upsert_goal(name: str, goal: str, prompt: str,
+                 goal_id: "str | None" = None) -> dict:
+    """Create (goal_id=None) or update a goal and persist it. Raises
+    ValueError on an empty title or when both description and prompt are
+    empty."""
+    import secrets
+    with _GOALS_LOCK:
+        goals = _load_goals()
+        if goal_id is None:
+            existing = {g["id"] for g in goals}
+            goal_id = secrets.token_hex(4)
+            while goal_id in existing:
+                goal_id = secrets.token_hex(4)
+        g = _validate_goal({"id": goal_id, "name": name, "goal": goal,
+                            "prompt": prompt})
+        if g is None:
+            raise ValueError("目标名称不能为空，目标描述和 Prompt 至少填一项")
+        for i, old in enumerate(goals):
+            if old["id"] == goal_id:
+                goals[i] = g
+                break
+        else:
+            goals.append(g)
+        _save_goals(goals)
+    _log("CONFIG", f"goals: saved id={g['id']} prompt_chars={len(g['prompt'])}")
+    return g
+
+
+def _delete_goal(goal_id: str) -> bool:
+    """Forget a goal. Outputs already generated from it stay on disk."""
+    with _GOALS_LOCK:
+        goals = _load_goals()
+        kept = [g for g in goals if g["id"] != goal_id]
+        if len(kept) == len(goals):
+            return False
+        _save_goals(kept)
+    _log("CONFIG", f"goals: deleted id={goal_id}")
+    return True
+
+
+def _goal_output_path(audio_path: Path, goal_id: str) -> Path:
+    if not _GOAL_ID_RE.match(goal_id or ""):
+        raise ValueError(f"invalid goal id: {goal_id!r}")
+    return audio_path.with_name(f"{audio_path.stem}.goal-{goal_id}.md")
+
+
+def _strip_code_fence(text: str) -> str:
+    """Unwrap a reply the model fenced in ``` despite being told not to."""
+    s = (text or "").strip()
+    m = re.match(r"^```[^\n]*\n(.*?)\n?```$", s, re.S)
+    return m.group(1).strip() if m else s
+
+
+def enrich_goal_prompt(name: str, goal: str, provider: str, cfg: dict) -> str:
+    """Expand the user's short goal description into a full prompt."""
+    goal = (goal or "").strip()
+    if not goal:
+        raise ValueError("请先填写目标描述")
+    prompt = (_resolve_prompt(cfg, "goal_enrich")
+              .replace("{name}", (name or "").strip() or "（未命名）")
+              .replace("{goal}", goal[:_GOAL_TEXT_MAX]))
+    out = _strip_code_fence(_llm_run(prompt, provider, cfg, "目标Prompt"))
+    if not out:
+        raise ValueError("模型返回了空内容")
+    return out[:_GOAL_PROMPT_MAX]
+
+
+def generate_goal_notes(transcript: str, provider: str, cfg: dict, goal: dict,
+                        background: str = "", roster: str = "") -> str:
+    """Run one custom goal over a polished transcript (single LLM call — the
+    goal's own prompt decides the language, unlike the zh+en built-ins)."""
+    # A goal saved with a description but no prompt still works: the
+    # description IS the instruction then.
+    goal_prompt = (goal.get("prompt") or goal.get("goal") or "").strip()
+    # The wrapper appends the transcript itself; a `{transcript}` the user
+    # typed into their own prompt would otherwise paste it in twice.
+    goal_prompt = goal_prompt.replace("{transcript}", "下方【录音转写】")
+    label = f"目标:{goal.get('name', '')}"
+    print(f"[{label}] 生成中（{provider}）...")
+    # Same substitution order as generate_notes: trusted text first, the
+    # untrusted ASR transcript last so it cannot expand a placeholder.
+    prompt = (_resolve_prompt(cfg, "goal_notes")
+              .replace("{goal_prompt}", goal_prompt)
+              .replace("{hotwords}", _cfg_hotword(cfg) or "（无）")
+              .replace("{roster}", roster.strip() or "（无）")
+              .replace("{context}", background.strip() or "（无）")
+              .replace("{transcript}", transcript))
+    return _llm_run(prompt, provider, cfg, label)
+
+
+def save_goal_output(text: str, audio_path: Path, goal: dict) -> Path:
+    path = _goal_output_path(audio_path, goal["id"])
+    # The goal's title heads the file, so it still reads sensibly after the
+    # goal itself is renamed or deleted.
+    title = f"# {goal.get('name', '').strip()}\n\n" if goal.get("name") else ""
+    path.write_text(title + text, encoding="utf-8")
+    return path
+
+
 # Files in the recordings dir follow this naming convention:
 #     <timestamp>[.<custom_name>].<suffix>
 # e.g.
@@ -9087,6 +9858,15 @@ def _scan_meeting_artifacts(recordings_dir: Path) -> list[dict]:
             if _split_meeting_stem(stem)[0]:
                 stems.setdefault(stem, {})["wav"] = path
             continue
+        # Checked before the suffix table: `.goal-<id>.md` also ends in the
+        # legacy `.md`, which would mint a phantom meeting whose custom name
+        # is `goal-<id>`.
+        gm = _GOAL_SUFFIX_RE.search(path.name)
+        if gm:
+            stem = path.name[:gm.start()]
+            if _split_meeting_stem(stem)[0]:
+                stems.setdefault(stem, {}).setdefault("goals", {})[gm.group(1)] = path
+            continue
         suffix = next((s for s in _MEETING_ARTIFACT_SUFFIXES
                        if path.name.endswith(s)), None)
         if suffix is None:
@@ -9113,14 +9893,15 @@ def _scan_meeting_artifacts(recordings_dir: Path) -> list[dict]:
         else:
             md_path, md_mode = None, None
 
-        existing = [p for p in files.values() if p.exists()]
+        goal_paths = files.pop("goals", {})
+        existing = [p for p in [*files.values(), *goal_paths.values()] if p.exists()]
         mtime = max((p.stat().st_mtime for p in existing), default=0)
         out.append({
             "wav_path": wav,
             "audio_exists": wav.exists(),
             "stem": stem,
             "mtime": mtime,
-            "has_md": md_path is not None,
+            "has_md": md_path is not None or bool(goal_paths),
             "has_polish": ".polish.txt" in files,
             "has_raw": ".raw.txt" in files,
             "md_path": md_path,
@@ -9130,6 +9911,8 @@ def _scan_meeting_artifacts(recordings_dir: Path) -> list[dict]:
             "sharing_md_path": sharing_md,
             "polish_path": files.get(".polish.txt"),
             "raw_path": files.get(".raw.txt"),
+            # goal id → output path, for the 自定义目标 outputs.
+            "goal_paths": goal_paths,
         })
     return sorted(out, key=lambda item: item["mtime"], reverse=True)
 
@@ -11676,12 +12459,16 @@ def _cmd_ui_body(args, cfg):
         from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QPoint, QSize
         from PyQt6.QtGui import (
             QFont, QAction, QColor, QSyntaxHighlighter, QTextCharFormat,
-            QTextCursor, QTextFormat, QGuiApplication,
+            QTextCursor, QTextFormat, QGuiApplication, QIcon, QPainter, QPen,
+            QBrush, QFontMetrics,
         )
         from PyQt6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
             QStackedWidget, QListWidgetItem, QFileDialog, QMenu, QInputDialog,
-            QMessageBox, QPlainTextEdit, QPushButton,
+            QMessageBox, QPlainTextEdit, QPushButton, QDialog,
+            QGridLayout, QSizePolicy, QComboBox, QLineEdit, QSpinBox, QSlider,
+            QProgressBar, QListWidget, QTextEdit, QTextBrowser, QScrollArea,
+            QStyledItemDelegate, QStyle, QLabel,
         )
         from qfluentwidgets import (
             NavigationInterface, NavigationItemPosition,
@@ -11690,7 +12477,8 @@ def _cmd_ui_body(args, cfg):
             TextEdit, ProgressBar, SegmentedWidget, BodyLabel,
             StrongBodyLabel, TitleLabel, SubtitleLabel, CaptionLabel,
             SearchLineEdit, TextBrowser, ScrollArea, SpinBox,
-            InfoBar, InfoBarPosition, SwitchButton, ComboBox,
+            InfoBar, InfoBarPosition, SwitchButton, ComboBox, LineEdit,
+            setThemeColor, setFontFamilies,
         )
     except ImportError as e:
         print(
@@ -11703,6 +12491,179 @@ def _cmd_ui_body(args, cfg):
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # ── Native macOS controls ──────────────────────────────────────────────
+    # qfluentwidgets draws Windows 11 controls; recolouring them still read as
+    # "a Windows app in Mac colours". These names shadow the Fluent imports
+    # with plain Qt widgets, which the platform's `macos` QStyle renders as
+    # real AppKit controls (NSPopUpButton combos, native fields, overlay
+    # scrollbars, native sliders / progress). Only the API the views use is
+    # kept compatible. Kept from Fluent on purpose: SwitchButton (Qt has no
+    # native toggle; Fluent's, in system blue, is close to NSSwitch), the
+    # labels (plain QLabels with our fonts), SegmentedWidget, InfoBar toasts
+    # and FluentIcon glyphs. Buttons are NOT native: AppKit's blue default
+    # button only shows in the key window and only one per window, so the
+    # Generate / Open states would be invisible. They are drawn like
+    # SwiftUI's `.bordered` / `.borderedProminent` instead.
+
+    def _as_qicon(icon, color: "str | None" = None):
+        if icon is None or isinstance(icon, QIcon):
+            return icon
+        if hasattr(icon, "icon"):            # FluentIcon
+            return icon.icon(color=QColor(color)) if color else icon.icon()
+        return QIcon(icon)
+
+    _BTN_QSS = (
+        "PushButton {"
+        "  background-color: #ffffff; color: #1d1d1f;"
+        "  border: 1px solid #d2d2d7; border-radius: 7px; padding: 6px 14px;"
+        "}"
+        "PushButton:hover { background-color: #f5f5f7; }"
+        "PushButton:pressed { background-color: #e8e8ed; }"
+        "PushButton:disabled { color: #b0b0b5; background-color: #fafafa; border-color: #e3e3e8; }"
+    )
+
+    def _split_button_args(args):
+        """Fluent buttons take (text, parent) or (icon, text, parent)."""
+        args = list(args)
+        icon = None
+        if args and args[0] is not None and not isinstance(args[0], (str, QWidget)):
+            icon = args.pop(0)
+        text = args.pop(0) if args and isinstance(args[0], str) else ""
+        parent = args.pop(0) if args else None
+        return icon, text, parent
+
+    class PushButton(QPushButton):
+        def __init__(self, *args):
+            icon, text, parent = _split_button_args(args)
+            super().__init__(text, parent)
+            if icon is not None:
+                self.setIcon(icon)
+            self.setStyleSheet(_BTN_QSS)
+
+        def setIcon(self, icon):
+            super().setIcon(_as_qicon(icon))
+
+    class PrimaryPushButton(QPushButton):
+        def __init__(self, *args):
+            icon, text, parent = _split_button_args(args)
+            super().__init__(text, parent)
+            if icon is not None:
+                self.setIcon(icon)
+            self.setStyleSheet(
+                "PrimaryPushButton {"
+                "  background-color: #007aff; color: #ffffff;"
+                "  border: 1px solid #007aff; border-radius: 7px; padding: 6px 14px;"
+                "}"
+                "PrimaryPushButton:hover { background-color: #0062cc; }"
+                "PrimaryPushButton:pressed { background-color: #004fa3; }"
+                "PrimaryPushButton:disabled { background-color: #9cc6ff; border-color: #9cc6ff; }")
+
+        def setIcon(self, icon):
+            super().setIcon(_as_qicon(icon, "#ffffff"))
+
+    class ComboBox(QComboBox):
+        pass
+
+    class LineEdit(QLineEdit):
+        pass
+
+    class SearchLineEdit(QLineEdit):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setClearButtonEnabled(True)
+
+    class SpinBox(QSpinBox):
+        pass
+
+    class Slider(QSlider):
+        pass
+
+    class ProgressBar(QProgressBar):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setTextVisible(False)
+
+    class ListWidget(QListWidget):
+        pass
+
+    class TextEdit(QTextEdit):
+        pass
+
+    class TextBrowser(QTextBrowser):
+        pass
+
+    class ScrollArea(QScrollArea):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setFrameShape(QFrame.Shape.NoFrame)
+
+    class _SidebarItem(QPushButton):
+        """One row of the sidebar: icon + label, blue fill when selected
+        (macOS source list). Fluent glyphs are re-tinted white on selection."""
+
+        def __init__(self, icon, text, selectable, parent=None):
+            super().__init__(text, parent)
+            self._glyph = icon
+            self.setCheckable(selectable)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setIconSize(QSize(16, 16))
+            self.setStyleSheet(
+                "_SidebarItem { text-align: left; padding: 6px 10px; border: none;"
+                "  border-radius: 7px; background: transparent; color: #1d1d1f; }"
+                "_SidebarItem:hover { background-color: rgba(0, 0, 0, 0.05); }"
+                "_SidebarItem:checked { background-color: #007aff; color: #ffffff; }")
+            self.toggled.connect(self._tint)
+            self._tint(False)
+
+        def _tint(self, on: bool):
+            self.setIcon(_as_qicon(self._glyph, "#ffffff" if on else "#3a3a3c"))
+
+    class _Sidebar(QWidget):
+        """Stand-in for Fluent's NavigationInterface with the subset of its
+        API MainWindow uses: addItem / setCurrentItem / setExpandWidth."""
+
+        def __init__(self, parent=None, **_ignored):
+            super().__init__(parent)
+            self.setObjectName("appSidebar")
+            self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            self.setStyleSheet("#appSidebar { background-color: #e9e9ee; }")
+            v = QVBoxLayout(self)
+            v.setContentsMargins(10, 14, 10, 12)
+            v.setSpacing(2)
+            self._top = QVBoxLayout()
+            self._top.setSpacing(2)
+            self._bottom = QVBoxLayout()
+            self._bottom.setSpacing(2)
+            v.addLayout(self._top)
+            v.addStretch(1)
+            v.addLayout(self._bottom)
+            self._items: dict = {}
+
+        def addItem(self, routeKey, icon, text, onClick=None, selectable=True,
+                    position=None, **_ignored):
+            item = _SidebarItem(icon, text, selectable, self)
+            if onClick is not None:
+                item.clicked.connect(onClick)
+            if selectable:
+                item.clicked.connect(lambda _c=False, k=routeKey: self.setCurrentItem(k))
+            bottom = position is not None and position == NavigationItemPosition.BOTTOM
+            (self._bottom if bottom else self._top).addWidget(item)
+            self._items[routeKey] = item
+            return item
+
+        def setCurrentItem(self, routeKey):
+            for key, item in self._items.items():
+                if item.isCheckable():
+                    item.blockSignals(True)
+                    item.setChecked(key == routeKey)
+                    item.blockSignals(False)
+                    item._tint(key == routeKey)
+
+        def setExpandWidth(self, _w):
+            pass
+
+    NavigationInterface = _Sidebar
 
     RECORDINGS_DIR = CONFIG_DIR / "recordings"
 
@@ -11744,7 +12705,201 @@ def _cmd_ui_body(args, cfg):
     # share the same Fluent-light "card" look — a soft rounded background
     # with consistent internal padding. We use objectName-qualified QSS so
     # nested widgets (lists, buttons, etc.) are NOT inadvertently restyled.
-    _CARD_BG = "#f5f7fa"
+    # macOS-style palette (System Settings look): gray window, white cards
+    # with a hairline edge, system blue accent, gray secondary text.
+    _ACCENT = "#007aff"
+    _ACCENT_HOVER = "#0062cc"
+    _ACCENT_PRESSED = "#004fa3"
+    _WINDOW_BG = "#f0f0f3"
+    _CARD_BG = "#ffffff"
+    _SURFACE_ALT = "#f7f7f9"
+    _HAIRLINE = "#e3e3e8"
+    _TEXT_SECONDARY = "#86868b"
+    _TEXT_SECTION = "#6e6e73"
+
+    # Status rows draw a coloured dot rather than ✅ / ❌ emoji, which render
+    # as large glossy icons and dominate the row.
+    _TONE_COLORS = {"ok": "#34c759", "bad": "#ff3b30", "warn": "#ff9500",
+                    "idle": "#aeaeb2"}
+
+    def _status_html(text: str, tone: str) -> str:
+        import html as _html
+        dot = _TONE_COLORS.get(tone, _TONE_COLORS["idle"])
+        return (f'<span style="color:{dot}; font-size:15px;">●</span>'
+                f'&nbsp;&nbsp;{_html.escape(text)}')
+
+    def _muted(label):
+        """Secondary text: explanations under a row, hints, footnotes."""
+        label.setStyleSheet(f"color: {_TEXT_SECONDARY};")
+        return label
+
+    def _section_label(label):
+        """The small gray header above a group card."""
+        label.setStyleSheet(f"color: {_TEXT_SECTION}; font-size: 13px; font-weight: 600;")
+        return label
+
+    def _style_reading_pane(view) -> None:
+        """A text surface inside a card (caption pane, notes body): a soft
+        inset panel instead of Fluent's white box with an accent underline."""
+        view.setStyleSheet(
+            f"QTextBrowser {{ background-color: {_SURFACE_ALT};"
+            f" border: 1px solid {_HAIRLINE}; border-radius: 8px; padding: 6px; }}")
+
+    class _EmptyState(QWidget):
+        """Centred gray glyph + message laid over a pane with nothing to show
+        yet (macOS / SwiftUI ContentUnavailableView). Follows the host's size
+        through an event filter, so it needs no layout slot of its own.
+        `opaque` paints the card background, hiding what is underneath."""
+
+        def __init__(self, host: QWidget, icon, opaque: bool = False):
+            super().__init__(host)
+            self.setObjectName("emptyState")
+            if opaque:
+                self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                self.setStyleSheet(f"#emptyState {{ background-color: {_CARD_BG};"
+                                   f" border-radius: 12px; }}")
+            else:
+                self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(40, 0, 40, 0)
+            v.setSpacing(8)
+            v.addStretch(1)
+            self._icon = QLabel(self)
+            self._icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._icon.setPixmap(_as_qicon(icon, "#b8b8bd").pixmap(QSize(44, 44)))
+            self.title = QLabel(self)
+            self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.title.setWordWrap(True)
+            self.title.setStyleSheet("color: #6e6e73; font-size: 15px; font-weight: 500;")
+            self.sub = QLabel(self)
+            self.sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.sub.setWordWrap(True)
+            self.sub.setStyleSheet(f"color: {_TEXT_SECONDARY}; font-size: 12px;")
+            v.addWidget(self._icon)
+            v.addSpacing(4)
+            v.addWidget(self.title)
+            v.addWidget(self.sub)
+            v.addStretch(1)
+            host.installEventFilter(self)
+            self.setGeometry(host.rect())
+            self.raise_()
+
+        def set_text(self, title: str, sub: str = "") -> None:
+            self.title.setText(title)
+            self.sub.setText(sub)
+            self.sub.setVisible(bool(sub))
+
+        def eventFilter(self, obj, ev):
+            if ev.type() == ev.Type.Resize:
+                self.setGeometry(obj.rect())
+            return False
+
+    # Status pill colours (background, text) for the history list.
+    _PILL_TONES = {
+        "done": ("#e6f6ea", "#1e8e3e"),
+        "transcribed": ("#e8f1ff", "#0a64d8"),
+        "audio_only": ("#f0f0f2", "#6e6e73"),
+        "audio_missing": ("#fdecea", "#c5372c"),
+    }
+    _ROW_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    class _MeetingRowDelegate(QStyledItemDelegate):
+        """History rows as two-line cards: bold title + status pill, then a
+        gray date · duration line. The row's display data lives in _ROW_ROLE
+        ({title, meta, badge, tone}); the meeting dict stays in UserRole."""
+
+        ROW_H = 58
+
+        def sizeHint(self, option, index):
+            return QSize(option.rect.width(), self.ROW_H)
+
+        def paint(self, painter, option, index):
+            d = index.data(_ROW_ROLE) or {}
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = option.rect.adjusted(2, 2, -2, -2)
+            if option.state & QStyle.StateFlag.State_Selected:
+                painter.setBrush(QColor("#e3eefe"))
+            elif option.state & QStyle.StateFlag.State_MouseOver:
+                painter.setBrush(QColor("#f4f4f7"))
+            else:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(r, 8, 8)
+
+            pad = 10
+            # pill (right side of the title line)
+            bg, fg = _PILL_TONES.get(d.get("tone"), _PILL_TONES["audio_only"])
+            pf = QFont(option.font)
+            pf.setPixelSize(11)
+            pfm = QFontMetrics(pf)
+            badge = d.get("badge", "")
+            pw = pfm.horizontalAdvance(badge) + 14
+            ph = pfm.height() + 4
+            px = r.right() - pad - pw
+            py = r.top() + 9
+            if badge:
+                painter.setBrush(QColor(bg))
+                painter.drawRoundedRect(px, py, pw, ph, ph / 2, ph / 2)
+                painter.setFont(pf)
+                painter.setPen(QColor(fg))
+                painter.drawText(px, py, pw, ph, Qt.AlignmentFlag.AlignCenter, badge)
+
+            tf = QFont(option.font)
+            tf.setPixelSize(13)
+            tf.setWeight(QFont.Weight.DemiBold)
+            painter.setFont(tf)
+            painter.setPen(QColor("#1d1d1f"))
+            tw = (px - 8 if badge else r.right() - pad) - (r.left() + pad)
+            title = QFontMetrics(tf).elidedText(d.get("title", ""),
+                                                Qt.TextElideMode.ElideRight, tw)
+            painter.drawText(r.left() + pad, r.top() + 8, tw, 20,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title)
+            mf = QFont(option.font)
+            mf.setPixelSize(12)
+            painter.setFont(mf)
+            painter.setPen(QColor(_TEXT_SECONDARY))
+            mw = r.width() - 2 * pad
+            meta = QFontMetrics(mf).elidedText(d.get("meta", ""),
+                                               Qt.TextElideMode.ElideRight, mw)
+            painter.drawText(r.left() + pad, r.top() + 30, mw, 18,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, meta)
+            painter.restore()
+
+    class _GroupCard(QFrame):
+        """One settings group: a white rounded card whose rows are separated
+        by inset hairlines, as in macOS System Settings. `add` takes a widget
+        or a layout and inserts the divider itself, so callers never have to
+        remember which row is first."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setObjectName("groupCard")
+            self.setStyleSheet(
+                f"#groupCard {{ background-color: {_CARD_BG}; "
+                f"border: 1px solid {_HAIRLINE}; border-radius: 12px; }}")
+            self._v = QVBoxLayout(self)
+            self._v.setContentsMargins(16, 4, 16, 4)
+            self._v.setSpacing(0)
+            self._n = 0
+
+        def add(self, item, divider: bool = True) -> None:
+            if self._n and divider:
+                line = QFrame(self)
+                line.setObjectName("groupDivider")
+                line.setFixedHeight(1)
+                line.setStyleSheet(f"#groupDivider {{ background-color: {_HAIRLINE}; border: none; }}")
+                self._v.addWidget(line)
+            holder = QWidget(self)
+            lay = QVBoxLayout(holder)
+            lay.setContentsMargins(0, 11, 0, 11)
+            if isinstance(item, QWidget):
+                lay.addWidget(item)
+            else:
+                lay.addLayout(item)
+            self._v.addWidget(holder)
+            self._n += 1
+
     # Outer padding around every view's content, and the gap between the
     # recording view's two columns. Named rather than repeated per view
     # because the horizontal value had drifted (28 / 24 / 28), which made the
@@ -11753,26 +12908,101 @@ def _cmd_ui_body(args, cfg):
     _VIEW_MARGIN_V = 24
     _VIEW_COL_GAP = 12
 
-    def _confirm_dialog(parent, title: str, msg: str) -> bool:
-        """Modal Yes/No dialog whose button labels are routed through
-        ``_t("ctx.confirm_yes")`` / ``_t("ctx.confirm_no")`` so they flip
-        between Chinese and English with the rest of the UI.
+    class _MacAlert(QDialog):
+        """macOS-style alert: a sheet sliding out of the window's title bar,
+        a tinted glyph, a bold one-line question, a short gray explanation,
+        and right-aligned buttons — the default (confirm) one blue, or red
+        for a destructive action, as NSAlert does. Replaces QMessageBox,
+        whose deprecated "?" icon and square buttons looked foreign, and
+        whose button labels followed the macOS locale instead of our 中文 /
+        EN toggle."""
 
-        Qt's built-in ``QMessageBox.question(...)`` labels its buttons
-        from the system locale via QTranslator — independent of our
-        ``_LANG["current"]`` — which means the EN toggle would otherwise
-        leave the buttons in Chinese (or vice-versa) depending on the
-        user's macOS locale. Using ``addButton`` lets us control the
-        labels directly.
-        """
-        box = QMessageBox(parent)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle(title)
-        box.setText(msg)
-        yes_btn = box.addButton(_t("ctx.confirm_yes"), QMessageBox.ButtonRole.YesRole)
-        box.addButton(_t("ctx.confirm_no"), QMessageBox.ButtonRole.NoRole)
-        box.exec()
-        return box.clickedButton() is yes_btn
+        _KINDS = {"question": (FluentIcon.QUESTION, _ACCENT),
+                  "destructive": (FluentIcon.DELETE, "#ff3b30"),
+                  "warning": (FluentIcon.INFO, "#ff9500"),
+                  "error": (FluentIcon.CANCEL, "#ff3b30"),
+                  "info": (FluentIcon.INFO, _ACCENT)}
+
+        def __init__(self, parent, title: str, msg: str, kind: str = "question",
+                     confirm: "str | None" = None, cancel: "str | None" = None):
+            host = parent.window() if parent is not None else None
+            super().__init__(host)
+            if sys.platform == "darwin" and host is not None:
+                self.setWindowFlags(Qt.WindowType.Sheet)
+            self.setWindowModality(Qt.WindowModality.WindowModal)
+            self.setObjectName("macAlert")
+            self.setStyleSheet(f"#macAlert {{ background-color: {_CARD_BG}; }}")
+            self.setFixedWidth(460)
+            glyph, tint = self._KINDS.get(kind, self._KINDS["question"])
+
+            outer = QHBoxLayout(self)
+            outer.setContentsMargins(22, 22, 22, 18)
+            outer.setSpacing(16)
+            icon = QLabel(self)
+            icon.setPixmap(_as_qicon(glyph, tint).pixmap(QSize(36, 36)))
+            icon.setAlignment(Qt.AlignmentFlag.AlignTop)
+            outer.addWidget(icon, alignment=Qt.AlignmentFlag.AlignTop)
+
+            col = QVBoxLayout()
+            col.setSpacing(6)
+            head = QLabel(title, self)
+            head.setWordWrap(True)
+            head.setStyleSheet("color: #1d1d1f; font-size: 14px; font-weight: 600;")
+            head.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+            col.addWidget(head)
+            if msg:
+                body = QLabel(msg, self)
+                body.setWordWrap(True)
+                body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                body.setStyleSheet("color: #3c3c43; font-size: 12px;")
+                col.addWidget(body)
+            # Spare height goes below the text, never between title and body.
+            col.addStretch(1)
+            col.addSpacing(12)
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            row.addStretch(1)
+            if cancel is not None:
+                no = PushButton(cancel, self)
+                no.setMinimumWidth(88)
+                no.clicked.connect(self.reject)
+                row.addWidget(no)
+            yes = PrimaryPushButton(confirm or _t("ctx.ok"), self)
+            yes.setMinimumWidth(88)
+            if kind == "destructive":
+                yes.setStyleSheet(
+                    "PrimaryPushButton { background-color: #ff3b30; color: #ffffff;"
+                    "  border: 1px solid #ff3b30; border-radius: 7px; padding: 6px 14px; }"
+                    "PrimaryPushButton:hover { background-color: #e0332a; }"
+                    "PrimaryPushButton:pressed { background-color: #c42b23; }")
+            yes.clicked.connect(self.accept)
+            yes.setDefault(True)
+            row.addWidget(yes)
+            col.addLayout(row)
+            outer.addLayout(col, stretch=1)
+            # A destructive default must not fire on a stray Return: focus
+            # Cancel, exactly as macOS does for "Delete" alerts.
+            (no if cancel is not None and kind == "destructive" else yes).setFocus()
+            # Height from the WRAPPED text at the fixed width; sizeHint alone
+            # measures the text on one line and leaves a gap under it.
+            lay = self.layout()
+            lay.activate()
+            h = lay.totalHeightForWidth(460) if lay.hasHeightForWidth() else lay.sizeHint().height()
+            self.setFixedHeight(max(h, 120))
+
+    def _confirm_dialog(parent, title: str, msg: str, confirm: "str | None" = None,
+                        destructive: bool = False) -> bool:
+        """Yes / No question as a macOS sheet. Labels go through `_t` so they
+        follow the app's 中文 / EN toggle, not the system locale."""
+        box = _MacAlert(parent, title, msg,
+                        kind="destructive" if destructive else "question",
+                        confirm=confirm or _t("ctx.confirm_yes"),
+                        cancel=_t("ctx.confirm_no"))
+        return box.exec() == QDialog.DialogCode.Accepted
+
+    def _alert(parent, title: str, msg: str = "", kind: str = "warning") -> None:
+        """One-button notice (warning / error / info) as a macOS sheet."""
+        _MacAlert(parent, title, msg, kind=kind).exec()
 
     def _apply_open_btn_style(btn, is_open: bool) -> None:
         """Paint a pipeline action button. Both states share the exact
@@ -11790,14 +13020,14 @@ def _cmd_ui_body(args, cfg):
         if is_open:
             btn.setStyleSheet(
                 "PushButton {"
-                "  background-color: #0a84ff;"
+                f"  background-color: {_ACCENT};"
                 "  color: white;"
-                "  border: 1px solid #0a84ff;"
-                "  border-radius: 6px;"
-                "  padding: 6px 16px;"
+                f"  border: 1px solid {_ACCENT};"
+                "  border-radius: 7px;"
+                "  padding: 7px 16px;"
                 "}"
-                "PushButton:hover { background-color: #0066d6; }"
-                "PushButton:pressed { background-color: #0050a8; }"
+                f"PushButton:hover {{ background-color: {_ACCENT_HOVER}; }}"
+                f"PushButton:pressed {{ background-color: {_ACCENT_PRESSED}; }}"
                 "PushButton:disabled {"
                 "  background-color: #9bbfe6;"
                 "  border-color: #9bbfe6;"
@@ -11807,14 +13037,14 @@ def _cmd_ui_body(args, cfg):
         else:
             btn.setStyleSheet(
                 "PushButton {"
-                "  background-color: #e8eaed;"
-                "  color: #1f2328;"
-                "  border: 1px solid #d0d7de;"
-                "  border-radius: 6px;"
-                "  padding: 6px 16px;"
+                "  background-color: #ffffff;"
+                "  color: #1d1d1f;"
+                "  border: 1px solid #d2d2d7;"
+                "  border-radius: 7px;"
+                "  padding: 7px 16px;"
                 "}"
-                "PushButton:hover { background-color: #dadce0; }"
-                "PushButton:pressed { background-color: #c8ccd1; }"
+                "PushButton:hover { background-color: #f5f5f7; }"
+                "PushButton:pressed { background-color: #e8e8ed; }"
                 "PushButton:disabled {"
                 "  background-color: #f0f1f3;"
                 "  border-color: #e0e2e5;"
@@ -11830,11 +13060,36 @@ def _cmd_ui_body(args, cfg):
         # this attribute its rounded corners wouldn't render).
         w.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         w.setStyleSheet(
-            f"#{name} {{ background-color: {_CARD_BG}; border-radius: 14px; }}"
+            f"#{name} {{ background-color: {_CARD_BG}; border: 1px solid {_HAIRLINE};"
+            f" border-radius: 12px; }}"
         )
         lyt = w.layout()
         if lyt is not None:
             lyt.setContentsMargins(padding, padding, padding, padding)
+
+    def _open_guide(section: str = "", parent=None) -> None:
+        url = _install_guide_url(section, _LANG["current"])
+        if url is None:
+            _log("ERR", "install guide not found in bundle / repo")
+            if parent is not None:
+                InfoBar.warning(title=_t("guide.missing"), content="",
+                                parent=parent, position=InfoBarPosition.TOP,
+                                duration=4000)
+            return
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _guide_link(key: str, section: str, parent) -> QLabel:
+        """A blue text link (not a button) that opens the guide at `section`."""
+        lbl = QLabel(parent)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        lbl.linkActivated.connect(lambda _h: _open_guide(section, parent.window()))
+        lbl._paint = lambda: lbl.setText(
+            f'<a href="#" style="color:{_ACCENT}; text-decoration:none;">{_t(key)}</a>')
+        lbl._paint()
+        return lbl
 
     def _open_path(path) -> None:
         path = str(path)
@@ -11944,6 +13199,36 @@ def _cmd_ui_body(args, cfg):
             "rec.btn.notes": "生成会议纪要",
             "rec.btn.interview": "生成面试报告",
             "rec.btn.sharing": "生成分享总结",
+            "goal.btn": "自定义目标 ▾",
+            "goal.menu.empty": "还没有自定义目标",
+            "goal.menu.no_audio": "（先选择一段录音）",
+            "goal.menu.run": "生成：{name}",
+            "goal.menu.done": "✓ {name}",
+            "goal.menu.open": "打开结果",
+            "goal.menu.regen": "重新生成",
+            "goal.menu.new": "新建目标…",
+            "goal.menu.edit": "编辑目标",
+            "goal.dlg.title_new": "新建自定义目标",
+            "goal.dlg.title_edit": "编辑自定义目标",
+            "goal.dlg.name": "目标名称",
+            "goal.dlg.name_ph": "例如：客户需求清单",
+            "goal.dlg.goal": "目标描述（一两句话说清你想得到什么）",
+            "goal.dlg.goal_ph": "例如：把客户提到的需求、痛点和预算整理成表格，最后给出跟进建议",
+            "goal.dlg.enrich": "AI 生成 Prompt",
+            "goal.dlg.enriching": "AI 正在扩写 Prompt，通常需要 10–30 秒…",
+            "goal.dlg.enrich_done": "已生成，可直接修改后保存",
+            "goal.dlg.enrich_failed": "生成失败：{err}",
+            "goal.dlg.all_failed": "所有模型都调用失败，详情见日志",
+            "goal.dlg.cancelled": "已取消",
+            "goal.dlg.need_goal": "请先填写目标描述",
+            "goal.dlg.overwrite_confirm": "会覆盖下方已有的 Prompt，继续吗？",
+            "goal.dlg.prompt": "Prompt（可直接修改；留空则直接使用目标描述）",
+            "goal.dlg.save": "保存",
+            "goal.dlg.cancel": "取消",
+            "goal.dlg.delete": "删除目标",
+            "goal.dlg.delete_confirm": "删除目标「{name}」？已生成的结果文件会保留。",
+            "goal.info.saved": "目标已保存",
+            "hist.body.notes_goal": "自定义目标结果",
             "rec.btn.open_transcribe": "打开语音转文字结果",
             "rec.btn.open_notes": "打开会议纪要",
             "rec.btn.open_interview": "打开面试报告",
@@ -11971,6 +13256,8 @@ def _cmd_ui_body(args, cfg):
             "rec.captions.status.ready": "字幕运行中",
             "rec.captions.status.stopped": "字幕已停止",
             "rec.captions.error_prefix": "字幕出错：",
+            "rec.captions.download_progress": "正在下载模型 {name}：{pct}%（{done} / {total} MB）",
+            "models.download_title": "需要下载模型",
             "rec.captions.role_mic": "我方",
             "rec.captions.role_system": "对方",
             "rec.captions.speaker_n": "说话人{n}",
@@ -12015,6 +13302,108 @@ def _cmd_ui_body(args, cfg):
             "cal.err.quota_at": "Claude 用量已达上限（预计 {at} 恢复），本次读取失败。",
             "cal.stale_suffix": "  ⚠ 未更新",
             # ── 配置页的日程卡片
+            "cfg.title.settings": "常用设置",
+            "cfg.desc.settings": "常用选项可以直接在这里改，改完立即保存。实时字幕相关的设置从下次开始录音时生效。",
+            "cfg.set.saved": "已保存",
+            "cfg.set.sec.ai": "AI 模型",
+            "cfg.set.sec.stt": "转写",
+            "cfg.set.sec.captions": "实时字幕",
+            "cfg.set.sec.captions.desc": "从下次开始录音时生效。",
+            "rec.actions_head": "处理录音",
+            "cfg.set.sec.hotwords": "热词",
+            "cfg.set.polish": "校对文字稿",
+            "cfg.set.polish.desc": "把转写原文整理成通顺、分段的文字稿",
+            "cfg.set.notes": "生成纪要 / 报告",
+            "cfg.set.notes.desc": "会议纪要、面试报告、分享总结和自定义目标",
+            "cfg.set.fallback": "主模型失败时",
+            "cfg.set.fallback.desc": "调用失败（超时、额度不足等）时自动改用的备选模型",
+            "cfg.set.opt.p.claude": "Claude（claude 命令行）",
+            "cfg.set.opt.p.codex_proxy": "Codex（代理，codex -p proxy）",
+            "cfg.set.opt.p.codex_personal": "Codex（个人账号）",
+            "cfg.set.opt.p.none": "不改用，直接报错",
+            "cfg.set.spk": "区分说话人",
+            "cfg.set.spk.desc": "转写稿标注 [说话人N]，纪要能分清谁说了什么。代价：长录音不能分段并行，转写会慢好几倍",
+            "cfg.set.mt": "翻译引擎",
+            "cfg.set.mt.desc": "只在字幕面板「翻译」不是「不翻译」时才会用到。",
+            "cfg.set.opt.mt.hymt": "HY-MT 1.5 1.8B（推荐）",
+            "cfg.set.opt.mt.qwen": "Qwen 2.5 1.5B",
+            "cfg.set.opt.mt.nllb": "NLLB-200 600M",
+            "cfg.set.opt.mt.marian": "opus-mt",
+            "cfg.set.mt.about.hymt": "腾讯的专用翻译模型，中英互译都准确、完整。约 1.1 GB，每句约 1 秒。加载失败时自动改用 opus-mt。",
+            "cfg.set.mt.about.qwen": "通用小模型。中文会议里，翻译的同时能纠正听错的词；但它翻不好英文，常把英文原样输出，英文会议不要选。约 1 GB，每句约 1.8 秒。加载失败时自动改用 opus-mt。",
+            "cfg.set.mt.about.nllb": "Meta 的多语言翻译模型，部分专业术语保留得更好。约 2.4 GB，每句约 1 秒。",
+            "cfg.set.mt.about.marian": "最快、最小（约 0.6 GB），但较长的句子常常只翻译前半句。",
+            "cfg.set.capnow": "当前字幕",
+            "cfg.set.capnow.text": "识别：{lang}（{asr}）· 翻译：{mt}",
+            "cfg.set.capnow.hint": "识别语言和翻译方向在录音页字幕面板的「识别」「翻译」里切换。",
+            "cfg.set.capnow.lang.zh": "中文",
+            "cfg.set.capnow.lang.en": "英文",
+            "cfg.set.capnow.asr.zh": "流式 Paraformer 中英双语，约 230 MB",
+            "cfg.set.capnow.asr.en": "NVIDIA Nemotron 0.6B，约 630 MB",
+            "cfg.set.capnow.mt.off": "不翻译（不加载翻译模型）",
+            "cfg.set.capnow.mt.on": "翻成{target}，用 {engine}",
+            "cfg.set.refine": "中文字幕二次识别",
+            "cfg.set.refine.desc": "只在识别中文时生效：用离线的 paraformer-large（与语音转文字共用）把每条字幕重新识别一遍，更准，但更占 CPU。",
+            "cfg.set.speaker": "字幕区分说话人",
+            "cfg.set.speaker.desc": "用 cam++ 声纹模型（约 27 MB）给每条字幕标上 [说话人N]。",
+            "cfg.set.review": "大模型复核字幕",
+            "cfg.set.review.desc": "每新增两条字幕，把最近五条交给「校对文字稿」所选的大模型修正术语。这是字幕里唯一需要联网的环节，关闭后字幕完全在本地运行。",
+            "cfg.set.hotwords": "自动积累热词",
+            "cfg.set.hotwords.desc": "每次生成纪要后，从内容里提取人名和术语加入热词表，提高下次识别准确率",
+            "cfg.set.btn.hotwords": "编辑热词表",
+            "cfg.set.hotwords_note": "热词表改完后重启 app 生效。",
+            "cfg.set.sec.files": "文件位置",
+            "cfg.set.files.desc": "配置：{config}\n热词：{hotword}\n自定义目标：{goals}\n录音：{recordings}",
+            "cfg.set.btn.data_dir": "打开数据文件夹",
+            "cfg.set.btn.recordings": "打开录音文件夹",
+            "cfg.adv.show": "展开",
+            "cfg.set.on": "开",
+            "cfg.set.off": "关",
+            "cfg.adv.hide": "收起",
+            "cfg.title.env": "运行环境",
+            "cfg.desc.env": "录音和生成纪要依赖几个需要单独安装的工具。缺少时对应功能会失效，这里逐项检查并给出处理方法。",
+            "cfg.env.btn.recheck": "重新检查",
+            "cfg.env.guide_link": "查看步骤",
+            "cfg.env.full_guide": "完整安装说明",
+            "menu.help": "帮助",
+            "menu.help.guide": "安装说明",
+            "menu.help.faq": "常见问题",
+            "guide.missing": "找不到安装说明文件",
+            "cfg.env.btn.copy": "复制命令",
+            "cfg.env.btn.open_midi": "打开音频 MIDI 设置",
+            "cfg.env.btn.test": "测试连接",
+            "cfg.env.btn.brew": "打开 brew.sh",
+            "cfg.env.copied": "已复制到剪贴板，粘贴到「终端」里运行即可",
+            "cfg.env.svc.blackhole": "BlackHole 2ch",
+            "cfg.env.svc.multi_output": "多输出设备",
+            "cfg.env.svc.llm": "AI 命令行",
+            "cfg.env.svc.ffmpeg": "ffmpeg（可选）",
+            "cfg.env.state.blackhole.ok": "已安装",
+            "cfg.env.state.blackhole.missing": "未安装：只能录到麦克风，录不到电脑里播放的声音（对方说话）",
+            "cfg.env.state.multi_output.ok": "已创建（{detail}）",
+            "cfg.env.state.multi_output.missing": "未找到：录音时无法一边听、一边录下电脑的声音",
+            "cfg.env.state.multi_output.no_physical": "「{detail}」里没有勾选扬声器或耳机：录音时你会听不到声音",
+            "cfg.env.state.llm.ok": "已找到：{detail}",
+            "cfg.env.state.llm.missing": "找不到 {detail}：无法校对文字稿和生成纪要",
+            "cfg.env.state.ffmpeg.ok": "已安装",
+            "cfg.env.state.ffmpeg.missing": "未安装：只影响导入 mp3 / m4a 等非 WAV 音频",
+            "cfg.env.state.testing": "正在发送一条测试消息…（约 10–30 秒）",
+            "cfg.env.state.test_ok": "{detail} 已登录，能正常回复",
+            "cfg.env.state.test_fail": "测试失败：{detail}",
+            "cfg.env.hint.blackhole": "在「终端」运行：{cmd}（需要输入电脑密码，装完建议重启电脑）",
+            "cfg.env.hint.multi_output": "打开「音频 MIDI 设置」→ 左下角「+」→「创建多输出设备」→ 勾选 BlackHole 2ch 和你平时用的扬声器 / 耳机。",
+            "cfg.env.hint.multi_output.no_physical": "打开「音频 MIDI 设置」，选中「{detail}」，在右侧勾选你的扬声器 / 耳机。",
+            "cfg.env.hint.llm": "在「终端」运行：{cmd}，装完再运行 {login} 按提示登录。",
+            "cfg.env.hint.ffmpeg": "在「终端」运行：{cmd}",
+            "cfg.env.hint.no_brew": "上面的 brew 命令需要先安装 Homebrew，安装方法见 brew.sh。",
+            "cfg.env.hint.no_npm": "上面的 npm 命令需要先安装 Node.js（nodejs.org）。",
+            "env.startup.title": "运行环境不完整",
+            "env.startup.msg": "缺少：{items}。相关功能会受影响，处理方法见「配置 → 运行环境」。",
+            "env.startup.btn": "去查看",
+            "env.rec.no_blackhole.title": "这次录不到电脑声音",
+            "env.rec.no_blackhole.msg": "未找到 BlackHole 2ch，只会录麦克风，对方说话录不进来。安装方法见「配置 → 运行环境」。",
+            "env.rec.no_multi.title": "未找到多输出设备",
+            "env.rec.no_multi.msg": "电脑声音可能录不到，或录音时听不到声音。设置方法见「配置 → 运行环境」。",
             "cfg.title.calendar": "日程关联",
             "cfg.desc.calendar": ("从 Google 日历读取会议名称、参会人和 Notion 链接，"
                                   "录音时自动命名并存进 .meta.json（该文件在录音目录里，不进仓库）。"
@@ -12022,9 +13411,9 @@ def _cmd_ui_body(args, cfg):
             "cfg.cal.enable": "启用日程关联",
             "cfg.cal.svc.calendar": "Google 日历",
             "cfg.cal.svc.notion": "Notion",
-            "cfg.cal.state.connected": "✔ 已连接",
-            "cfg.cal.state.needs_auth": "⚠ 需要重新授权",
-            "cfg.cal.state.missing": "⚠ 未连接",
+            "cfg.cal.state.connected": "已连接",
+            "cfg.cal.state.needs_auth": "需要重新授权",
+            "cfg.cal.state.missing": "未连接",
             "cfg.cal.state.checking": "检测中…",
             "cfg.cal.state.unknown": "未检测",
             "cfg.cal.optional_note": "（可选：仅影响会议背景资料，不影响日程列表）",
@@ -12057,8 +13446,10 @@ def _cmd_ui_body(args, cfg):
             "ctx.rename": "重命名…",
             "ctx.reveal": "在 Finder/资源管理器中显示",
             "ctx.delete": "删除本次会议所有记录…",
-            "ctx.delete_title": "确认删除",
-            "ctx.delete_confirm": "确认删除 “{name}” 及其所有相关文件（.wav / .raw.txt / .polish.txt / .meeting.md / .interview.md / .sharing.md 等）？\n此操作不可恢复。",
+            "ctx.delete_title": "删除「{name}」？",
+            "ctx.delete_confirm": "这次会议的录音、文字稿和所有生成的纪要都会被删除，无法恢复。",
+            "ctx.delete_btn": "删除",
+            "ctx.ok": "好",
             "ctx.delete_failed_title": "删除失败",
             "ctx.delete_failed_msg": "{err}",
             "ctx.confirm_yes": "确认",
@@ -12081,12 +13472,16 @@ def _cmd_ui_body(args, cfg):
             "pipe.warn.file_missing_title": "文件不存在",
             "pipe.warn.file_missing_msg": "找不到 {name}。",
             # ── History list badges + body titles
-            "hist.badge.done": "✓ 已总结",
-            "hist.badge.transcribed": "📝 已转文字",
+            "hist.badge.done": "已总结",
+            "hist.badge.transcribed": "已转文字",
             "hist.badge.pending_summary": "待生成纪要",
             "hist.badge.audio_only": "仅录音",
             "hist.badge.audio_missing": "录音已删除",
             "hist.dur_prefix": "时长",
+            "hist.untitled": "未命名录音",
+            "hist.empty_sub": "点击左侧列表里的会议，查看纪要、文字稿和待办。",
+            "rec.captions.disabled_sub": "打开上方的开关，录音时这里会实时显示字幕和翻译。",
+            "rec.captions.idle_sub": "字幕在本地实时识别，不影响录音本身。",
             "dur.unknown": "未知时长",
             "dur.hour_minute": "{h} 小时 {m} 分钟",
             "dur.minute": "{m} 分钟",
@@ -12123,7 +13518,7 @@ def _cmd_ui_body(args, cfg):
                                      "> 0 时直接使用该值，不再二次计算。"),
             "cfg.label.workers": "并发任务数：",
             "cfg.btn.apply": "应用",
-            "cfg.title.editor": "配置文件编辑器",
+            "cfg.title.editor": "高级：直接编辑 config.jsonc",
             "cfg.desc.editor": ("直接编辑 config.jsonc 原文（支持 // 注释）。"
                                 "保存前会做一次 JSON 语法校验；校验失败不会覆盖磁盘上的文件。"),
             "cfg.btn.reload": "重新加载",
@@ -12145,15 +13540,45 @@ def _cmd_ui_body(args, cfg):
             "rec.volume": "Output volume:",
             "rec.volume_hint": "💡 Use this slider during recording — F11/F12 are disabled while recording.",
             "rec.btn.transcribe": "Transcribe",
-            "rec.btn.notes": "Generate meeting notes",
-            "rec.btn.interview": "Generate interview report",
-            "rec.btn.sharing": "Generate sharing summary",
+            "rec.btn.notes": "Meeting notes",
+            "rec.btn.interview": "Interview report",
+            "rec.btn.sharing": "Sharing summary",
+            "goal.btn": "Custom goals ▾",
+            "goal.menu.empty": "No custom goals yet",
+            "goal.menu.no_audio": "(select a recording first)",
+            "goal.menu.run": "Generate: {name}",
+            "goal.menu.done": "✓ {name}",
+            "goal.menu.open": "Open result",
+            "goal.menu.regen": "Regenerate",
+            "goal.menu.new": "New goal…",
+            "goal.menu.edit": "Edit goal",
+            "goal.dlg.title_new": "New custom goal",
+            "goal.dlg.title_edit": "Edit custom goal",
+            "goal.dlg.name": "Goal name",
+            "goal.dlg.name_ph": "e.g. Customer requirements",
+            "goal.dlg.goal": "Goal (a sentence or two on what you want)",
+            "goal.dlg.goal_ph": "e.g. Tabulate every requirement, pain point and budget the customer mentioned, then suggest follow-ups",
+            "goal.dlg.enrich": "Generate prompt with AI",
+            "goal.dlg.enriching": "AI is expanding the prompt, usually 10–30 s…",
+            "goal.dlg.enrich_done": "Done — edit freely, then save",
+            "goal.dlg.enrich_failed": "Failed: {err}",
+            "goal.dlg.all_failed": "Every model provider failed; see the log",
+            "goal.dlg.cancelled": "Cancelled",
+            "goal.dlg.need_goal": "Describe the goal first",
+            "goal.dlg.overwrite_confirm": "This replaces the prompt below. Continue?",
+            "goal.dlg.prompt": "Prompt (editable; leave empty to use the goal text as-is)",
+            "goal.dlg.save": "Save",
+            "goal.dlg.cancel": "Cancel",
+            "goal.dlg.delete": "Delete goal",
+            "goal.dlg.delete_confirm": "Delete goal “{name}”? Results already generated are kept.",
+            "goal.info.saved": "Goal saved",
+            "hist.body.notes_goal": "Custom goal result",
             "rec.btn.open_transcribe": "Open transcript",
-            "rec.btn.open_notes": "Open meeting notes",
-            "rec.btn.open_interview": "Open interview report",
-            "rec.btn.open_sharing": "Open sharing summary",
+            "rec.btn.open_notes": "Open notes",
+            "rec.btn.open_interview": "Open interview",
+            "rec.btn.open_sharing": "Open summary",
             "rec.btn.cancel": "Stop task",
-            "rec.btn.import": "Import audio file…",
+            "rec.btn.import": "Import audio…",
             "rec.import.dialog_title": "Select an audio file to import",
             "rec.import.filter": "Audio files (*.wav *.m4a *.mp3 *.aac *.flac *.ogg *.opus *.aif *.aiff *.aifc *.wma *.amr *.caf *.webm);;All files (*)",
             "rec.import.progress": "Importing & transcoding…",
@@ -12175,6 +13600,8 @@ def _cmd_ui_body(args, cfg):
             "rec.captions.status.ready": "Captions live",
             "rec.captions.status.stopped": "Captions stopped",
             "rec.captions.error_prefix": "Caption error: ",
+            "rec.captions.download_progress": "Downloading model {name}: {pct}% ({done} / {total} MB)",
+            "models.download_title": "Models to download",
             "rec.captions.role_mic": "Us",
             "rec.captions.role_system": "Them",
             "rec.captions.speaker_n": "Speaker {n}",
@@ -12216,6 +13643,108 @@ def _cmd_ui_body(args, cfg):
             "cal.err.quota": "Claude usage limit reached; this reload failed.",
             "cal.err.quota_at": "Claude usage limit reached (resets {at}); this reload failed.",
             "cal.stale_suffix": "  ⚠ not refreshed",
+            "cfg.title.settings": "Common settings",
+            "cfg.desc.settings": "Change the common options here; every change is saved immediately. Live-caption settings take effect from the next recording.",
+            "cfg.set.saved": "Saved",
+            "cfg.set.sec.ai": "AI models",
+            "cfg.set.sec.stt": "Transcription",
+            "cfg.set.sec.captions": "Live captions",
+            "cfg.set.sec.captions.desc": "Takes effect from the next recording.",
+            "rec.actions_head": "Process recording",
+            "cfg.set.sec.hotwords": "Hotwords",
+            "cfg.set.polish": "Polish transcript",
+            "cfg.set.polish.desc": "Turns the raw transcript into clean, paragraphed text",
+            "cfg.set.notes": "Notes / reports",
+            "cfg.set.notes.desc": "Meeting notes, interview reports, sharing summaries and custom goals",
+            "cfg.set.fallback": "When the main model fails",
+            "cfg.set.fallback.desc": "Backup model used automatically when a call fails (timeout, quota …)",
+            "cfg.set.opt.p.claude": "Claude (claude CLI)",
+            "cfg.set.opt.p.codex_proxy": "Codex (proxy, codex -p proxy)",
+            "cfg.set.opt.p.codex_personal": "Codex (personal account)",
+            "cfg.set.opt.p.none": "None — report the error",
+            "cfg.set.spk": "Identify speakers",
+            "cfg.set.spk.desc": "Labels the transcript [Speaker N] so the notes know who said what. Cost: long recordings can't be split for parallel transcription, so it is several times slower",
+            "cfg.set.mt": "Translation engine",
+            "cfg.set.mt.desc": "Only used when the caption panel's Translate is not Off.",
+            "cfg.set.opt.mt.hymt": "HY-MT 1.5 1.8B (recommended)",
+            "cfg.set.opt.mt.qwen": "Qwen 2.5 1.5B",
+            "cfg.set.opt.mt.nllb": "NLLB-200 600M",
+            "cfg.set.opt.mt.marian": "opus-mt",
+            "cfg.set.mt.about.hymt": "Tencent's dedicated translation model; accurate, complete zh↔en. ~1.1 GB, ~1 s per line. Falls back to opus-mt if it fails to load.",
+            "cfg.set.mt.about.qwen": "General small model. In Chinese meetings it also fixes misheard words while translating, but it translates English poorly (often echoes it back) — don't use it for English meetings. ~1 GB, ~1.8 s per line. Falls back to opus-mt if it fails to load.",
+            "cfg.set.mt.about.nllb": "Meta's multilingual translation model; keeps some domain terms better. ~2.4 GB, ~1 s per line.",
+            "cfg.set.mt.about.marian": "Fastest and smallest (~0.6 GB), but often translates only the first half of a long line.",
+            "cfg.set.capnow": "Current captions",
+            "cfg.set.capnow.text": "Recognition: {lang} ({asr}) · Translation: {mt}",
+            "cfg.set.capnow.hint": "Switch the recognition language and translation in the caption panel on the recording page.",
+            "cfg.set.capnow.lang.zh": "Chinese",
+            "cfg.set.capnow.lang.en": "English",
+            "cfg.set.capnow.asr.zh": "streaming Paraformer zh/en, ~230 MB",
+            "cfg.set.capnow.asr.en": "NVIDIA Nemotron 0.6B, ~630 MB",
+            "cfg.set.capnow.mt.off": "off (no translation model loaded)",
+            "cfg.set.capnow.mt.on": "into {target} with {engine}",
+            "cfg.set.refine": "Re-check Chinese captions",
+            "cfg.set.refine.desc": "Chinese recognition only: re-recognises each line with the offline paraformer-large (shared with transcription) — more accurate, more CPU.",
+            "cfg.set.speaker": "Speaker tags in captions",
+            "cfg.set.speaker.desc": "Tags each line [Speaker N] using the cam++ voice-print model (~27 MB).",
+            "cfg.set.review": "LLM caption review",
+            "cfg.set.review.desc": "Every two new lines, the last five go to the model chosen for Polish transcript to fix misheard terms. The only caption step that goes online; turn it off to keep captions fully local.",
+            "cfg.set.hotwords": "Learn hotwords automatically",
+            "cfg.set.hotwords.desc": "After each set of notes, names and terms are added to the hotword list to improve recognition next time",
+            "cfg.set.btn.hotwords": "Edit hotword list",
+            "cfg.set.hotwords_note": "Hotword edits take effect after restarting the app.",
+            "cfg.set.sec.files": "File locations",
+            "cfg.set.files.desc": "Settings: {config}\nHotwords: {hotword}\nCustom goals: {goals}\nRecordings: {recordings}",
+            "cfg.set.btn.data_dir": "Open data folder",
+            "cfg.set.btn.recordings": "Open recordings folder",
+            "cfg.adv.show": "Show",
+            "cfg.set.on": "On",
+            "cfg.set.off": "Off",
+            "cfg.adv.hide": "Hide",
+            "cfg.title.env": "Environment",
+            "cfg.desc.env": "Recording and notes rely on a few tools installed separately. When one is missing the related feature stops working; each is checked here with a fix.",
+            "cfg.env.btn.recheck": "Check again",
+            "cfg.env.guide_link": "How to",
+            "cfg.env.full_guide": "Full install guide",
+            "menu.help": "Help",
+            "menu.help.guide": "Install guide",
+            "menu.help.faq": "Troubleshooting",
+            "guide.missing": "Install guide not found",
+            "cfg.env.btn.copy": "Copy command",
+            "cfg.env.btn.open_midi": "Open Audio MIDI Setup",
+            "cfg.env.btn.test": "Test",
+            "cfg.env.btn.brew": "Open brew.sh",
+            "cfg.env.copied": "Copied — paste it into Terminal to run",
+            "cfg.env.svc.blackhole": "BlackHole 2ch",
+            "cfg.env.svc.multi_output": "Multi-Output Device",
+            "cfg.env.svc.llm": "AI CLI",
+            "cfg.env.svc.ffmpeg": "ffmpeg (optional)",
+            "cfg.env.state.blackhole.ok": "Installed",
+            "cfg.env.state.blackhole.missing": "Not installed: only the microphone is recorded, not the computer's audio (the other side)",
+            "cfg.env.state.multi_output.ok": "Found ({detail})",
+            "cfg.env.state.multi_output.missing": "Not found: you can't hear and record the computer's audio at the same time",
+            "cfg.env.state.multi_output.no_physical": "\"{detail}\" has no speaker or headphones ticked: you'll hear nothing while recording",
+            "cfg.env.state.llm.ok": "Found: {detail}",
+            "cfg.env.state.llm.missing": "{detail} not found: transcripts can't be polished and notes can't be generated",
+            "cfg.env.state.ffmpeg.ok": "Installed",
+            "cfg.env.state.ffmpeg.missing": "Not installed: only affects importing non-WAV audio (mp3 / m4a …)",
+            "cfg.env.state.testing": "Sending a test message… (about 10–30 s)",
+            "cfg.env.state.test_ok": "{detail} is logged in and replying",
+            "cfg.env.state.test_fail": "Test failed: {detail}",
+            "cfg.env.hint.blackhole": "Run in Terminal: {cmd} (asks for your password; restart afterwards)",
+            "cfg.env.hint.multi_output": "Open Audio MIDI Setup → \"+\" at the bottom left → Create Multi-Output Device → tick BlackHole 2ch and your usual speaker / headphones.",
+            "cfg.env.hint.multi_output.no_physical": "Open Audio MIDI Setup, select \"{detail}\" and tick your speaker / headphones on the right.",
+            "cfg.env.hint.llm": "Run in Terminal: {cmd}, then run {login} and follow the prompts to log in.",
+            "cfg.env.hint.ffmpeg": "Run in Terminal: {cmd}",
+            "cfg.env.hint.no_brew": "The brew commands above need Homebrew first — see brew.sh.",
+            "cfg.env.hint.no_npm": "The npm command above needs Node.js first (nodejs.org).",
+            "env.startup.title": "Setup incomplete",
+            "env.startup.msg": "Missing: {items}. Related features are affected — see Settings → Environment.",
+            "env.startup.btn": "Show me",
+            "env.rec.no_blackhole.title": "Computer audio won't be recorded",
+            "env.rec.no_blackhole.msg": "BlackHole 2ch not found: only the microphone is recorded, not the other side. See Settings → Environment.",
+            "env.rec.no_multi.title": "Multi-Output Device not found",
+            "env.rec.no_multi.msg": "Computer audio may not be recorded, or you may hear nothing while recording. See Settings → Environment.",
             "cfg.title.calendar": "Calendar linkage",
             "cfg.desc.calendar": ("Pull meeting titles, attendees and Notion links from Google Calendar: "
                                   "recordings get named automatically and the details land in a .meta.json "
@@ -12224,9 +13753,9 @@ def _cmd_ui_body(args, cfg):
             "cfg.cal.enable": "Enable calendar linkage",
             "cfg.cal.svc.calendar": "Google Calendar",
             "cfg.cal.svc.notion": "Notion",
-            "cfg.cal.state.connected": "✔ Connected",
-            "cfg.cal.state.needs_auth": "⚠ Needs re-authorisation",
-            "cfg.cal.state.missing": "⚠ Not connected",
+            "cfg.cal.state.connected": "Connected",
+            "cfg.cal.state.needs_auth": "Needs re-authorisation",
+            "cfg.cal.state.missing": "Not connected",
             "cfg.cal.state.checking": "Checking…",
             "cfg.cal.state.unknown": "Not checked",
             "cfg.cal.optional_note": "(optional: affects background context only, not the event list)",
@@ -12257,8 +13786,10 @@ def _cmd_ui_body(args, cfg):
             "ctx.rename": "Rename…",
             "ctx.reveal": "Show in Finder / Explorer",
             "ctx.delete": "Delete this meeting…",
-            "ctx.delete_title": "Confirm delete",
-            "ctx.delete_confirm": "Delete \"{name}\" and all related files (.wav / .raw.txt / .polish.txt / .meeting.md / .interview.md / .sharing.md etc.)?\nThis cannot be undone.",
+            "ctx.delete_title": "Delete “{name}”?",
+            "ctx.delete_confirm": "The recording, transcripts and every generated summary of this meeting will be deleted. This can’t be undone.",
+            "ctx.delete_btn": "Delete",
+            "ctx.ok": "OK",
             "ctx.delete_failed_title": "Delete failed",
             "ctx.delete_failed_msg": "{err}",
             "ctx.confirm_yes": "Confirm",
@@ -12279,12 +13810,16 @@ def _cmd_ui_body(args, cfg):
             "pipe.warn.prefix": "[warn] {msg}",
             "pipe.warn.file_missing_title": "File not found",
             "pipe.warn.file_missing_msg": "Could not find {name}.",
-            "hist.badge.done": "✓ Summarized",
-            "hist.badge.transcribed": "📝 Transcribed",
+            "hist.badge.done": "Summarized",
+            "hist.badge.transcribed": "Transcribed",
             "hist.badge.pending_summary": "Awaiting summary",
             "hist.badge.audio_only": "Audio only",
             "hist.badge.audio_missing": "Audio deleted",
             "hist.dur_prefix": "Duration",
+            "hist.untitled": "Untitled recording",
+            "hist.empty_sub": "Pick a meeting on the left to see its notes, transcript and to-dos.",
+            "rec.captions.disabled_sub": "Turn on the switch above to see live captions and translation while recording.",
+            "rec.captions.idle_sub": "Captions are recognised locally and never affect the recording.",
             "dur.unknown": "Unknown duration",
             "dur.hour_minute": "{h}h {m}m",
             "dur.minute": "{m} min",
@@ -12319,7 +13854,7 @@ def _cmd_ui_body(args, cfg):
                                      "> 0 uses the value as-is, no fallback computation."),
             "cfg.label.workers": "Workers:",
             "cfg.btn.apply": "Apply",
-            "cfg.title.editor": "config.jsonc editor",
+            "cfg.title.editor": "Advanced: edit config.jsonc",
             "cfg.desc.editor": ("Edit config.jsonc as raw text (// comments supported). "
                                 "The text is JSON-validated before saving; an invalid edit "
                                 "will NOT overwrite the file on disk."),
@@ -12407,6 +13942,244 @@ def _cmd_ui_body(args, cfg):
                     self.setFormat(m.start(), m.end() - m.start(), self._fmt_comment)
 
 
+    # ── 自定义目标 (custom goals) ─────────────────────────────────────────
+
+    class _GoalDialog(QDialog):
+        """Create / edit one custom goal: title, the user's short description,
+        and the full prompt — typed by hand or expanded from the description
+        by 「AI 生成 Prompt」. Result: ``self.saved`` holds the stored goal
+        dict, or ``self.deleted`` is True; both stay falsy on cancel."""
+        # (request token, prompt text, error message) — crosses back from
+        # the enrichment thread on a queued signal: a QTimer started on a
+        # plain worker thread is never delivered (see cal_loaded).
+        _enriched = pyqtSignal(int, str, str)
+
+        def __init__(self, parent=None, goal: "dict | None" = None):
+            super().__init__(parent)
+            self._goal = goal
+            self.saved: "dict | None" = None
+            self.deleted = False
+            self._token = 0
+            self.setWindowTitle(_t("goal.dlg.title_edit" if goal else "goal.dlg.title_new"))
+            self.setMinimumSize(620, 560)
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(20, 18, 20, 18)
+            lay.setSpacing(8)
+
+            lay.addWidget(StrongBodyLabel(_t("goal.dlg.name"), self))
+            self.name_edit = LineEdit(self)
+            self.name_edit.setMaxLength(_GOAL_NAME_MAX)
+            self.name_edit.setPlaceholderText(_t("goal.dlg.name_ph"))
+            lay.addWidget(self.name_edit)
+
+            lay.addWidget(StrongBodyLabel(_t("goal.dlg.goal"), self))
+            self.goal_edit = QPlainTextEdit(self)
+            self.goal_edit.setPlaceholderText(_t("goal.dlg.goal_ph"))
+            self.goal_edit.setFixedHeight(90)
+            lay.addWidget(self.goal_edit)
+
+            enrich_row = QHBoxLayout()
+            self.enrich_btn = PushButton(_t("goal.dlg.enrich"), self)
+            self.enrich_status = CaptionLabel("", self)
+            enrich_row.addWidget(self.enrich_btn)
+            enrich_row.addWidget(self.enrich_status, 1)
+            lay.addLayout(enrich_row)
+
+            lay.addWidget(StrongBodyLabel(_t("goal.dlg.prompt"), self))
+            self.prompt_edit = QPlainTextEdit(self)
+            lay.addWidget(self.prompt_edit, 1)
+
+            btn_row = QHBoxLayout()
+            self.delete_btn = PushButton(_t("goal.dlg.delete"), self)
+            self.delete_btn.setVisible(goal is not None)
+            btn_row.addWidget(self.delete_btn)
+            btn_row.addStretch(1)
+            self.cancel_btn = PushButton(_t("goal.dlg.cancel"), self)
+            self.save_btn = PrimaryPushButton(_t("goal.dlg.save"), self)
+            btn_row.addWidget(self.cancel_btn)
+            btn_row.addWidget(self.save_btn)
+            lay.addLayout(btn_row)
+
+            if goal:
+                self.name_edit.setText(goal.get("name", ""))
+                self.goal_edit.setPlainText(goal.get("goal", ""))
+                self.prompt_edit.setPlainText(goal.get("prompt", ""))
+
+            self.enrich_btn.clicked.connect(self._on_enrich)
+            self._enriched.connect(self._on_enriched)
+            self.save_btn.clicked.connect(self._on_save)
+            self.cancel_btn.clicked.connect(self.reject)
+            self.delete_btn.clicked.connect(self._on_delete)
+
+        def _on_enrich(self):
+            goal_text = self.goal_edit.toPlainText().strip()
+            if not goal_text:
+                self.enrich_status.setText(_t("goal.dlg.need_goal"))
+                return
+            if self.prompt_edit.toPlainText().strip() and not _confirm_dialog(
+                    self, _t("goal.dlg.enrich"), _t("goal.dlg.overwrite_confirm")):
+                return
+            self._token += 1
+            token = self._token
+            name = self.name_edit.text().strip()
+            provider = cfg.get("meeting_notes_provider", "codex_proxy")
+            self.enrich_btn.setEnabled(False)
+            self.enrich_status.setText(_t("goal.dlg.enriching"))
+            emit = self._enriched.emit
+
+            def _work():
+                text, err = "", ""
+                try:
+                    text = enrich_goal_prompt(name, goal_text, provider, cfg)
+                except _PipelineCancelled:
+                    err = _t("goal.dlg.cancelled")
+                except SystemExit:
+                    # _llm_run exits once every provider in the chain failed;
+                    # the per-provider reasons are in the daily log.
+                    err = _t("goal.dlg.all_failed")
+                except Exception as e:
+                    _log("ERR", f"goal enrich: {type(e).__name__}: {e}")
+                    err = f"{type(e).__name__}: {e}"
+                try:
+                    emit(token, text, err)
+                except RuntimeError:
+                    pass  # dialog closed and deleted while the model ran
+
+            threading.Thread(target=_work, name="goal-enrich", daemon=True).start()
+
+        def _on_enriched(self, token: int, text: str, err: str):
+            if token != self._token:
+                return  # superseded by a later click
+            self.enrich_btn.setEnabled(True)
+            if err:
+                self.enrich_status.setText(_t("goal.dlg.enrich_failed", err=err))
+                return
+            self.enrich_status.setText(_t("goal.dlg.enrich_done"))
+            self.prompt_edit.setPlainText(text)
+
+        def _on_save(self):
+            try:
+                self.saved = _upsert_goal(
+                    self.name_edit.text(), self.goal_edit.toPlainText(),
+                    self.prompt_edit.toPlainText(),
+                    goal_id=self._goal["id"] if self._goal else None)
+            except ValueError as e:
+                self.enrich_status.setText(str(e))
+                return
+            except OSError as e:
+                self.enrich_status.setText(f"{type(e).__name__}: {e}")
+                return
+            self.accept()
+
+        def _on_delete(self):
+            if not self._goal:
+                return
+            if not _confirm_dialog(self, _t("goal.dlg.delete"),
+                                   _t("goal.dlg.delete_confirm",
+                                      name=self._goal.get("name", "")),
+                                   confirm=_t("ctx.delete_btn"), destructive=True):
+                return
+            try:
+                self.deleted = _delete_goal(self._goal["id"])
+            except OSError as e:
+                self.enrich_status.setText(f"{type(e).__name__}: {e}")
+                return
+            self.accept()
+
+    def _open_goal_dialog(parent, goal: "dict | None" = None) -> None:
+        dlg = _GoalDialog(parent, goal)
+        dlg.exec()
+        if dlg.saved:
+            InfoBar.success(title=_t("goal.info.saved"), content=dlg.saved["name"],
+                            isClosable=True, position=InfoBarPosition.TOP,
+                            duration=3000, parent=parent)
+        dlg.deleteLater()
+
+    def _popup_goal_menu(parent, anchor, audio: "Path | None", can_run: bool,
+                         goal_paths: "dict[str, Path]", on_run) -> None:
+        """The 「自定义目标 ▾」 menu, shared by the recording and history views.
+
+        ``goal_paths`` maps goal id → existing output for the selected
+        recording. A goal with an output opens it (plus a 重新生成 entry);
+        one without runs ``on_run(goal)``. Same async-popup pattern as the
+        history context menus: ``popup()`` not ``exec()``, handlers deferred
+        past the menu's teardown, screen pinned explicitly."""
+        menu = QMenu(parent)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        def _defer(fn):
+            return lambda: QTimer.singleShot(0, fn)
+
+        goals = _load_goals()
+        if not goals:
+            act = menu.addAction(_t("goal.menu.empty"))
+            act.setEnabled(False)
+        elif audio is None:
+            act = menu.addAction(_t("goal.menu.no_audio"))
+            act.setEnabled(False)
+        for g in goals:
+            out = goal_paths.get(g["id"])
+            if audio is None:
+                continue
+            if out is not None:
+                sub = menu.addMenu(_t("goal.menu.done", name=g["name"]))
+                a_open = sub.addAction(_t("goal.menu.open"))
+                a_open.triggered.connect(_defer(lambda p=out: _open_path(p)))
+                a_regen = sub.addAction(_t("goal.menu.regen"))
+                a_regen.setEnabled(can_run)
+                a_regen.triggered.connect(_defer(lambda g=g: on_run(g)))
+            else:
+                act = menu.addAction(_t("goal.menu.run", name=g["name"]))
+                act.setEnabled(can_run)
+                act.triggered.connect(_defer(lambda g=g: on_run(g)))
+        menu.addSeparator()
+        a_new = menu.addAction(_t("goal.menu.new"))
+        a_new.triggered.connect(_defer(lambda: _open_goal_dialog(parent)))
+        if goals:
+            edit = menu.addMenu(_t("goal.menu.edit"))
+            for g in goals:
+                a = edit.addAction(g["name"])
+                a.triggered.connect(_defer(lambda g=g: _open_goal_dialog(parent, g)))
+        global_pos = anchor.mapToGlobal(QPoint(0, anchor.height()))
+        screen = QGuiApplication.screenAt(global_pos)
+        if screen is not None:
+            menu.setScreen(screen)
+        parent._goal_menu = menu  # keep the wrapper alive while shown
+        menu.popup(global_pos)
+
+    def _goal_outputs(audio: "Path | None") -> "dict[str, Path]":
+        """goal id → existing output file for one recording."""
+        if audio is None:
+            return {}
+        out = {}
+        for g in _load_goals():
+            p = _goal_output_path(audio, g["id"])
+            if p.exists():
+                out[g["id"]] = p
+        return out
+
+    def _pipeline_download_notice(audio: Path) -> str:
+        """Heads-up for a run that will transcribe on a machine still missing
+        the offline models — otherwise the bar sits at 5 % for minutes while
+        ~2 GB downloads, which reads as a hang. Empty when nothing to say."""
+        raw_txt = audio.with_name(audio.stem + ".raw.txt")
+        if raw_txt.exists():
+            return ""
+        try:
+            missing = _models_missing_for_transcription(cfg)
+        except Exception as e:
+            _log("STT", f"download check: {type(e).__name__}: {e}")
+            return ""
+        return _model_download_notice(missing, "transcribe", _LANG["current"])
+
+    def _show_download_notice(parent, notice: str, log_view) -> None:
+        if not notice:
+            return
+        log_view.append(notice)
+        InfoBar.info(title=_t("models.download_title"), content=notice,
+                     isClosable=True, position=InfoBarPosition.TOP,
+                     duration=12000, parent=parent)
+
     class _PipelineWorker(QObject):
         """Runs transcribe → polish → notes on a background QThread, emitting
         Qt signals (``progress`` / ``log`` / ``done`` / ``failed`` /
@@ -12427,12 +14200,15 @@ def _cmd_ui_body(args, cfg):
         cancelled = pyqtSignal()  # user-initiated stop
 
         def __init__(self, audio_path: Path, mode: str, cfg_: dict,
-                     transcribe_only: bool = False, parent=None):
+                     transcribe_only: bool = False, goal: "dict | None" = None,
+                     parent=None):
             super().__init__(parent)
             self.audio_path = audio_path
             self.mode = mode
             self.cfg = cfg_
             self.transcribe_only = transcribe_only
+            # A custom goal (自定义目标) replaces the mode's notes step.
+            self.goal = goal
             # Always start uncancelled — clear leftover state from a
             # previous (cancelled / completed) run.
             _PIPELINE_CANCEL.clear()
@@ -12532,11 +14308,18 @@ def _cmd_ui_body(args, cfg):
 
                 _pipeline_check_cancelled()
                 self.progress.emit(85)
-                self.log.emit("[纪要] 生成中...")
-                notes = generate_notes(polished, np_, self.cfg, self.mode,
-                                       background=background, roster=roster)
-                _pipeline_check_cancelled()
-                note_path = save_minutes(notes, audio_path, self.mode)
+                if self.goal is not None:
+                    self.log.emit(f"[目标] {self.goal.get('name', '')} 生成中...")
+                    notes = generate_goal_notes(polished, np_, self.cfg, self.goal,
+                                                background=background, roster=roster)
+                    _pipeline_check_cancelled()
+                    note_path = save_goal_output(notes, audio_path, self.goal)
+                else:
+                    self.log.emit("[纪要] 生成中...")
+                    notes = generate_notes(polished, np_, self.cfg, self.mode,
+                                           background=background, roster=roster)
+                    _pipeline_check_cancelled()
+                    note_path = save_minutes(notes, audio_path, self.mode)
                 added_hw = _auto_update_hotwords(polished, np_, self.cfg)
                 if added_hw:
                     self.log.emit(f"[热词] 新增 {len(added_hw)} 个："
@@ -13010,10 +14793,7 @@ def _cmd_ui_body(args, cfg):
             # only shows up in genuinely cramped windows beats truncated text.
             left_scroll.setHorizontalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            left_scroll.setStyleSheet(
-                "QScrollArea { background: transparent; border: none; }"
-                "QScrollArea > QWidget > QWidget { background: transparent; }"
-            )
+            # No QSS here — it would replace the native overlay scrollbars.
             left_scroll.viewport().setAutoFillBackground(False)
             left_inner = QWidget()
             left_inner.setObjectName("recordingLeftInner")
@@ -13031,8 +14811,9 @@ def _cmd_ui_body(args, cfg):
             self.title_label = TitleLabel(_t("rec.title.idle"), self)
             self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            self.subtitle_label = BodyLabel(_t("rec.subtitle.idle"), self)
+            self.subtitle_label = _muted(BodyLabel(_t("rec.subtitle.idle"), self))
             self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.subtitle_label.setWordWrap(True)
 
             # Big circular mic button.  Idle = blue; recording = red.
             # Visual state is toggled by `_apply_rec_btn_style(status)` from
@@ -13042,7 +14823,7 @@ def _cmd_ui_body(args, cfg):
             # / state-coloured backgrounds in a portable way.
             self.rec_btn = QPushButton(self)
             self.rec_btn.setFixedSize(132, 132)
-            self.rec_btn.setIcon(FluentIcon.MICROPHONE.icon())
+            self.rec_btn.setIcon(FluentIcon.MICROPHONE.icon(color=QColor("#ffffff")))
             # Icon deliberately smaller than the 132 px disc: at 56 px it
             # crowded the circle's edge.
             self.rec_btn.setIconSize(QSize(40, 40))
@@ -13114,7 +14895,7 @@ def _cmd_ui_body(args, cfg):
             # which writes directly to the physical sub-device. We
             # surface the affordance here so users don't think the app
             # is broken when their hardware keys stop responding.
-            self._vol_hint = BodyLabel("", self)
+            self._vol_hint = _muted(CaptionLabel("", self))
             self._i18n(self._vol_hint, "rec.volume_hint")
             self._vol_hint.setWordWrap(True)
             self._vol_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -13123,9 +14904,6 @@ def _cmd_ui_body(args, cfg):
             # (#0a84ff hover variant #0066d6, which reads better as text
             # on a white background) + a touch of weight to lift it off
             # the surrounding plain body text without screaming.
-            self._vol_hint.setStyleSheet(
-                "BodyLabel { color: #0066d6; font-weight: 500; }"
-            )
 
             # Volume row
             vol_row = QHBoxLayout()
@@ -13136,7 +14914,7 @@ def _cmd_ui_body(args, cfg):
             self.vol_slider = Slider(Qt.Orientation.Horizontal, self)
             self.vol_slider.setRange(0, 100)
             self.vol_slider.setValue(50)
-            self.vol_slider.setMinimumWidth(220)
+            self.vol_slider.setMinimumWidth(140)
             vol_row.addWidget(self.vol_slider)
             # Initialise the percentage label from the slider's value so the
             # handle position and the number always agree at first paint —
@@ -13161,6 +14939,12 @@ def _cmd_ui_body(args, cfg):
             self.notes_btn = PushButton("", self)
             self.interview_btn = PushButton("", self)
             self.sharing_btn = PushButton("", self)
+            # 自定义目标 ▾ — opens a menu of the user's own goals (generate /
+            # open / regenerate) plus new / edit. Styled like the generate
+            # buttons; it never flips to the blue "open" state because it
+            # stands for many outputs, not one.
+            self.goal_btn = PushButton("", self)
+            _apply_open_btn_style(self.goal_btn, is_open=False)
 
             # Import button: lets the user bring in an external audio file
             # (iPhone .m4a, .mp3 download, Zoom .m4a, etc.). Opens a file
@@ -13176,29 +14960,26 @@ def _cmd_ui_body(args, cfg):
             # it for the widget's lifetime.
             _apply_open_btn_style(self.import_btn, is_open=False)
 
-            # Row 1: import + transcribe (entry-point actions)
-            actions_row1 = QHBoxLayout()
-            actions_row1.addStretch(1)
-            actions_row1.addWidget(self.import_btn)
-            actions_row1.addWidget(self.transcribe_btn)
-            actions_row1.addStretch(1)
-
-            # Row 2: per-mode notes generation (meeting / interview / sharing)
-            actions_row2 = QHBoxLayout()
-            actions_row2.addStretch(1)
-            actions_row2.addWidget(self.notes_btn)
-            actions_row2.addWidget(self.interview_btn)
-            actions_row2.addWidget(self.sharing_btn)
-            actions_row2.addStretch(1)
+            # Two equal columns. The old 2 + 4 rows were wider than the
+            # column once 自定义目标 joined, which pushed the whole column
+            # into horizontal scrolling and clipped the centred text above.
+            actions_grid = QGridLayout()
+            actions_grid.setHorizontalSpacing(10)
+            actions_grid.setVerticalSpacing(10)
+            for i, b in enumerate((self.transcribe_btn, self.notes_btn,
+                                   self.interview_btn, self.sharing_btn,
+                                   self.goal_btn, self.import_btn)):
+                b.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                QSizePolicy.Policy.Fixed)
+                actions_grid.addWidget(b, i // 2, i % 2)
+            self._actions_head = _section_label(StrongBodyLabel("", self))
+            self._i18n(self._actions_head, "rec.actions_head")
 
             # Chosen-recording indicator. The standalone "选择已有音频文件"
             # button was removed — meetings are picked via the right-side
             # history list (click or right-click) or just-recorded inline.
-            self.chosen_label = CaptionLabel(_t("rec.no_file"), self)
-            choose_row = QHBoxLayout()
-            choose_row.addStretch(1)
-            choose_row.addWidget(self.chosen_label)
-            choose_row.addStretch(1)
+            self.chosen_label = _muted(CaptionLabel(_t("rec.no_file"), self))
+            self.chosen_label.setWordWrap(True)
 
             # Progress + log + cancel
             self.progress_bar = ProgressBar(self)
@@ -13232,14 +15013,13 @@ def _cmd_ui_body(args, cfg):
             # apart from the timer (which lives at the bottom of
             # mic_block). Without this the hint visually crowds the
             # "00:00:00" digits as soon as the log_view expands.
-            lv.addSpacing(20)
-            lv.addWidget(self._vol_hint)
-            lv.addSpacing(6)
+            lv.addSpacing(12)
             lv.addLayout(vol_row)
-            lv.addSpacing(8)
-            lv.addLayout(actions_row1)
-            lv.addLayout(actions_row2)
-            lv.addLayout(choose_row)
+            lv.addWidget(self._vol_hint)
+            lv.addSpacing(14)
+            lv.addWidget(self._actions_head)
+            lv.addWidget(self.chosen_label)
+            lv.addLayout(actions_grid)
             lv.addWidget(self.progress_bar)
             lv.addWidget(self.cancel_btn)
             lv.addWidget(self.log_view)
@@ -13268,6 +15048,10 @@ def _cmd_ui_body(args, cfg):
             cap_header.addSpacing(12)
             self.caption_switch = SwitchButton(self)
             self.caption_switch.setChecked(bool(lc_cfg.get("enabled", True)))
+            _cs_text = lambda: (self.caption_switch.setOnText(_t("cfg.set.on")),
+                                self.caption_switch.setOffText(_t("cfg.set.off")))
+            self._lang_callbacks.append(_cs_text)
+            _cs_text()
             cap_header.addWidget(self.caption_switch)
             cap_header.addStretch(1)
             # Recognition language. Switchable mid-recording: the engine swaps
@@ -13310,6 +15094,8 @@ def _cmd_ui_body(args, cfg):
 
             self.caption_view = TextBrowser(self)
             self.caption_view.setMinimumHeight(140)
+            _style_reading_pane(self.caption_view)
+            self._cap_empty = _EmptyState(self.caption_view, FluentIcon.CHAT)
             cv.addWidget(self.caption_view, stretch=1)
 
             # The in-flight line is rendered inline at the document's tail —
@@ -13346,6 +15132,7 @@ def _cmd_ui_body(args, cfg):
             self.notes_btn.clicked.connect(self._on_meeting_clicked)
             self.interview_btn.clicked.connect(self._on_interview_clicked)
             self.sharing_btn.clicked.connect(self._on_sharing_clicked)
+            self.goal_btn.clicked.connect(self._on_goal_clicked)
             self.cancel_btn.clicked.connect(self._on_cancel_pipeline)
             self.vol_slider.valueChanged.connect(self._on_vol_changed)
             self.cal_btn.clicked.connect(self._on_cal_clicked)
@@ -13476,6 +15263,27 @@ def _cmd_ui_body(args, cfg):
                 self.caption_status.setText(
                     _t("rec.captions.error_prefix") + str(ev.get("message", "")))
                 return
+            elif t == "download":
+                notice = _model_download_notice(
+                    [tuple(m) for m in ev.get("models") or []], "captions",
+                    _LANG["current"])
+                if notice:
+                    self._caption_status_key = None
+                    self.caption_status.setText(notice)
+                    InfoBar.info(
+                        title=_t("models.download_title"), content=notice,
+                        isClosable=True, position=InfoBarPosition.TOP,
+                        duration=12000, parent=self)
+                return
+            elif t == "download_progress":
+                total = int(ev.get("total_mb") or 0)
+                done = int(ev.get("done_mb") or 0)
+                self._caption_status_key = None
+                self.caption_status.setText(_t(
+                    "rec.captions.download_progress",
+                    name=ev.get("name", ""), done=done, total=total,
+                    pct=(done * 100 // total) if total else 0))
+                return
             else:
                 return
             self._schedule_caption_render()
@@ -13542,12 +15350,13 @@ def _cmd_ui_body(args, cfg):
                 groups.append((tag, src, dst))
             groups_html = _caption_groups_html(
                 groups, self._caption_partial, self._caption_partial_en)
-            hint = (
-                _t("rec.captions.idle_hint")
-                if self.caption_switch.isChecked()
-                else _t("rec.captions.disabled_hint"))
-            mode = self._caption_renderer.render(
-                groups_html, f'<p style="color:#8a8a8a;">{hint}</p>')
+            on = self.caption_switch.isChecked()
+            self._cap_empty.set_text(
+                _t("rec.captions.idle_hint" if on else "rec.captions.disabled_hint"),
+                _t("rec.captions.idle_sub" if on else "rec.captions.disabled_sub"))
+            self._cap_empty.setVisible(
+                not groups_html and not self._caption_partial)
+            mode = self._caption_renderer.render(groups_html, "")
             # A "full" path means the incremental bookkeeping bailed out — fine
             # occasionally (first paint, language toggle, history eviction),
             # but a steady stream of them means every caption event is paying
@@ -14020,6 +15829,19 @@ def _cmd_ui_body(args, cfg):
                 _log("AUDIO", f"start switch: from={prev_dout!r} to={plan.multi_output_name!r} performed=False")
 
             _reconcile_recording_mutes(plan)
+            # Missing pieces used to surface only as a run-log line, which
+            # nobody reads mid-meeting — and the recording came out silent on
+            # the other side. Warn, but record anyway: the mic is still useful.
+            if sys.platform == "darwin" and not plan.sys_source_name:
+                InfoBar.warning(title=_t("env.rec.no_blackhole.title"),
+                                content=_t("env.rec.no_blackhole.msg"),
+                                isClosable=True, position=InfoBarPosition.TOP,
+                                duration=15000, parent=self)
+            elif sys.platform == "darwin" and not plan.multi_output_name:
+                InfoBar.warning(title=_t("env.rec.no_multi.title"),
+                                content=_t("env.rec.no_multi.msg"),
+                                isClosable=True, position=InfoBarPosition.TOP,
+                                duration=15000, parent=self)
 
             RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -14154,7 +15976,7 @@ def _cmd_ui_body(args, cfg):
             if status == "recording":
                 bg, hover, pressed = "#ef4444", "#dc2626", "#b91c1c"
             else:
-                bg, hover, pressed = "#0a84ff", "#0066d6", "#0050a8"
+                bg, hover, pressed = _ACCENT, _ACCENT_HOVER, _ACCENT_PRESSED
             self.rec_btn.setStyleSheet(
                 "QPushButton {"
                 "  border: none;"
@@ -14258,7 +16080,8 @@ def _cmd_ui_body(args, cfg):
 
         # ── Pipeline
         def _start_pipeline(self, transcribe_only: bool = False,
-                            mode: "str | None" = None):
+                            mode: "str | None" = None,
+                            goal: "dict | None" = None):
             target = self._last_recorded
             if not target or not Path(target).exists():
                 self._on_warning(_t("pipe.warn.no_wav"))
@@ -14271,13 +16094,15 @@ def _cmd_ui_body(args, cfg):
             self.progress_bar.setValue(0)
             self.cancel_btn.setVisible(True)
             for b in (self.rec_btn, self.transcribe_btn, self.notes_btn,
-                      self.interview_btn):
+                      self.interview_btn, self.sharing_btn, self.goal_btn):
                 b.setEnabled(False)
             self.state.set_status("processing")
+            _show_download_notice(
+                self, _pipeline_download_notice(Path(target)), self.log_view)
 
             thread = QThread(self)
             worker = _PipelineWorker(target, chosen_mode, cfg,
-                                     transcribe_only=transcribe_only)
+                                     transcribe_only=transcribe_only, goal=goal)
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             worker.progress.connect(self.progress_bar.setValue)
@@ -14330,8 +16155,12 @@ def _cmd_ui_body(args, cfg):
             # Re-arm the cancel button in case `_on_cancel_pipeline` had
             # disabled it during the wrap-up window.
             self.cancel_btn.setEnabled(True)
+            # The worker has finished, so a cancel it was asked for is fully
+            # consumed. Left set, it would make the next LLM call outside a
+            # pipeline (the goal dialog's 「AI 生成 Prompt」) fail as cancelled.
+            _PIPELINE_CANCEL.clear()
             for b in (self.rec_btn, self.transcribe_btn, self.notes_btn,
-                      self.interview_btn, self.sharing_btn):
+                      self.interview_btn, self.sharing_btn, self.goal_btn):
                 b.setEnabled(True)
             self.state.set_status("idle")
 
@@ -14381,13 +16210,8 @@ def _cmd_ui_body(args, cfg):
             # before the user waits on a long transcode that's going to
             # fail anyway.
             if src.suffix.lower() != ".wav" and _ffmpeg_path() is None:
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Icon.Warning)
-                box.setWindowTitle(_t("rec.import.failed_title"))
-                box.setText(_t("rec.import.no_ffmpeg_msg"))
-                box.addButton(_t("ctx.confirm_yes"),
-                              QMessageBox.ButtonRole.AcceptRole)
-                box.exec()
+                _alert(self, _t("rec.import.failed_title"),
+                       _t("rec.import.no_ffmpeg_msg"))
                 return
 
             self.chosen_label.setText(_t("rec.import.progress"))
@@ -14398,14 +16222,9 @@ def _cmd_ui_body(args, cfg):
                 QApplication.restoreOverrideCursor()
                 _log("ERR", f"import: {type(e).__name__}: {e}")
                 self.chosen_label.setText(_t("rec.no_file"))
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Icon.Critical)
-                box.setWindowTitle(_t("rec.import.failed_title"))
-                box.setText(_t("rec.import.failed_msg_fmt").format(
-                    err=f"{type(e).__name__}: {e}"))
-                box.addButton(_t("ctx.confirm_yes"),
-                              QMessageBox.ButtonRole.AcceptRole)
-                box.exec()
+                _alert(self, _t("rec.import.failed_title"),
+                       _t("rec.import.failed_msg_fmt").format(
+                           err=f"{type(e).__name__}: {e}"), kind="error")
                 return
             QApplication.restoreOverrideCursor()
 
@@ -14427,10 +16246,12 @@ def _cmd_ui_body(args, cfg):
                 self.notes_btn.setText(_t("rec.btn.notes"))
                 self.interview_btn.setText(_t("rec.btn.interview"))
                 self.sharing_btn.setText(_t("rec.btn.sharing"))
+                self.goal_btn.setText(_t("goal.btn"))
                 for b in (self.transcribe_btn, self.notes_btn,
                           self.interview_btn, self.sharing_btn):
                     _apply_open_btn_style(b, is_open=False)
                 return
+            self.goal_btn.setText(_t("goal.btn"))
             polish = audio.with_name(audio.stem + ".polish.txt")
             meeting_md = audio.with_name(audio.stem + ".meeting.md")
             interview_md = audio.with_name(audio.stem + ".interview.md")
@@ -14500,6 +16321,17 @@ def _cmd_ui_body(args, cfg):
             else:
                 self._start_pipeline(mode="sharing")
 
+        def _on_goal_clicked(self):
+            audio = self._last_recorded
+            if audio is not None and not Path(audio).exists():
+                audio = None
+            _popup_goal_menu(
+                self, self.goal_btn, audio,
+                # Not _pipeline_thread: this view never resets it after a run.
+                can_run=self.state.status == "idle",
+                goal_paths=_goal_outputs(audio),
+                on_run=lambda g: self._start_pipeline(goal=g))
+
         # ── Log helper — prefix every UI log line with a wall-clock timestamp
         # so the log_view and the file log share the same time reference.
         def _ui_log(self, msg: str):
@@ -14509,6 +16341,20 @@ def _cmd_ui_body(args, cfg):
     # ── History view ──────────────────────────────────────────────────────
 
     class HistoryInterface(QWidget):
+        # `_current` (the meeting in the detail pane) is assigned in half a
+        # dozen places; making it a property lets the setter show / hide the
+        # empty state without touching any of them.
+        @property
+        def _current(self):
+            return self.__dict__.get("_current_meeting")
+
+        @_current.setter
+        def _current(self, m):
+            self.__dict__["_current_meeting"] = m
+            empty = self.__dict__.get("_detail_empty")
+            if empty is not None:
+                empty.setVisible(m is None)
+
         # The calendar fetch for a rename runs off the Qt thread; results come
         # back queued (see RecordingInterface.cal_loaded for why a timer can't
         # do this job).
@@ -14612,7 +16458,16 @@ def _cmd_ui_body(args, cfg):
 
             self.list_w = ListWidget(self)
             self.list_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            self.count_label = CaptionLabel("", self)
+            # Long titles elide; a sideways scrollbar under a list of meetings
+            # only ever showed half a title anyway.
+            self.list_w.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.list_w.setTextElideMode(Qt.TextElideMode.ElideRight)
+            self.list_w.setItemDelegate(_MeetingRowDelegate(self.list_w))
+            self.list_w.setMouseTracking(True)
+            self.list_w.setFrameShape(QFrame.Shape.NoFrame)
+            self.list_w.setStyleSheet("QListWidget { background: transparent; border: none; outline: 0; }")
+            self.count_label = _muted(CaptionLabel("", self))
             self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             lv.addWidget(self.search)
@@ -14641,10 +16496,11 @@ def _cmd_ui_body(args, cfg):
             scroll = ScrollArea(self)
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setStyleSheet(
-                "QScrollArea { background: transparent; border: none; }"
-                "QScrollArea > QWidget > QWidget { background: transparent; }"
-            )
+            # No stylesheet on the scroll area itself: any QSS there makes Qt
+            # draw old-style scrollbars with arrow buttons instead of macOS's
+            # native overlay ones. Transparency comes from the viewport's
+            # autofill (below) and the inner widget's own style.
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             # Defensive: explicitly clear the viewport's auto-fill so a
             # system style can't slip an opaque background back in.
             scroll.viewport().setAutoFillBackground(False)
@@ -14672,8 +16528,10 @@ def _cmd_ui_body(args, cfg):
             self.h_notes_btn = PushButton("", self)
             self.h_interview_btn = PushButton("", self)
             self.h_sharing_btn = PushButton("", self)
+            self.h_goal_btn = PushButton("", self)
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn, self.h_sharing_btn):
+                      self.h_interview_btn, self.h_sharing_btn,
+                      self.h_goal_btn):
                 b.setEnabled(False)  # no meeting selected at startup
             self._refresh_h_action_buttons()
             actions_row = QHBoxLayout()
@@ -14682,6 +16540,7 @@ def _cmd_ui_body(args, cfg):
             actions_row.addWidget(self.h_notes_btn)
             actions_row.addWidget(self.h_interview_btn)
             actions_row.addWidget(self.h_sharing_btn)
+            actions_row.addWidget(self.h_goal_btn)
             actions_row.addStretch(1)
             dv.addLayout(actions_row)
 
@@ -14703,13 +16562,14 @@ def _cmd_ui_body(args, cfg):
             dv.addWidget(self._sep())
 
             # ── Detail content (title / meta / body / participants / todos)
-            self.detail_title = TitleLabel(_t("hist.default_title"), self)
+            self.detail_title = SubtitleLabel(_t("hist.default_title"), self)
+            self.detail_title.setWordWrap(True)
             dv.addWidget(self.detail_title)
 
             meta_row = QHBoxLayout()
-            self.meta_date = CaptionLabel("", self)
-            self.meta_dur = CaptionLabel("", self)
-            self.meta_participants = CaptionLabel("", self)
+            self.meta_date = _muted(CaptionLabel("", self))
+            self.meta_dur = _muted(CaptionLabel("", self))
+            self.meta_participants = _muted(CaptionLabel("", self))
             meta_row.addWidget(self.meta_date)
             meta_row.addSpacing(12)
             meta_row.addWidget(self.meta_dur)
@@ -14719,22 +16579,23 @@ def _cmd_ui_body(args, cfg):
             dv.addLayout(meta_row)
             dv.addWidget(self._sep())
 
-            self.body_title = StrongBodyLabel("", self)
+            self.body_title = _section_label(StrongBodyLabel("", self))
             self._i18n(self.body_title, "hist.body_title")
             self.body_browser = TextBrowser(self)
             self.body_browser.setMinimumHeight(320)
+            _style_reading_pane(self.body_browser)
             dv.addWidget(self.body_title)
             dv.addWidget(self.body_browser)
             dv.addWidget(self._sep())
 
-            _participants_title = StrongBodyLabel("", self)
+            _participants_title = _section_label(StrongBodyLabel("", self))
             self._i18n(_participants_title, "hist.participants")
             dv.addWidget(_participants_title)
             self.participants_label = BodyLabel(_placeholder_no_data(), self)
             dv.addWidget(self.participants_label)
             dv.addWidget(self._sep())
 
-            _todos_title = StrongBodyLabel("", self)
+            _todos_title = _section_label(StrongBodyLabel("", self))
             self._i18n(_todos_title, "hist.todos")
             dv.addWidget(_todos_title)
             self.todos_label = BodyLabel(_placeholder_no_data(), self)
@@ -14752,20 +16613,29 @@ def _cmd_ui_body(args, cfg):
             right_card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             right_card.setStyleSheet(
                 f"#historyCardRight {{ background-color: {_CARD_BG}; "
-                f"border-radius: 14px; }}"
+                f"border: 1px solid {_HAIRLINE}; border-radius: 12px; }}"
             )
             rcv = QVBoxLayout(right_card)
             rcv.setContentsMargins(0, 0, 0, 0)
             rcv.setSpacing(0)
             rcv.addWidget(scroll)
+            self._detail_empty = _EmptyState(right_card, FluentIcon.DOCUMENT, opaque=True)
+            _paint_empty = lambda: self._detail_empty.set_text(
+                _t("hist.default_title"), _t("hist.empty_sub"))
+            self._lang_callbacks.append(_paint_empty)
+            _paint_empty()
+            self._detail_empty.setVisible(self._current is None)
 
             root.addWidget(left)
             root.addWidget(right_card, stretch=1)
 
         def _sep(self) -> QFrame:
+            # Hairline, not a sunken QFrame line: the 3D groove read as a
+            # heavy rule between every section of the detail pane.
             s = QFrame(self)
-            s.setFrameShape(QFrame.Shape.HLine)
-            s.setFrameShadow(QFrame.Shadow.Sunken)
+            s.setObjectName("histDivider")
+            s.setFixedHeight(1)
+            s.setStyleSheet(f"#histDivider {{ background-color: {_HAIRLINE}; border: none; }}")
             return s
 
         def _wire(self):
@@ -14781,6 +16651,7 @@ def _cmd_ui_body(args, cfg):
             self.h_notes_btn.clicked.connect(self._on_h_meeting_clicked)
             self.h_interview_btn.clicked.connect(self._on_h_interview_clicked)
             self.h_sharing_btn.clicked.connect(self._on_h_sharing_clicked)
+            self.h_goal_btn.clicked.connect(self._on_h_goal_clicked)
             self.h_cancel_btn.clicked.connect(self._on_cancel_pipeline)
 
         # ── Action buttons — mirror RecordingInterface: each toggles
@@ -14795,10 +16666,14 @@ def _cmd_ui_body(args, cfg):
                 self.h_notes_btn.setText(_t("hist.btn.notes"))
                 self.h_interview_btn.setText(_t("hist.btn.interview"))
                 self.h_sharing_btn.setText(_t("hist.btn.sharing"))
+                self.h_goal_btn.setText(_t("goal.btn"))
                 for b in (self.h_transcribe_btn, self.h_notes_btn,
-                          self.h_interview_btn, self.h_sharing_btn):
+                          self.h_interview_btn, self.h_sharing_btn,
+                      self.h_goal_btn):
                     _apply_open_btn_style(b, is_open=False)
                 return
+            self.h_goal_btn.setText(_t("goal.btn"))
+            _apply_open_btn_style(self.h_goal_btn, is_open=False)
             polish_p = m.get("polish_path")
             meeting_p = m.get("meeting_md_path")
             interview_p = m.get("interview_md_path")
@@ -14875,6 +16750,20 @@ def _cmd_ui_body(args, cfg):
             else:
                 self._start_pipeline(mode="sharing")
 
+        def _on_h_goal_clicked(self):
+            m = self._current
+            if not m:
+                return
+            audio = m["wav_path"] if m.get("audio_exists", True) else None
+            # Outputs come from the scan, so they still open after the audio
+            # itself was deleted; generating needs the audio.
+            paths = {gid: p for gid, p in (m.get("goal_paths") or {}).items()}
+            _popup_goal_menu(
+                self, self.h_goal_btn, m["wav_path"],
+                can_run=self._pipeline_thread is None and audio is not None,
+                goal_paths=paths,
+                on_run=lambda g: self._start_pipeline(goal=g))
+
         def refresh(self):
             self.list_w.clear()
             q = (self.search.text() or "").strip().lower()
@@ -14897,19 +16786,23 @@ def _cmd_ui_body(args, cfg):
                 if q and q not in m["stem"].lower():
                     continue
                 label = _format_timestamp_label(m["stem"])
+                date_part, _, title = label.partition(" · ")
                 dur = _audio_duration_secs(m["wav_path"])
                 if not m["audio_exists"]:
-                    badge = _t("hist.badge.audio_missing")
+                    tone = "audio_missing"
                 elif m["has_md"]:
-                    badge = _t("hist.badge.done")
+                    tone = "done"
                 elif m["has_polish"]:
-                    badge = _t("hist.badge.transcribed")
+                    tone = "transcribed"
                 else:
-                    badge = _t("hist.badge.audio_only")
-                item = QListWidgetItem(
-                    f"{label}\n{_t('hist.dur_prefix')} {_format_duration(dur)}  ·  {badge}"
-                )
+                    tone = "audio_only"
+                badge = _t(f"hist.badge.{tone}")
+                meta = date_part if not m["audio_exists"] else \
+                    f"{date_part}  ·  {_format_duration(dur)}"
+                item = QListWidgetItem(title or _t("hist.untitled"))
                 item.setData(Qt.ItemDataRole.UserRole, m)
+                item.setData(_ROW_ROLE, {"title": title or _t("hist.untitled"),
+                                         "meta": meta, "badge": badge, "tone": tone})
                 self.list_w.addItem(item)
                 shown += 1
             self.count_label.setText(_t("hist.count_fmt", n=shown))
@@ -14923,11 +16816,12 @@ def _cmd_ui_body(args, cfg):
         def _show_detail(self, m: dict):
             self._current = m
             label = _format_timestamp_label(m["stem"])
-            self.detail_title.setText(label)
-            self.meta_date.setText(f"📅 {label}")
+            date_part, _, name = label.partition(" · ")
+            self.detail_title.setText(name or _t("hist.untitled"))
+            self.meta_date.setText(date_part)
             dur = _audio_duration_secs(m["wav_path"])
-            self.meta_dur.setText(f"⏱ {_format_duration(dur)}")
-            self.meta_participants.setText(f"👥 {_placeholder_no_data()}")
+            self.meta_dur.setText(_format_duration(dur))
+            self.meta_participants.setText("")
 
             # Body content is tab-dependent:
             #   全部       → meeting.md > interview.md > polish.txt > raw.txt
@@ -14947,7 +16841,8 @@ def _cmd_ui_body(args, cfg):
             running = self._pipeline_thread is not None
             audio_exists = m.get("audio_exists", True)
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn, self.h_sharing_btn):
+                      self.h_interview_btn, self.h_sharing_btn,
+                      self.h_goal_btn):
                 b.setEnabled(not running and (audio_exists or self._button_opens_existing(b, m)))
             # Refresh "generate / open" label + style for the new selection.
             self._refresh_h_action_buttons()
@@ -14959,6 +16854,8 @@ def _cmd_ui_body(args, cfg):
                 self.h_notes_btn: m.get("meeting_md_path") or m.get("md_path"),
                 self.h_interview_btn: m.get("interview_md_path"),
                 self.h_sharing_btn: m.get("sharing_md_path"),
+                # The goal menu also hosts 新建 / 编辑, so it is always usable.
+                self.h_goal_btn: m.get("wav_path"),
             }
             return paths.get(button) is not None
 
@@ -14986,6 +16883,14 @@ def _cmd_ui_body(args, cfg):
                 except Exception as e:
                     return _t("hist.body.read_error", name=Path(p).name, err=str(e))
 
+            # Custom-goal outputs, in the goals' own order (unknown ids —
+            # goals deleted since — last). Each file already starts with its
+            # goal's title, so it gets no extra heading here.
+            order = {g["id"]: i for i, g in enumerate(_load_goals())}
+            goal_files = sorted((m.get("goal_paths") or {}).items(),
+                                key=lambda kv: (order.get(kv[0], len(order)), kv[0]))
+            goal_parts = [_read(p) for _gid, p in goal_files]
+
             if mode == "done":
                 parts: list[str] = []
                 if meeting_p:
@@ -14996,13 +16901,16 @@ def _cmd_ui_body(args, cfg):
                     parts.append(f"# 🎓 {_t('hist.body.notes_sharing')}\n\n{_read(sharing_p)}")
                 if legacy_p and not (meeting_p or interview_p or sharing_p):
                     parts.append(_read(legacy_p))
+                parts.extend(goal_parts)
                 if parts:
                     self._set_body_markdown("\n\n---\n\n".join(parts))
                     # Title: name the single artifact if there's only one, else
                     # "Multiple summaries". (Don't try to enumerate every
                     # combination — the body itself shows the contents.)
                     present = [p for p in (meeting_p, interview_p, sharing_p) if p]
-                    if len(present) == 1:
+                    if len(present) + len(goal_parts) == 1 and goal_parts:
+                        self.body_title.setText(_t("hist.body.notes_goal"))
+                    elif len(present) + len(goal_parts) == 1:
                         if meeting_p:
                             self.body_title.setText(_t("hist.body.notes_meeting"))
                         elif interview_p:
@@ -15059,6 +16967,7 @@ def _cmd_ui_body(args, cfg):
                 summary_parts.append(
                     f"# 🎓 {_t('hist.body.notes_sharing')}\n\n{_read(sharing_p)}"
                 )
+            summary_parts.extend(goal_parts)
             if len(summary_parts) >= 2:
                 self._set_body_markdown("\n\n---\n\n".join(summary_parts))
                 self.body_title.setText(_t("hist.body.notes_both"))
@@ -15071,6 +16980,9 @@ def _cmd_ui_body(args, cfg):
             elif sharing_p:
                 self._set_body_markdown(_read(sharing_p))
                 self.body_title.setText(_t("hist.body.notes_sharing_md"))
+            elif goal_parts:
+                self._set_body_markdown(goal_parts[0])
+                self.body_title.setText(_t("hist.body.notes_goal"))
             elif legacy_p:
                 self._set_body_markdown(_read(legacy_p))
                 self.body_title.setText(_t("hist.body.notes_legacy_md"))
@@ -15096,7 +17008,7 @@ def _cmd_ui_body(args, cfg):
             wav = data.get("wav_path")
             when = _recording_started_at(wav) if wav else None
             if when is None:
-                QMessageBox.warning(self, _t("ctx.rename_failed_title"),
+                _alert(self, _t("ctx.rename_failed_title"),
                                     _t("ctx.rename_failed_format"))
                 return
             self._cal_rename_busy = True
@@ -15149,7 +17061,7 @@ def _cmd_ui_body(args, cfg):
                 return
             new_wav = _rename_meeting_files(wav, clean)
             if new_wav is None:
-                QMessageBox.warning(self, _t("ctx.rename_failed_title"),
+                _alert(self, _t("ctx.rename_failed_title"),
                                     _t("ctx.rename_failed_collision"))
                 return
             # Give the recording the sidecar it would have had if the event
@@ -15190,7 +17102,7 @@ def _cmd_ui_body(args, cfg):
             def _do_rename():
                 ts, current_custom = _split_meeting_stem(data["stem"])
                 if not ts:
-                    QMessageBox.warning(self, _t("ctx.rename_failed_title"),
+                    _alert(self, _t("ctx.rename_failed_title"),
                                         _t("ctx.rename_failed_format"))
                     return
                 new_name, ok = QInputDialog.getText(
@@ -15205,7 +17117,7 @@ def _cmd_ui_body(args, cfg):
                     return
                 new_wav = _rename_meeting_files(data["wav_path"], clean)
                 if new_wav is None:
-                    QMessageBox.warning(self, _t("ctx.rename_failed_title"),
+                    _alert(self, _t("ctx.rename_failed_title"),
                                         _t("ctx.rename_failed_collision"))
                     return
                 # If the renamed meeting is the one currently shown in the
@@ -15233,22 +17145,25 @@ def _cmd_ui_body(args, cfg):
                 # Guard: a running pipeline owns the files. Same logic as
                 # RecordingInterface — block delete and tell the user why.
                 if self._pipeline_thread is not None:
-                    QMessageBox.warning(
+                    _alert(
                         self, _t("ctx.delete_blocked_title"),
                         _t("ctx.delete_blocked_msg"),
                     )
                     return
                 if not _confirm_dialog(
-                    self, _t("ctx.delete_title"),
-                    _t("ctx.delete_confirm", name=wav.name),
+                    self,
+                    _t("ctx.delete_title",
+                       name=_format_timestamp_label(data["stem"]).partition(" · ")[2]
+                       or _format_timestamp_label(data["stem"])),
+                    _t("ctx.delete_confirm"),
+                    confirm=_t("ctx.delete_btn"), destructive=True,
                 ):
                     return
                 _deleted, errors = _delete_meeting_files(wav)
                 if errors:
-                    QMessageBox.warning(
-                        self, _t("ctx.delete_failed_title"),
-                        _t("ctx.delete_failed_msg", err="\n".join(errors)),
-                    )
+                    _alert(self, _t("ctx.delete_failed_title"),
+                           _t("ctx.delete_failed_msg", err="\n".join(errors)),
+                           kind="error")
                 # If the deleted file was the currently-displayed meeting,
                 # clear the right-pane detail.
                 if self._current is not None and \
@@ -15257,7 +17172,8 @@ def _cmd_ui_body(args, cfg):
                     self.detail_title.setText(_t("hist.default_title"))
                     self.body_browser.setPlainText("")
                     for b in (self.h_transcribe_btn, self.h_notes_btn,
-                              self.h_interview_btn, self.h_sharing_btn):
+                              self.h_interview_btn, self.h_sharing_btn,
+                      self.h_goal_btn):
                         b.setEnabled(False)
                 self.refresh()
 
@@ -15288,12 +17204,13 @@ def _cmd_ui_body(args, cfg):
         # item instead of the freshly-recorded file.
 
         def _start_pipeline(self, transcribe_only: bool = False,
-                            mode: "str | None" = None):
+                            mode: "str | None" = None,
+                            goal: "dict | None" = None):
             if not self._current:
                 return
             target: Path = self._current["wav_path"]
             if not target.exists():
-                QMessageBox.warning(
+                _alert(
                     self, _t("pipe.warn.file_missing_title"),
                     _t("pipe.warn.file_missing_msg", name=target.name),
                 )
@@ -15306,12 +17223,15 @@ def _cmd_ui_body(args, cfg):
             self.h_progress.setValue(0)
             self.h_cancel_btn.setVisible(True)
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn, self.h_sharing_btn):
+                      self.h_interview_btn, self.h_sharing_btn,
+                      self.h_goal_btn):
                 b.setEnabled(False)
+            _show_download_notice(
+                self, _pipeline_download_notice(target), self.h_log_view)
 
             thread = QThread(self)
             worker = _PipelineWorker(target, chosen_mode, cfg,
-                                     transcribe_only=transcribe_only)
+                                     transcribe_only=transcribe_only, goal=goal)
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             worker.progress.connect(self.h_progress.setValue)
@@ -15371,12 +17291,15 @@ def _cmd_ui_body(args, cfg):
             # Re-arm the cancel button in case `_on_cancel_pipeline` had
             # disabled it during the wrap-up window.
             self.h_cancel_btn.setEnabled(True)
+            # See RecordingInterface._reset_after_pipeline.
+            _PIPELINE_CANCEL.clear()
             self._pipeline_worker = None
             self._pipeline_thread = None
             # Re-enable action buttons iff a meeting is currently selected.
             has_selection = self._current is not None
             for b in (self.h_transcribe_btn, self.h_notes_btn,
-                      self.h_interview_btn, self.h_sharing_btn):
+                      self.h_interview_btn, self.h_sharing_btn,
+                      self.h_goal_btn):
                 b.setEnabled(has_selection)
             # A just-completed pipeline may have produced new artifacts —
             # re-render the "generate / open" toggle.
@@ -15417,11 +17340,15 @@ def _cmd_ui_body(args, cfg):
         # Preflight runs off the Qt thread — same queued-signal requirement
         # as RecordingInterface.cal_loaded (see the comment there).
         cal_checked = pyqtSignal(object)
+        # 「测试连接」 runs a real LLM call off the Qt thread.
+        env_tested = pyqtSignal(bool, str)
 
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setObjectName("configInterface")
             self._lang_callbacks: list = []
+            self._env_items: "list[EnvItem]" = []
+            self._env_test: "tuple[str, str] | None" = None
             self._cal_last_status: "CalendarStatus | None" = None
             self._cal_then = None
             self._build_ui()
@@ -15439,65 +17366,106 @@ def _cmd_ui_body(args, cfg):
                 cb()
             # Connector states and the hint line are state-dependent.
             self._cal_render_status(self._cal_last_status)
+            self._env_render()
 
         def _build_ui(self):
-            root = QVBoxLayout(self)
-            root.setContentsMargins(_VIEW_MARGIN_H, _VIEW_MARGIN_V,
-                                    _VIEW_MARGIN_H, _VIEW_MARGIN_V)
-            root.setSpacing(20)
+            # macOS System Settings layout: a gray page, a small gray header
+            # per group, and the group's rows in one white rounded card with
+            # inset hairlines between them (`_GroupCard`). Scrollable — the
+            # page is far taller than a 640 px window.
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            scroll = ScrollArea(self)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.viewport().setAutoFillBackground(False)
+            inner = QWidget(scroll)
+            inner.setObjectName("configInner")
+            inner.setStyleSheet("#configInner { background: transparent; }")
+            scroll.setWidget(inner)
+            outer.addWidget(scroll)
+            root = QVBoxLayout(inner)
+            root.setContentsMargins(_VIEW_MARGIN_H + 12, _VIEW_MARGIN_V,
+                                    _VIEW_MARGIN_H + 12, _VIEW_MARGIN_V)
+            root.setSpacing(0)
+            self._page = root
 
-            # Card 1: concurrency
-            _t_concur_title = TitleLabel("", self)
-            self._i18n(_t_concur_title, "cfg.title.concurrency")
-            root.addWidget(_t_concur_title)
-            _t_concur_desc = BodyLabel("", self)
-            _t_concur_desc.setWordWrap(True)
-            self._i18n(_t_concur_desc, "cfg.desc.concurrency")
-            root.addWidget(_t_concur_desc)
-            concurrency_row = QHBoxLayout()
-            _t_workers_label = BodyLabel("", self)
-            self._i18n(_t_workers_label, "cfg.label.workers")
-            concurrency_row.addWidget(_t_workers_label)
-            self.concurrency_spin = SpinBox(self)
-            self.concurrency_spin.setRange(0, 64)
-            self.concurrency_spin.setMinimumWidth(120)
-            concurrency_row.addWidget(self.concurrency_spin)
-            self.concurrency_apply = PrimaryPushButton("", self)
-            self._i18n(self.concurrency_apply, "cfg.btn.apply")
-            concurrency_row.addWidget(self.concurrency_apply)
-            concurrency_row.addStretch(1)
-            root.addLayout(concurrency_row)
+            # ── Environment ──
+            card = self._section("cfg.title.env", "cfg.desc.env")
+            self._env_rows: dict = {}
+            for key in ("blackhole", "multi_output", "llm", "ffmpeg"):
+                row = QHBoxLayout()
+                row.setSpacing(12)
+                name_label = BodyLabel("", self)
+                self._i18n(name_label, f"cfg.env.svc.{key}")
+                name_label.setMinimumWidth(150)
+                name_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+                row.addWidget(name_label, alignment=Qt.AlignmentFlag.AlignTop)
+                col = QVBoxLayout()
+                col.setSpacing(2)
+                state_label = BodyLabel("", self)
+                state_label.setWordWrap(True)
+                hint_label = _muted(CaptionLabel("", self))
+                hint_label.setWordWrap(True)
+                hint_label.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse)
+                col.addWidget(state_label)
+                col.addWidget(hint_label)
+                row.addLayout(col, stretch=1)
+                link = _guide_link("cfg.env.guide_link", key, self)
+                self._lang_callbacks.append(link._paint)
+                row.addWidget(link, alignment=Qt.AlignmentFlag.AlignVCenter)
+                btn = PushButton("", self)
+                btn.setVisible(False)
+                row.addWidget(btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+                test_btn = None
+                if key == "llm":
+                    test_btn = PushButton("", self)
+                    self._i18n(test_btn, "cfg.env.btn.test")
+                    test_btn.setVisible(False)
+                    row.addWidget(test_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+                card.add(row)
+                self._env_rows[key] = {"state": state_label, "hint": hint_label,
+                                       "btn": btn, "test": test_btn,
+                                       "name": name_label}
+            env_foot = QHBoxLayout()
+            full = _guide_link("cfg.env.full_guide", "install", self)
+            self._lang_callbacks.append(full._paint)
+            env_foot.addWidget(full)
+            env_foot.addSpacing(12)
+            self.env_extra_hint = _muted(CaptionLabel("", self))
+            self.env_extra_hint.setWordWrap(True)
+            env_foot.addWidget(self.env_extra_hint, stretch=1)
+            self.env_brew_btn = PushButton("", self)
+            self._i18n(self.env_brew_btn, "cfg.env.btn.brew")
+            self.env_brew_btn.setVisible(False)
+            env_foot.addWidget(self.env_brew_btn)
+            self.env_recheck_btn = PushButton(FluentIcon.SYNC, "", self)
+            self._i18n(self.env_recheck_btn, "cfg.env.btn.recheck")
+            env_foot.addWidget(self.env_recheck_btn)
+            card.add(env_foot)
 
-            sep = QFrame(self)
-            sep.setFrameShape(QFrame.Shape.HLine)
-            sep.setFrameShadow(QFrame.Shadow.Sunken)
-            root.addWidget(sep)
+            # ── Common settings (one card per group of _SETTINGS_SPEC) ──
+            self._build_settings()
 
-            # Card 2: calendar linkage + connection health.
+            # ── Calendar linkage ──
             # The toggle IS the preflight: flipping it on runs the check and
             # only commits if the connectors answer, so a broken setup shows
             # up while the user is deliberately enabling the feature rather
             # than one minute before a meeting starts.
-            _t_cal_title = TitleLabel("", self)
-            self._i18n(_t_cal_title, "cfg.title.calendar")
-            root.addWidget(_t_cal_title)
-            _t_cal_desc = BodyLabel("", self)
-            _t_cal_desc.setWordWrap(True)
-            self._i18n(_t_cal_desc, "cfg.desc.calendar")
-            root.addWidget(_t_cal_desc)
-
+            card = self._section("cfg.title.calendar", "cfg.desc.calendar")
             cal_toggle_row = QHBoxLayout()
             _t_cal_enable = BodyLabel("", self)
             self._i18n(_t_cal_enable, "cfg.cal.enable")
             cal_toggle_row.addWidget(_t_cal_enable)
-            self.cal_switch = SwitchButton(self)
-            cal_toggle_row.addWidget(self.cal_switch)
             cal_toggle_row.addStretch(1)
             self.cal_recheck_btn = PushButton("", self)
             self._i18n(self.cal_recheck_btn, "cfg.cal.btn.recheck")
             cal_toggle_row.addWidget(self.cal_recheck_btn)
-            root.addLayout(cal_toggle_row)
-
+            self.cal_switch = SwitchButton(self)
+            self._localize_switch(self.cal_switch)
+            cal_toggle_row.addWidget(self.cal_switch)
+            card.add(cal_toggle_row)
             # One row per service. Calendar and Notion are deliberately NOT
             # a single gate: no calendar means no event list at all, while
             # no Notion only costs the background-context extra.
@@ -15506,37 +17474,59 @@ def _cmd_ui_body(args, cfg):
                 row = QHBoxLayout()
                 name_label = BodyLabel("", self)
                 self._i18n(name_label, f"cfg.cal.svc.{key}")
-                name_label.setMinimumWidth(140)
+                name_label.setMinimumWidth(150)
                 row.addWidget(name_label)
                 state_label = BodyLabel("", self)
                 state_label.setWordWrap(True)
                 row.addWidget(state_label, stretch=1)
                 self._cal_state_labels[key] = state_label
-                root.addLayout(row)
-            self.cal_hint = BodyLabel("", self)
+                card.add(row)
+            cal_hint_row = QHBoxLayout()
+            self.cal_hint = _muted(CaptionLabel("", self))
             self.cal_hint.setWordWrap(True)
-            root.addWidget(self.cal_hint)
+            cal_hint_row.addWidget(self.cal_hint, stretch=1)
             self.cal_open_btn = PushButton("", self)
             self._i18n(self.cal_open_btn, "cfg.cal.btn.open")
             self.cal_open_btn.setVisible(False)
-            cal_open_row = QHBoxLayout()
-            cal_open_row.addWidget(self.cal_open_btn)
-            cal_open_row.addStretch(1)
-            root.addLayout(cal_open_row)
+            cal_hint_row.addWidget(self.cal_open_btn)
+            card.add(cal_hint_row)
 
-            sep_cal = QFrame(self)
-            sep_cal.setFrameShape(QFrame.Shape.HLine)
-            sep_cal.setFrameShadow(QFrame.Shadow.Sunken)
-            root.addWidget(sep_cal)
+            # ── Concurrency ──
+            card = self._section("cfg.title.concurrency", "cfg.desc.concurrency")
+            concurrency_row = QHBoxLayout()
+            _t_workers_label = BodyLabel("", self)
+            self._i18n(_t_workers_label, "cfg.label.workers")
+            concurrency_row.addWidget(_t_workers_label)
+            concurrency_row.addStretch(1)
+            self.concurrency_spin = SpinBox(self)
+            self.concurrency_spin.setRange(0, 64)
+            self.concurrency_spin.setMinimumWidth(120)
+            concurrency_row.addWidget(self.concurrency_spin)
+            self.concurrency_apply = PrimaryPushButton("", self)
+            self._i18n(self.concurrency_apply, "cfg.btn.apply")
+            concurrency_row.addWidget(self.concurrency_apply)
+            card.add(concurrency_row)
 
-            # Card 3: raw editor
-            _t_editor_title = TitleLabel("", self)
-            self._i18n(_t_editor_title, "cfg.title.editor")
-            root.addWidget(_t_editor_title)
-            _t_editor_desc = BodyLabel("", self)
+            # ── Advanced: raw config.jsonc, collapsed by default ──
+            card = self._section("cfg.title.editor")
+            adv_head = QHBoxLayout()
+            _t_editor_desc = _muted(CaptionLabel("", self))
             _t_editor_desc.setWordWrap(True)
             self._i18n(_t_editor_desc, "cfg.desc.editor")
-            root.addWidget(_t_editor_desc)
+            adv_head.addWidget(_t_editor_desc, stretch=1)
+            self.adv_toggle = PushButton("", self)
+            adv_head.addWidget(self.adv_toggle)
+            card.add(adv_head)
+            self.adv_box = QWidget(self)
+            adv = QVBoxLayout(self.adv_box)
+            adv.setContentsMargins(0, 0, 0, 0)
+            adv.setSpacing(10)
+            card.add(self.adv_box, divider=False)
+            self.adv_box.setVisible(False)
+            self._adv_label = lambda: self.adv_toggle.setText(
+                _t("cfg.adv.hide" if self.adv_box.isVisible() else "cfg.adv.show"))
+            self._lang_callbacks.append(self._adv_label)
+            self._adv_label()
             self.editor = QPlainTextEdit(self)
             mono = QFont("Menlo")
             if not mono.exactMatch():
@@ -15549,14 +17539,11 @@ def _cmd_ui_body(args, cfg):
             self.editor.setFont(mono)
             self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
             self.editor.setMinimumHeight(360)
-            # Rounded card-style border + soft padding so the editor blends
-            # with the rest of the Fluent surface instead of looking like
-            # a raw native textarea.
             self.editor.setStyleSheet(
                 "QPlainTextEdit {"
-                "  background-color: #ffffff;"
-                "  border: 1px solid #d0d7de;"
-                "  border-radius: 10px;"
+                f"  background-color: {_SURFACE_ALT};"
+                f"  border: 1px solid {_HAIRLINE};"
+                "  border-radius: 8px;"
                 "  padding: 10px;"
                 "  selection-background-color: #cfe1ff;"
                 "}"
@@ -15565,13 +17552,11 @@ def _cmd_ui_body(args, cfg):
             #   keys  → blue   strings → green   numbers → red
             #   keywords (true/false/null) → purple   comments → grey-italic
             self._highlighter = _JSONCHighlighter(self.editor.document())
-            root.addWidget(self.editor, stretch=1)
-
-            # Below the editor: 「重新加载」 + 「保存配置文件」 on the same
-            # row. Reload re-fills the editor from disk (discarding any
-            # in-flight edits). Save validates the editor text (JSONC strip
-            # → json.loads) before writing it back; an invalid edit shows
-            # an InfoBar.error and does NOT touch the file on disk.
+            adv.addWidget(self.editor, stretch=1)
+            # Reload re-fills the editor from disk (discarding in-flight
+            # edits). Save validates the text (JSONC strip → json.loads)
+            # before writing it back; an invalid edit shows an InfoBar.error
+            # and does NOT touch the file on disk.
             edit_row = QHBoxLayout()
             self.reload_btn = PushButton(FluentIcon.SYNC, "", self)
             self.save_btn = PrimaryPushButton(FluentIcon.SAVE, "", self)
@@ -15580,7 +17565,33 @@ def _cmd_ui_body(args, cfg):
             edit_row.addStretch(1)
             edit_row.addWidget(self.reload_btn)
             edit_row.addWidget(self.save_btn)
-            root.addLayout(edit_row)
+            adv.addLayout(edit_row)
+            root.addStretch(1)
+
+        def _section(self, title_key: str, desc_key: "str | None" = None) -> "_GroupCard":
+            """Gray group header (+ optional one-line explanation) followed by
+            a fresh white card; returns the card for rows to be added to."""
+            root = self._page
+            if root.count():
+                root.addSpacing(22)
+            head = _section_label(StrongBodyLabel("", self))
+            self._i18n(head, title_key)
+            root.addWidget(head)
+            if desc_key:
+                desc = _muted(CaptionLabel("", self))
+                desc.setWordWrap(True)
+                self._i18n(desc, desc_key)
+                root.addSpacing(2)
+                root.addWidget(desc)
+            root.addSpacing(8)
+            card = _GroupCard(self)
+            root.addWidget(card)
+            return card
+
+        def _localize_switch(self, sw) -> None:
+            cb = lambda: (sw.setOnText(_t("cfg.set.on")), sw.setOffText(_t("cfg.set.off")))
+            self._lang_callbacks.append(cb)
+            cb()
 
         def _wire(self):
             self.concurrency_apply.clicked.connect(self._on_apply_concurrency)
@@ -15591,6 +17602,382 @@ def _cmd_ui_body(args, cfg):
                 lambda: self._cal_check(force=True))
             self.cal_open_btn.clicked.connect(self._on_cal_open_connectors)
             self.cal_checked.connect(self._on_cal_checked)
+            self.env_recheck_btn.clicked.connect(self.env_refresh)
+            self.adv_toggle.clicked.connect(self._on_adv_toggle)
+            self.set_hotwords_btn.clicked.connect(self._on_edit_hotwords)
+            self.set_data_btn.clicked.connect(lambda: _open_path(CONFIG_DIR))
+            self.set_rec_btn.clicked.connect(self._on_open_recordings)
+            self.env_brew_btn.clicked.connect(
+                lambda: self._env_open_url("https://brew.sh"))
+            for key, w in self._env_rows.items():
+                w["btn"].clicked.connect(
+                    lambda _c=False, k=key: self._env_action(k))
+            self._env_rows["llm"]["test"].clicked.connect(self._env_run_test)
+            self.env_tested.connect(self._on_env_tested)
+
+        # ── Common settings form ──────────────────────────────────────────
+
+        def _build_settings(self):
+            # (kind, path, label id, values, widget) — `values` is a list
+            # because a value the form does not offer (e.g. "openai" set in
+            # the editor) is appended on load rather than lost.
+            self._set_controls: list = []
+            for sec, rows in _SETTINGS_SPEC:
+                card = self._section(
+                    f"cfg.set.sec.{sec}",
+                    "cfg.set.sec.captions.desc" if sec == "captions" else None)
+                if sec == "captions":
+                    # What the caption engine will ACTUALLY run with: the
+                    # language and translation target are chosen in the
+                    # caption panel, so without this row the engine dropdown
+                    # below reads as if it were always in use.
+                    now_col = QVBoxLayout()
+                    now_col.setSpacing(2)
+                    now_name = BodyLabel("", self)
+                    self._i18n(now_name, "cfg.set.capnow")
+                    self._cap_now = BodyLabel("", self)
+                    self._cap_now.setWordWrap(True)
+                    now_hint = _muted(CaptionLabel("", self))
+                    now_hint.setWordWrap(True)
+                    self._i18n(now_hint, "cfg.set.capnow.hint")
+                    now_col.addWidget(now_name)
+                    now_col.addWidget(self._cap_now)
+                    now_col.addWidget(now_hint)
+                    card.add(now_col)
+                for kind, path, lid, choices in rows:
+                    row = QHBoxLayout()
+                    row.setSpacing(16)
+                    col = QVBoxLayout()
+                    col.setSpacing(2)
+                    name = BodyLabel("", self)
+                    self._i18n(name, f"cfg.set.{lid}")
+                    hint = _muted(CaptionLabel("", self))
+                    hint.setWordWrap(True)
+                    if lid == "mt":
+                        # Painted by _settings_describe: it follows the
+                        # selected engine.
+                        self._mt_hint = hint
+                    else:
+                        self._i18n(hint, f"cfg.set.{lid}.desc")
+                    col.addWidget(name)
+                    col.addWidget(hint)
+                    row.addLayout(col, stretch=1)
+                    if kind in ("combo", "fallback"):
+                        values = list(choices)
+                        w = ComboBox(self)
+                        w.setMinimumWidth(300)
+                        for v in values:
+                            w.addItem(self._opt_label(lid, v))
+                        w.currentIndexChanged.connect(
+                            lambda i, k=kind, pth=path, vals=values:
+                            self._on_setting(k, pth, vals[i] if 0 <= i < len(vals) else None))
+                    else:
+                        values = []
+                        w = SwitchButton(self)
+                        self._localize_switch(w)
+                        w.checkedChanged.connect(
+                            lambda on, k=kind, pth=path: self._on_setting(k, pth, on))
+                    row.addWidget(w, alignment=Qt.AlignmentFlag.AlignVCenter)
+                    card.add(row)
+                    self._set_controls.append((kind, path, lid, values, w))
+                if sec == "hotwords":
+                    hw_row = QHBoxLayout()
+                    hw_note = _muted(CaptionLabel("", self))
+                    self._i18n(hw_note, "cfg.set.hotwords_note")
+                    hw_row.addWidget(hw_note, stretch=1)
+                    self.set_hotwords_btn = PushButton(FluentIcon.EDIT, "", self)
+                    self._i18n(self.set_hotwords_btn, "cfg.set.btn.hotwords")
+                    hw_row.addWidget(self.set_hotwords_btn)
+                    card.add(hw_row)
+            card = self._section("cfg.set.sec.files")
+            files_desc = _muted(CaptionLabel("", self))
+            files_desc.setWordWrap(True)
+            files_desc.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            # Spelled out per file: run as a script, config and hotwords sit
+            # next to meetingscribe.py while goals and recordings do not.
+            paint_files = lambda: files_desc.setText(_t(
+                "cfg.set.files.desc", config=str(CONFIG_FILE),
+                hotword=str(HOTWORD_FILE), goals=str(GOALS_FILE),
+                recordings=str(RECORDINGS_DIR)))
+            self._lang_callbacks.append(paint_files)
+            paint_files()
+            card.add(files_desc)
+            f_row = QHBoxLayout()
+            self.set_data_btn = PushButton(FluentIcon.FOLDER, "", self)
+            self._i18n(self.set_data_btn, "cfg.set.btn.data_dir")
+            self.set_rec_btn = PushButton(FluentIcon.FOLDER, "", self)
+            self._i18n(self.set_rec_btn, "cfg.set.btn.recordings")
+            f_row.addWidget(self.set_data_btn)
+            f_row.addWidget(self.set_rec_btn)
+            f_row.addStretch(1)
+            card.add(f_row)
+            # Option labels follow the 中文 / EN toggle too.
+            self._lang_callbacks.append(self._settings_relabel)
+            self._lang_callbacks.append(self._settings_describe)
+
+        def _settings_describe(self):
+            """Texts that depend on the current config, not just the language:
+            the selected engine's trade-offs and the "current captions" line."""
+            lc = _deep_merge(DEFAULT_CONFIG["live_captions"], cfg.get("live_captions") or {})
+            engine = (lc.get("mt_provider") or "default").strip().lower()
+            engine = {"default": "marian", "opus": "marian", "opus-mt": "marian",
+                      "hy-mt": "hymt"}.get(engine, engine)
+            about = _t(f"cfg.set.mt.about.{engine}")
+            if about.startswith("cfg.set."):
+                about = ""
+            if getattr(self, "_mt_hint", None) is not None:
+                sep = "" if _LANG["current"] == "zh" else " "   # no space between CJK sentences
+                self._mt_hint.setText(sep.join(x for x in (_t("cfg.set.mt.desc"), about) if x))
+            if getattr(self, "_cap_now", None) is not None:
+                lang = _caption_language(lc)
+                if _caption_mt_active(lc):
+                    target = _caption_translate_to(lc)
+                    mt = _t("cfg.set.capnow.mt.on",
+                            target=_t(f"cfg.set.capnow.lang.{target}"),
+                            engine=self._opt_label("mt", engine))
+                else:
+                    mt = _t("cfg.set.capnow.mt.off")
+                self._cap_now.setText(_t(
+                    "cfg.set.capnow.text", lang=_t(f"cfg.set.capnow.lang.{lang}"),
+                    asr=_t(f"cfg.set.capnow.asr.{lang}"), mt=mt))
+
+        def showEvent(self, ev):
+            # Language / translation are changed from the caption panel on
+            # another page, so repaint on every visit.
+            self._settings_describe()
+            super().showEvent(ev)
+
+        def _opt_label(self, lid: str, value: str) -> str:
+            group = "mt" if lid == "mt" else "p"
+            key = f"cfg.set.opt.{group}.{value or 'none'}"
+            text = _t(key)
+            return value if text == key else text
+
+        def _settings_relabel(self):
+            for kind, _path, lid, values, w in self._set_controls:
+                if kind in ("combo", "fallback"):
+                    for i, v in enumerate(values):
+                        w.setItemText(i, self._opt_label(lid, v))
+
+        def _settings_load(self):
+            """Paint the controls from the running config, without firing
+            their change handlers."""
+            for kind, path, lid, values, w in self._set_controls:
+                cur: object = cfg
+                for k in path:
+                    cur = cur.get(k) if isinstance(cur, dict) else None
+                w.blockSignals(True)
+                try:
+                    if kind in ("combo", "fallback"):
+                        if kind == "fallback":
+                            cur = cur[0] if isinstance(cur, list) and cur else ""
+                        if lid != "mt":
+                            cur = _LLM_PROVIDER_ALIASES.get(cur, cur)
+                        cur = "" if cur is None else str(cur)
+                        if cur not in values:
+                            values.append(cur)
+                            w.addItem(self._opt_label(lid, cur))
+                        w.setCurrentIndex(values.index(cur))
+                    elif kind == "spk":
+                        w.setChecked(bool(str(cur or "").strip()))
+                    else:
+                        w.setChecked(bool(cur))
+                finally:
+                    w.blockSignals(False)
+
+        def _on_setting(self, kind: str, path: tuple, value):
+            if value is None:
+                return
+            if kind == "fallback":
+                value = [value] if value else []
+            elif kind == "spk":
+                value = "cam++" if value else ""
+            elif kind == "switch":
+                value = bool(value)
+            try:
+                update_config_values(cfg, {path: value})
+            except Exception as e:
+                _log("ERR", f"settings save {'.'.join(path)}: {type(e).__name__}: {e}")
+                InfoBar.error(title=_t("cfg.info.save_failed_title"), content=str(e),
+                              isClosable=True, position=InfoBarPosition.TOP,
+                              duration=6000, parent=self.window())
+                self._settings_load()
+                return
+            self._reload_editor()
+            self._settings_describe()
+            if path[0] in ("polish_provider", "meeting_notes_provider", "llm_fallback"):
+                self.env_refresh()
+            InfoBar.success(title=_t("cfg.set.saved"), content="",
+                            isClosable=False, position=InfoBarPosition.TOP,
+                            duration=1500, parent=self.window())
+
+        def _reload_editor(self):
+            """Show the file as it now is — unless the user has unsaved edits
+            in the editor, which a reload would silently throw away."""
+            if self.editor.toPlainText() != getattr(self, "_editor_loaded", None):
+                return
+            try:
+                text = CONFIG_FILE.read_text(encoding="utf-8")
+            except Exception as e:
+                _log("ERR", f"settings reload editor: {type(e).__name__}: {e}")
+                return
+            self.editor.setPlainText(text)
+            self._editor_loaded = text
+
+        def _on_adv_toggle(self):
+            self.adv_box.setVisible(not self.adv_box.isVisible())
+            self._adv_label()
+
+        def _on_edit_hotwords(self):
+            try:
+                if not HOTWORD_FILE.exists():
+                    _save_hotword_file("")
+                if sys.platform == "darwin":
+                    # .jsonc has no default app; -t opens it in TextEdit.
+                    subprocess.run(["open", "-t", str(HOTWORD_FILE)])
+                else:
+                    _open_path(HOTWORD_FILE)
+            except Exception as e:
+                _log("ERR", f"edit hotwords: {type(e).__name__}: {e}")
+                InfoBar.error(title=_t("cfg.set.btn.hotwords"), content=str(e),
+                              isClosable=True, position=InfoBarPosition.TOP,
+                              duration=6000, parent=self.window())
+
+        def _on_open_recordings(self):
+            RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            _open_path(RECORDINGS_DIR)
+
+        # ── Environment (external dependencies) ───────────────────────────
+
+        def env_refresh(self) -> "list[EnvItem]":
+            """Re-run the check and repaint. Cheap enough for the Qt thread
+            (PATH lookups + a cached device resolve). Returns the items so
+            the startup notice can reuse them."""
+            try:
+                self._env_items = _environment_check(cfg)
+            except Exception as e:
+                _log("ERR", f"env check: {type(e).__name__}: {e}")
+                self._env_items = []
+            self._env_test = None
+            self._env_render()
+            return self._env_items
+
+        def _env_llm_cmd(self, item: "EnvItem") -> "tuple[str, str]":
+            # Install the CLI the config actually uses first: if both are
+            # missing, the first in the provider chain.
+            cmd = item.missing_cmds[0] if item.missing_cmds else "claude"
+            for n in _llm_check_chain(cfg):
+                pcfg = _llm_provider_config(n, cfg) or {}
+                c = {"claude-cli": "claude", "codex-cli": "codex"}.get(
+                    pcfg.get("type", ""))
+                if c in item.missing_cmds:
+                    cmd = c
+                    break
+            return _ENV_INSTALL_CMDS[cmd], _ENV_LOGIN_CMDS[cmd]
+
+        def _env_render(self):
+            import shutil
+            items = {i.key: i for i in self._env_items}
+            need_brew = need_npm = False
+            for key, w in self._env_rows.items():
+                item = items.get(key)
+                visible = item is not None
+                for part in ("state", "hint", "btn", "name"):
+                    w[part].setVisible(visible)
+                if w["test"] is not None:
+                    w["test"].setVisible(False)
+                if item is None:
+                    continue
+                tone = ("ok" if item.ok else
+                        "warn" if item.state == "no_physical" else
+                        "idle" if not item.required else "bad")
+                w["state"].setText(_status_html(
+                    _t(f"cfg.env.state.{key}.{item.state}", detail=item.detail), tone))
+                hint, btn_key = "", None
+                if key == "blackhole" and not item.ok:
+                    hint = _t("cfg.env.hint.blackhole", cmd=_ENV_INSTALL_CMDS["blackhole"])
+                    btn_key, need_brew = "cfg.env.btn.copy", True
+                elif key == "multi_output" and not item.ok:
+                    hint = (_t("cfg.env.hint.multi_output.no_physical", detail=item.detail)
+                            if item.state == "no_physical"
+                            else _t("cfg.env.hint.multi_output"))
+                    btn_key = "cfg.env.btn.open_midi"
+                elif key == "llm":
+                    if item.ok:
+                        w["test"].setVisible(True)
+                        if self._env_test is not None:
+                            st, detail = self._env_test
+                            w["state"].setText(_status_html(
+                                _t(f"cfg.env.state.{st}", detail=detail),
+                                {"test_ok": "ok", "test_fail": "bad"}.get(st, "idle")))
+                    else:
+                        cmd, login = self._env_llm_cmd(item)
+                        hint = _t("cfg.env.hint.llm", cmd=cmd, login=login)
+                        btn_key, need_npm = "cfg.env.btn.copy", True
+                elif key == "ffmpeg" and not item.ok:
+                    hint = _t("cfg.env.hint.ffmpeg", cmd=_ENV_INSTALL_CMDS["ffmpeg"])
+                    btn_key, need_brew = "cfg.env.btn.copy", True
+                w["hint"].setText(hint)
+                w["hint"].setVisible(bool(hint))
+                w["btn"].setVisible(btn_key is not None)
+                if btn_key:
+                    w["btn"].setText(_t(btn_key))
+            extra = []
+            show_brew = need_brew and shutil.which("brew") is None
+            if show_brew:
+                extra.append(_t("cfg.env.hint.no_brew"))
+            if need_npm and shutil.which("npm") is None:
+                extra.append(_t("cfg.env.hint.no_npm"))
+            self.env_extra_hint.setText("\n".join(extra))
+            self.env_brew_btn.setVisible(show_brew)
+
+        def _env_action(self, key: str):
+            item = next((i for i in self._env_items if i.key == key), None)
+            if item is None:
+                return
+            if key == "multi_output":
+                try:
+                    subprocess.Popen(["open", "-a", "Audio MIDI Setup"])
+                except Exception as e:
+                    _log("ERR", f"open Audio MIDI Setup: {type(e).__name__}: {e}")
+                return
+            if key == "llm":
+                cmd = self._env_llm_cmd(item)[0]
+            else:
+                cmd = _ENV_INSTALL_CMDS.get(key, "")
+            if not cmd:
+                return
+            QGuiApplication.clipboard().setText(cmd)
+            InfoBar.success(title=cmd, content=_t("cfg.env.copied"),
+                            parent=self.window(), position=InfoBarPosition.TOP,
+                            duration=4000)
+
+        def _env_open_url(self, url: str):
+            import webbrowser
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                _log("ERR", f"open {url}: {type(e).__name__}: {e}")
+
+        def _env_run_test(self):
+            self._env_test = ("testing", "")
+            self._env_rows["llm"]["test"].setEnabled(False)
+            self._env_render()
+
+            def _work():
+                try:
+                    ok, msg = _llm_probe(cfg)
+                except Exception as e:              # pragma: no cover
+                    ok, msg = False, f"{type(e).__name__}: {e}"
+                self.env_tested.emit(ok, msg)
+
+            threading.Thread(target=_work, name="env-llm-test",
+                             daemon=True).start()
+
+        def _on_env_tested(self, ok: bool, msg: str):
+            self._env_rows["llm"]["test"].setEnabled(True)
+            self._env_test = ("test_ok" if ok else "test_fail", msg)
+            self._env_render()
 
         # ── Calendar connection health ────────────────────────────────────
 
@@ -15598,10 +17985,10 @@ def _cmd_ui_body(args, cfg):
                                checking: bool = False):
             for key, label in self._cal_state_labels.items():
                 if checking:
-                    label.setText(_t("cfg.cal.state.checking"))
+                    label.setText(_status_html(_t("cfg.cal.state.checking"), "idle"))
                     continue
                 if st is None:
-                    label.setText(_t("cfg.cal.state.unknown"))
+                    label.setText(_status_html(_t("cfg.cal.state.unknown"), "idle"))
                     continue
                 state = st.services.get(key, _MCP_STATUS_MISSING)
                 text = _t(f"cfg.cal.state.{state}")
@@ -15609,7 +17996,9 @@ def _cmd_ui_body(args, cfg):
                 # triangle there doesn't read as "the feature is broken".
                 if key == "notion" and state != _MCP_STATUS_CONNECTED:
                     text += " " + _t("cfg.cal.optional_note")
-                label.setText(text)
+                tone = ("ok" if state == _MCP_STATUS_CONNECTED else
+                        "idle" if key == "notion" else "warn")
+                label.setText(_status_html(text, tone))
             if checking:
                 self.cal_hint.setText(_t("cfg.cal.checking"))
                 self.cal_open_btn.setVisible(False)
@@ -15714,6 +18103,8 @@ def _cmd_ui_body(args, cfg):
             self.cal_switch.setChecked(cal_enabled)
             self.cal_switch.blockSignals(False)
             self._cal_render_status(self._cal_last_status)
+            self._settings_load()
+            self._settings_describe()
             if CONFIG_FILE.exists():
                 try:
                     self.editor.setPlainText(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -15722,6 +18113,7 @@ def _cmd_ui_body(args, cfg):
                         f"// 无法读取 config.jsonc: {type(e).__name__}: {e}\n")
             else:
                 self.editor.setPlainText("{\n}\n")
+            self._editor_loaded = self.editor.toPlainText()
 
         def _on_apply_concurrency(self):
             """Apply the SpinBox value to the two concurrency keys and
@@ -15872,6 +18264,9 @@ def _cmd_ui_body(args, cfg):
             )
 
             central = QWidget(self)
+            central.setObjectName("appCentral")
+            central.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            central.setStyleSheet(f"#appCentral {{ background-color: {_WINDOW_BG}; }}")
             h = QHBoxLayout(central)
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(0)
@@ -15879,6 +18274,38 @@ def _cmd_ui_body(args, cfg):
             h.addWidget(nav_separator)
             h.addWidget(right_col, stretch=1)
             self.setCentralWidget(central)
+            # After the window is up, so the notice has somewhere to land.
+            QTimer.singleShot(800, self._startup_env_check)
+            # Help menu — on macOS this lands in the system menu bar (and
+            # gets the native Help search field for free).
+            self._help_menu = self.menuBar().addMenu(_t("menu.help"))
+            self._help_guide = self._help_menu.addAction(_t("menu.help.guide"))
+            self._help_guide.triggered.connect(lambda: _open_guide("install", self))
+            self._help_faq = self._help_menu.addAction(_t("menu.help.faq"))
+            self._help_faq.triggered.connect(lambda: _open_guide("faq", self))
+
+        def _startup_env_check(self):
+            """Every launch, but only speaks when a REQUIRED dependency is
+            missing — a fully set-up machine never sees it."""
+            items = self.config_view.env_refresh()
+            missing = [i for i in items if i.required and not i.ok]
+            if not missing:
+                return
+            names = "、".join(_t(f"cfg.env.svc.{i.key}") for i in missing) \
+                if _LANG["current"] == "zh" else \
+                ", ".join(_t(f"cfg.env.svc.{i.key}") for i in missing)
+            bar = InfoBar.warning(
+                title=_t("env.startup.title"),
+                content=_t("env.startup.msg", items=names),
+                isClosable=True, position=InfoBarPosition.TOP,
+                duration=-1, parent=self.stack.currentWidget())
+            go = PushButton(_t("env.startup.btn"), bar)
+            go.clicked.connect(self.switch_to_config)
+            go.clicked.connect(bar.close)
+            bar.addWidget(go)
+            guide = PushButton(_t("menu.help.guide"), bar)
+            guide.clicked.connect(lambda: _open_guide("install", self))
+            bar.addWidget(guide)
 
         def switch_to_config(self):
             """Jump to the config view — used by the calendar chip when the
@@ -15912,6 +18339,9 @@ def _cmd_ui_body(args, cfg):
             if lang not in ("zh", "en") or lang == _LANG["current"]:
                 return
             _LANG["current"] = lang
+            self._help_menu.setTitle(_t("menu.help"))
+            self._help_guide.setText(_t("menu.help.guide"))
+            self._help_faq.setText(_t("menu.help.faq"))
             # Update nav labels.
             for text_key, item in self._nav_items.items():
                 if item is not None and hasattr(item, "setText"):
@@ -15986,6 +18416,19 @@ def _cmd_ui_body(args, cfg):
 
     app = QApplication.instance() or QApplication(sys.argv)
     setTheme(Theme.LIGHT)
+    # System blue everywhere Fluent draws an accent (switches, sliders,
+    # segmented tabs, progress), instead of Fluent's default teal.
+    setThemeColor(_ACCENT)
+    # The macOS UI font: SF for Latin, PingFang for CJK — the pairing native
+    # apps get. Fluent widgets take their families from setFontFamilies;
+    # everything else from the application font.
+    _ui_fonts = [".AppleSystemUIFont", "PingFang SC", "Helvetica Neue"] \
+        if sys.platform == "darwin" else ["Segoe UI", "Microsoft YaHei", "PingFang SC"]
+    setFontFamilies(_ui_fonts)
+    _app_font = QFont()
+    _app_font.setFamilies(_ui_fonts)
+    _app_font.setPointSize(13 if sys.platform == "darwin" else 10)
+    app.setFont(_app_font)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
@@ -15994,10 +18437,13 @@ def _cmd_ui_body(args, cfg):
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
 def main():
+    _prepare_frozen_runtime()
     parser = argparse.ArgumentParser(
         description="一行命令：录音 + 转写 + 纪要",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version",
+                        version=f"MeetingScribe {__version__}")
     sub = parser.add_subparsers(dest="cmd", metavar="<命令>")
 
     stt_help = "可选：funasr（默认）/ openai / gemini，或 stt 配置中的任意 key"
