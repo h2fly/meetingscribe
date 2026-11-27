@@ -31,3 +31,7 @@ openspec/
 
 # 本地热词（自动挖掘，含同事/客户名等本地数据；模板见 hotword.jsonc.example）
 hotword.jsonc
+
+# 打包产物（packaging/build_dmg.sh）
+build/
+dist/
