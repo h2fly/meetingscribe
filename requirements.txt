@@ -13,3 +13,13 @@ modelscope>=1.9.0
 # PyQt5，与 PyQt6 在同一进程中冲突（ObjC class 重复注册）。
 PyQt6>=6.6.0
 PyQt6-Fluent-Widgets>=1.5.0
+
+# 实时双语字幕（GUI 录音页；模型首次使用时自动下载）
+# transformers：两种模式的本地翻译都需要（快速=opus-mt，准确=NLLB-600M）
+transformers>=4.40.0
+# sherpa-onnx：仅「快速模式」的流式识别需要（准确模式走 funasr，无需此包）
+sherpa-onnx>=1.10.0
+# llama-cpp-python：字幕翻译 qwen 引擎（live_captions.mt_provider="qwen"，
+# 本地 Qwen 1.5B GGUF + 热词术语表，首次使用自动下载模型 ~1GB）。
+# 未安装时字幕翻译自动回退到 opus-mt / NLLB，不影响其他功能。
+llama-cpp-python>=0.2.90
